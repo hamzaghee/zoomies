@@ -46,10 +46,35 @@ META_PATH = os.path.join(state.CACHE_DIR, "docs-meta.json")
 
 TTL_SECONDS = 24 * 3600
 
-# Docs routinely quote a context this hardware cannot reach. 262,144 tokens
-# of KV cache will not fit beside the weights on a 16 GB card, and silently
-# filling that in would make the app look broken on the very first click.
-SAFE_CONTEXT = 32768
+# Docs routinely quote a context no consumer card can reach - 262,144 tokens
+# of KV cache does not fit beside the weights - and silently filling that in
+# would make the app look broken on the very first click. The ceiling is
+# computed from the GPUs actually present rather than assumed: this machine
+# has two RX 6800 XTs (32 GB), and an earlier hardcoded 16 GB was simply
+# wrong. state.detect_gpus() measures it.
+SAFE_CONTEXT = 32768          # fallback when no GPU can be detected
+
+
+def safe_context(model_size_bytes=0):
+    """A context ceiling that leaves room for the weights.
+
+    Rough on purpose. KV cache size depends on layer count and head
+    dimensions that are not in the docs, so rather than pretend to compute
+    it, this leaves a generous margin and says so in the note. The field is
+    editable; the user can raise it.
+    """
+    total = state.total_vram()
+    if not total:
+        return SAFE_CONTEXT
+    spare = total - int(model_size_bytes or 0)
+    gb = 1024 ** 3
+    if spare >= 16 * gb:
+        return 65536
+    if spare >= 8 * gb:
+        return 32768
+    if spare >= 4 * gb:
+        return 16384
+    return 8192
 
 USER_AGENT = "Zoomies/1.0 (+local)"
 
@@ -256,9 +281,36 @@ def page_family(url):
     return norm_key(_SLUG_TAIL.sub("", tail))
 
 
+# A size token is where a Hugging Face repo name stops being the family and
+# starts describing the build: Qwen3.8-27B-GGUF, gemma-4-26B-A4B-it-GGUF,
+# Ministral-3-14B-Instruct-2512-GGUF.
+SIZE_CUT = re.compile(r"(?i)[-_](\d+(?:\.\d+)?[bmt]|a\d+b|\d+x\d+b)(?:[-_]|$)")
+
+
 def model_family(model_id):
-    """Family key from a backend's model name - everything before the tag."""
-    return norm_key(str(model_id).split(":")[0])
+    """Family key from a model name, in either naming style.
+
+        qwen3.8:27b-q4_K_M                       -> qwen3.8   (Ollama tag)
+        unsloth/Qwen3.8-27B-GGUF                 -> qwen3.8   (HF repo)
+        unsloth/gemma-4-26B-A4B-it-GGUF          -> gemma4
+        unsloth/Ministral-3-14B-Instruct-2512-GGUF -> ministral3
+        unsloth/gpt-oss-20b-GGUF                 -> gptoss
+    """
+    name = str(model_id).replace("\\", "/")
+    if "/" in name:                       # Hugging Face repo id
+        name = name.rsplit("/", 1)[-1]
+        name = re.sub(r"(?i)[-_]?gguf$", "", name)
+        cut = SIZE_CUT.search(name)
+        if cut:
+            name = name[:cut.start()]
+    else:
+        name = name.split(":")[0]
+        if name.lower().endswith(".gguf"):
+            name = name[:-5]
+            cut = SIZE_CUT.search(name)
+            if cut:
+                name = name[:cut.start()]
+    return norm_key(name)
 
 
 def fetch_index(force=False):
@@ -724,6 +776,8 @@ def recommend(model, cfg=None, mode=None, force_refresh=False):
 def _result_from(saved, model, mode):
     """Rebuild a Result from the saved answer. Returns None if the saved
     shape is from an older version and cannot be trusted."""
+    if int(saved.get("v") or 1) < 2:
+        return None                    # older shape: re-resolve instead
     try:
         merged = {k: dict(v) for k, v in saved["merged"].items()}
         modes = tuple(saved["modes"])
@@ -739,6 +793,17 @@ def _result_from(saved, model, mode):
     for key, value in (saved.get("always") or {}).items():
         settings.setdefault(key, value)
 
+    # The context ceiling and its explanation are derived fresh every time,
+    # never replayed. They depend on the GPUs in the machine today, and on
+    # this model's size - neither of which belongs in a frozen answer.
+    notes = [n for n in (saved.get("notes") or []) if "context" not in n.lower()]
+    doc_ctx = saved.get("doc_context")
+    if doc_ctx:
+        ctx, note = _clamp_context(int(doc_ctx), model)
+        settings["context_length"] = ctx
+        if note:
+            notes.append(note)
+
     when = saved.get("saved")
     age = "saved %s" % _age_text(time.time() - when) if when else "saved"
     return Result(
@@ -747,7 +812,7 @@ def _result_from(saved, model, mode):
         modes=modes, mode_labels=dict(saved.get("labels") or {}), mode=chosen,
         page=saved.get("page", ""), url=saved.get("url", ""),
         section=saved.get("section", ""), line=int(saved.get("line") or 0),
-        age=age, notes=list(saved.get("notes") or []),
+        age=age, notes=notes,
         suggestions=list(saved.get("suggestions") or []))
 
 
@@ -827,14 +892,10 @@ def _resolve(model, cfg, mode, force_refresh):
 
     doc_ctx = parse_context(block, lines)
     if doc_ctx:
-        ctx = min(doc_ctx, getattr(model, "context_max", 0) or doc_ctx)
-        if ctx > SAFE_CONTEXT:
-            notes.append(
-                "Docs list a %s context. Filled in %s instead - the full "
-                "window will not fit in 16 GB. Raise it if you have the room."
-                % (format(doc_ctx, ","), format(SAFE_CONTEXT, ",")))
-            ctx = SAFE_CONTEXT
+        ctx, note = _clamp_context(doc_ctx, model)
         settings["context_length"] = ctx
+        if note:
+            notes.append(note)
 
     lift, suggest = parse_extras(lines)
     if lift:
@@ -847,11 +908,15 @@ def _resolve(model, cfg, mode, force_refresh):
     # Everything needed to answer this model again without the network,
     # including the other modes so flipping the dropdown stays instant.
     always = {}
-    if "context_length" in settings:
-        always["context_length"] = settings["context_length"]
     if "extra_flags" in settings:
         always["extra_flags"] = settings["extra_flags"]
     payload = {
+        # Schema version. Saved answers from an older version are ignored and
+        # re-resolved rather than replayed: the clamp note used to be frozen
+        # into the payload, so a saved answer kept telling the user "will not
+        # fit in 16 GB" long after the VRAM detection was corrected.
+        "v": 2,
+        "doc_context": doc_ctx,
         "merged": {mk: dict(vals) for mk, vals in merged.items()},
         "modes": list(modes), "labels": labels, "always": always,
         "page": entry["title"], "url": entry["url"], "section": section,
@@ -865,6 +930,22 @@ def _resolve(model, cfg, mode, force_refresh):
         line=block_start + 1, age=page_age, notes=notes,
         suggestions=suggestions)
     return result, payload
+
+
+def _clamp_context(doc_ctx, model):
+    """Return (context_to_use, explanation_or_empty).
+
+    Computed from the GPUs present right now, so it follows the hardware
+    rather than a number baked in at write time.
+    """
+    ceiling = safe_context(getattr(model, "size_bytes", 0))
+    ctx = min(int(doc_ctx), getattr(model, "context_max", 0) or int(doc_ctx))
+    if ctx <= ceiling:
+        return ctx, ""
+    return ceiling, ("Docs list a %s context. Filled in %s instead, to leave "
+                     "room for the weights on your %s. Raise it if you want."
+                     % (format(int(doc_ctx), ","), format(ceiling, ","),
+                        state.describe_gpus()))
 
 
 def _pick_mode(modes, model, override=None):

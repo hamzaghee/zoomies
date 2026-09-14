@@ -698,3 +698,457 @@ class OllamaBackend(Backend):
 
 
 register(OllamaBackend())
+
+
+# --------------------------------------------------------------------------
+# Unsloth Studio
+# --------------------------------------------------------------------------
+
+UNSLOTH_HOST = "127.0.0.1"
+UNSLOTH_PORT = 8888
+UNSLOTH_BASE = "http://%s:%d" % (UNSLOTH_HOST, UNSLOTH_PORT)
+
+# Flags Unsloth manages itself and rejects with HTTP 400 if they are passed
+# through to llama-server. Its own --host/--port options are used instead.
+UNSLOTH_DENIED = (
+    "--model", "-m", "-hf", "--hf-repo", "--host", "--port", "--path",
+    "--api-prefix", "--reuse-port", "--api-key", "--ssl-cert-file",
+    "--ssl-key-file", "--ui", "--webui", "--models-json", "--parallel", "-np",
+)
+
+# Settings that map to a first-class `unsloth run` flag.
+UNSLOTH_FLAGS = (
+    ("temperature", "--temperature"),
+    ("top_p", "--top-p"),
+    ("top_k", "--top-k"),
+    ("min_p", "--min-p"),
+    ("seed", "--seed"),
+    ("context_length", "--max-seq-length"),
+)
+UNSLOTH_INT_FLAGS = {"top_k", "seed", "context_length"}
+
+# Settings the running server accepts on POST /v1/load. Note what is absent:
+# there is no temperature here. Sampling can only be pinned by the CLI at
+# launch, which is why starting the server ourselves is the better path.
+UNSLOTH_LOAD_FIELDS = (
+    ("context_length", "max_seq_length"),
+    ("gpu_layers", "gpu_layers"),
+    ("parallel", "n_parallel"),
+)
+
+
+def find_unsloth_exe():
+    home = os.path.join(os.path.expanduser("~"), ".unsloth", "studio", "bin",
+                        "unsloth.exe")
+    if os.path.isfile(home):
+        return home
+    for directory in (os.environ.get("PATH") or "").split(os.pathsep):
+        candidate = os.path.join(directory.strip('"'), "unsloth.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+class UnslothBackend(Backend):
+    """Unsloth Studio.
+
+    Like Ollama, this is driven over HTTP rather than by scripting its CLI -
+    the Studio exposes /v1/load, /v1/unload, /v1/status and /v1/models.
+
+    The one thing the API cannot do is pin sampling. POST /v1/load takes
+    placement and sizing (max_seq_length, gpu_layers, n_parallel) but has no
+    temperature field; `unsloth run --temperature` pins it "for every
+    request" instead. So there are two launch shapes:
+
+      server not running -> start it with `unsloth run`, all settings applied
+      server running     -> POST /v1/load, and say plainly that the sampling
+                            settings cannot be pinned into an already-running
+                            server
+
+    That distinction is surfaced through supports() and through a note on the
+    plan, rather than being quietly ignored.
+    """
+
+    name = "unsloth"
+    display_name = "Unsloth Studio"
+    uses_model_folder = True
+    endpoint = UNSLOTH_BASE
+    host = UNSLOTH_HOST
+    port = UNSLOTH_PORT
+
+    def __init__(self):
+        Backend.__init__(self)
+        self.exe = find_unsloth_exe()
+        self.default_folder = os.path.join(os.path.expanduser("~"), ".unsloth")
+
+    # -- availability ------------------------------------------------------
+
+    def is_available(self):
+        if not self.exe:
+            return False, "unsloth.exe not found"
+        if self.server_up():
+            return True, "running"
+        return True, "installed, not running"
+
+    def server_up(self):
+        return state.port_open(UNSLOTH_HOST, UNSLOTH_PORT)
+
+    # -- discovery ---------------------------------------------------------
+
+    def list_models(self, folder=None):
+        models = self._from_api() if self.server_up() else []
+        seen = {m.id for m in models}
+        for record in self._from_folder(folder):
+            if record.id not in seen:
+                models.append(record)
+        models.sort(key=lambda m: m.label.lower())
+        return models
+
+    def _from_api(self):
+        """The running Studio already knows its models, their quants and
+        their sizes - better than guessing from filenames."""
+        listing, err = http_json(UNSLOTH_BASE + "/v1/models", timeout=8.0)
+        if err:
+            self.last_error = err
+            return []
+        self.last_error = ""
+        sizes = {}
+        cached, cache_err = http_json(UNSLOTH_BASE + "/api/models/cached-gguf",
+                                      timeout=10.0)
+        if not cache_err:
+            for item in (cached or {}).get("cached", []) or []:
+                if item.get("repo_id"):
+                    sizes[item["repo_id"]] = int(item.get("size_bytes") or 0)
+        out = []
+        for item in (listing or {}).get("data", []) or []:
+            repo = item.get("id") or ""
+            if not repo:
+                continue
+            out.append(ModelRecord(
+                backend=self.name, id=repo,
+                label=item.get("display_name") or repo,
+                quant=item.get("quant", ""),
+                size_bytes=sizes.get(repo, 0),
+                source="registry"))
+        return out
+
+    def _from_folder(self, folder):
+        """Loose .gguf files the user points us at.
+
+        Skips the pieces that are not a model you can load on their own:
+        projector files, speculative-decoding sidecars, llama.cpp's tiny
+        vocab fixtures, and every shard of a split model except the first
+        (llama.cpp finds the rest itself).
+        """
+        if not folder or not os.path.isdir(folder):
+            return []
+        skip = ("mmproj", "dspark", "ggml-vocab", "-draft")
+        out, seen = [], set()
+        for base, dirs, files in os.walk(folder):
+            if base[len(folder):].count(os.sep) >= 4:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fname in files:
+                low = fname.lower()
+                if not low.endswith(".gguf") or any(s in low for s in skip):
+                    continue
+                shard = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", low)
+                if shard and shard.group(1) != "00001":
+                    continue
+                path = os.path.join(base, fname)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size < 50 * 1024 * 1024 or path in seen:
+                    continue
+                seen.add(path)
+                quant = re.search(r"(?i)(UD-[A-Z0-9_]+|IQ\d[_A-Z0-9]*|"
+                                  r"Q\d[_A-Z0-9]*|BF16|F16)", fname)
+                out.append(ModelRecord(
+                    backend=self.name, id=path,
+                    label=os.path.splitext(fname)[0],
+                    quant=quant.group(1) if quant else "",
+                    size_bytes=size, source="folder", gguf_path=path))
+        return out
+
+    # -- capability matrix -------------------------------------------------
+
+    def supports(self, key):
+        if key in ("temperature", "top_p", "top_k", "min_p", "seed"):
+            if self.server_up():
+                return "needs Zoomies to start the server"
+            return "pinned at launch"
+        if key == "context_length":
+            return "--max-seq-length"
+        if key == "gpu_layers":
+            return "-ngl"
+        if key == "parallel":
+            return "decode slots"
+        if key in ("repeat_penalty", "presence_penalty"):
+            return "passed to llama-server"
+        if key == "extra_flags":
+            return "passed to llama-server"
+        return ""          # keep_alive: the model lives as long as the server
+
+    # -- what is loaded ----------------------------------------------------
+
+    def list_loaded(self):
+        if not self.server_up():
+            return []
+        listing, err = http_json(UNSLOTH_BASE + "/v1/models", timeout=5.0)
+        if err:
+            self.last_error = err
+            return []
+        self.last_error = ""
+        status, _ = http_json(UNSLOTH_BASE + "/v1/status", timeout=5.0)
+        context = int((status or {}).get("context_length") or 0)
+        session = state.load_session()
+        record = session.get("unsloth") or {}
+        ours = record.get("model_id", "")
+        out = []
+        for item in (listing or {}).get("data", []) or []:
+            if not item.get("loaded"):
+                continue
+            repo = item.get("id") or ""
+            out.append(LoadedModel(
+                backend=self.name, id=repo,
+                label=item.get("display_name") or repo,
+                context=context, endpoint=UNSLOTH_BASE,
+                pid=int(record.get("pid") or 0),
+                owned_by_us=(repo == ours),
+                log_path=record.get("log", "")))
+        return out
+
+    def installed_names(self):
+        return [m.id for m in self.list_models(None)]
+
+    # -- script generation -------------------------------------------------
+
+    def _preamble(self, log_path, title, model, source_note):
+        return "\n".join([
+            runner.header(title, model, source_note),
+            "",
+            "$ErrorActionPreference = 'Stop'",
+            "$log  = %s" % runner.ps_single(log_path),
+            "$base = %s" % runner.ps_single(UNSLOTH_BASE),
+            "",
+            "function Write-Log {",
+            "  param($m)",
+            "  $line = '[zoomies] ' + (Get-Date).ToString('o') + ' ' + $m",
+            "  Write-Output $line",
+            "  $line | Out-File -FilePath $log -Append -Encoding utf8",
+            "}",
+            "function Test-Srv {",
+            "  try { Invoke-RestMethod \"$base/v1/models\" -TimeoutSec 3 | Out-Null; return $true }",
+            "  catch { return $false }",
+            "}",
+            "",
+        ])
+
+    @staticmethod
+    def _number(settings, key, as_int=False):
+        raw = settings.get(key, "")
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            value = float(str(raw).replace(",", ""))
+        except ValueError:
+            return None
+        return int(value) if as_int else value
+
+    def _extra_args(self, settings):
+        """Split the free-text field, dropping anything Unsloth will reject."""
+        raw = str(settings.get("extra_flags") or "").strip()
+        if not raw:
+            return [], []
+        try:
+            import shlex
+            parts = shlex.split(raw, posix=False)
+        except ValueError:
+            parts = raw.split()
+        kept, dropped, skip_next = [], [], False
+        for i, token in enumerate(parts):
+            if skip_next:
+                skip_next = False
+                continue
+            if token.split("=", 1)[0] in UNSLOTH_DENIED:
+                dropped.append(token)
+                if "=" not in token and i + 1 < len(parts) \
+                        and not parts[i + 1].startswith("-"):
+                    skip_next = True
+                continue
+            kept.append(token)
+        return kept, dropped
+
+    def build_launch(self, model, settings, session, source_note=""):
+        extra, dropped = self._extra_args(settings)
+        notes = []
+        if dropped:
+            notes.append("Ignoring %s - Unsloth manages those itself."
+                         % ", ".join(dropped))
+        script_path, log_path = runner.new_paths(self.name, model.label)
+        if self.server_up():
+            return self._load_into_running(model, settings, extra, notes,
+                                           script_path, log_path, source_note)
+        return self._start_server(model, settings, extra, notes,
+                                  script_path, log_path, source_note)
+
+    def _start_server(self, model, settings, extra, notes, script_path,
+                      log_path, source_note):
+        """`unsloth run` starts the server and loads the model in one go,
+        with the sampling settings pinned for every request."""
+        args = ["'run'", "'--model',%s" % runner.ps_single(model.id)]
+        for key, flag in UNSLOTH_FLAGS:
+            value = self._number(settings, key, key in UNSLOTH_INT_FLAGS)
+            if value is not None:
+                args.append("'%s',%s" % (flag, runner.ps_single(value)))
+        gpu_layers = self._number(settings, "gpu_layers", True)
+        if gpu_layers is not None:
+            args.append("'-ngl',%s" % runner.ps_single(gpu_layers))
+        parallel = self._number(settings, "parallel", True) or 1
+        args.append("'--parallel',%s" % runner.ps_single(parallel))
+        if model.quant:
+            args.append("'--gguf-variant',%s" % runner.ps_single(model.quant))
+        args.extend(runner.ps_single(token) for token in extra)
+        # Always explicit, always headless: the requirement is that the
+        # backend's own window never opens.
+        args.extend(["'--host',%s" % runner.ps_single(UNSLOTH_HOST),
+                     "'--port',%s" % runner.ps_single(UNSLOTH_PORT),
+                     "'--api-only'"])
+
+        notes.insert(0, "Starts Unsloth Studio on port %d with these settings "
+                        "pinned. No Unsloth window opens." % UNSLOTH_PORT)
+        body = "\n".join([
+            self._preamble(log_path, "start Unsloth and load", model.label,
+                           source_note),
+            "$exe = %s" % runner.ps_single(self.exe),
+            "$a = @(",
+            "\n".join("  " + a for a in args),
+            ")",
+            "Write-Log ('starting: ' + ($a -join ' '))",
+            "& $exe @a *>> $log",
+            "Write-Log ('unsloth exited with ' + $LASTEXITCODE)",
+            "",
+        ])
+        return runner.LaunchPlan(
+            kind="load", backend=self.name, script_text=body,
+            script_path=script_path, log_path=log_path,
+            endpoint=UNSLOTH_BASE, host=UNSLOTH_HOST, port=UNSLOTH_PORT,
+            long_lived=True, notes=notes)
+
+    def _load_into_running(self, model, settings, extra, notes, script_path,
+                           log_path, source_note):
+        """POST /v1/load against a server that is already up."""
+        fields = {}
+        for key, target in UNSLOTH_LOAD_FIELDS:
+            value = self._number(settings, key, True)
+            if value is not None:
+                fields[target] = value
+        if model.quant:
+            fields["gguf_variant"] = model.quant
+
+        pinned = [label for key, label in
+                  (("temperature", "Temperature"), ("top_p", "Top P"),
+                   ("top_k", "Top K"), ("min_p", "Min P"), ("seed", "Seed"))
+                  if str(settings.get(key) or "").strip()]
+        if pinned:
+            notes.append(
+                "Unsloth Studio is already running, and its load API has no "
+                "sampling fields - %s will NOT be applied. Stop the server "
+                "first if you need those pinned." % ", ".join(pinned))
+
+        lines = ["$body = @{",
+                 "  model_path   = %s" % runner.ps_single(model.id),
+                 "  force_reload = $true"]
+        for key in sorted(fields):
+            value = fields[key]
+            lines.append("  %-12s = %s" % (
+                key, runner.ps_single(value) if isinstance(value, str) else value))
+        if extra:
+            lines.append("  llama_extra_args = @(%s)"
+                         % ", ".join(runner.ps_single(t) for t in extra))
+        lines.append("} | ConvertTo-Json -Depth 6")
+
+        body = "\n".join([
+            self._preamble(log_path, "load model", model.label, source_note),
+            "if (-not (Test-Srv)) { Write-Log 'Unsloth is not responding'; exit 3 }",
+            "",
+            "\n".join(lines),
+            "Write-Log %s" % runner.ps_single("loading " + model.id),
+            "try {",
+            "  Invoke-RestMethod \"$base/v1/load\" -Method Post "
+            "-ContentType 'application/json' -Body $body -TimeoutSec 1800 | Out-Null",
+            "} catch {",
+            "  Write-Log ('load failed: ' + $_.Exception.Message)",
+            "  exit 1",
+            "}",
+            "Write-Log 'loaded'",
+            "exit 0",
+            "",
+        ])
+        return runner.LaunchPlan(
+            kind="load", backend=self.name, script_text=body,
+            script_path=script_path, log_path=log_path,
+            endpoint=UNSLOTH_BASE, host=UNSLOTH_HOST, port=UNSLOTH_PORT,
+            long_lived=False, notes=notes)
+
+    def build_stop(self, loaded, session):
+        script_path, log_path = runner.new_paths(self.name,
+                                                 "stop-" + loaded.label)
+        notes = ["Unloads the model. Unsloth Studio itself keeps running."]
+        if not loaded.owned_by_us:
+            notes.append("This model was loaded outside Zoomies.")
+        body = "\n".join([
+            self._preamble(log_path, "unload model", loaded.label, ""),
+            "if (-not (Test-Srv)) { Write-Log 'Unsloth is not running'; exit 0 }",
+            "",
+            "$body = @{ model_path = %s } | ConvertTo-Json"
+            % runner.ps_single(loaded.id),
+            "try {",
+            "  Invoke-RestMethod \"$base/v1/unload\" -Method Post "
+            "-ContentType 'application/json' -Body $body -TimeoutSec 300 | Out-Null",
+            "  Write-Log 'unloaded'",
+            "} catch { Write-Log ('unload failed: ' + $_.Exception.Message) }",
+            "exit 0",
+            "",
+        ])
+        return runner.LaunchPlan(
+            kind="stop", backend=self.name, script_text=body,
+            script_path=script_path, log_path=log_path,
+            endpoint=UNSLOTH_BASE, host=UNSLOTH_HOST, port=UNSLOTH_PORT,
+            notes=notes)
+
+    def build_shutdown(self, session):
+        """Stop the whole server. Only offered when Zoomies started it -
+        `unsloth studio stop` is all-or-nothing for a STUDIO_HOME and would
+        take down servers somebody else launched."""
+        record = session.get("unsloth") or {}
+        pid = int(record.get("pid") or 0)
+        script_path, log_path = runner.new_paths(self.name, "shutdown")
+        kill_parent = ""
+        if pid:
+            # unsloth.exe spawns llama-server.exe; killing only the parent
+            # leaves the child holding every byte of VRAM.
+            kill_parent = ("if (Get-Process -Id %d -ErrorAction SilentlyContinue) "
+                           "{ taskkill /T /F /PID %d *>> $log }" % (pid, pid))
+        body = "\n".join([
+            self._preamble(log_path, "stop Unsloth Studio", "", ""),
+            "& %s studio stop *>> $log" % runner.ps_single(self.exe),
+            "Start-Sleep -Milliseconds 2000",
+            kill_parent,
+            "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" "
+            "-ErrorAction SilentlyContinue | ForEach-Object "
+            "{ taskkill /T /F /PID $_.ProcessId *>> $log }",
+            "Write-Log 'stopped'",
+            "exit 0",
+            "",
+        ])
+        return runner.LaunchPlan(
+            kind="stop", backend=self.name, script_text=body,
+            script_path=script_path, log_path=log_path,
+            endpoint=UNSLOTH_BASE, notes=["Stops Unsloth Studio entirely."])
+
+
+register(UnslothBackend())

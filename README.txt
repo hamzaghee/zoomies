@@ -32,6 +32,34 @@ WHERE THINGS LIVE
   Use "Open folder" and "Open log" in the Output pane to get to them.
 
 
+THE TWO BACKENDS
+
+  OLLAMA
+    Models come from Ollama's own registry, so the folder box is greyed
+    out - Ollama manages those files itself. Sampling settings are
+    applied through a temporary tag (see below).
+
+  UNSLOTH STUDIO
+    Models come from the running Studio (its own API lists them, with
+    sizes and quants), plus any .gguf files in the folder you pick.
+
+    Unsloth has the mirror-image of Ollama's problem. Its load API takes
+    context length, GPU layers and parallel slots, but has no field for
+    temperature. Sampling is pinned by the `unsloth run` command line
+    instead - which only happens when Zoomies is the one starting the
+    server. So:
+
+      Studio not running -> Zoomies starts it and pins everything.
+      Studio already running -> Zoomies loads into it, and tells you
+                                plainly which settings could not be
+                                applied. Stop the server first if you
+                                need them.
+
+    Unloading a model leaves Studio running. Zoomies only ever shuts the
+    whole server down if it started it, because "unsloth studio stop"
+    stops every server on the machine, not just ours.
+
+
 THE OLLAMA TEMPORARY TAG - READ THIS ONE
   Ollama has no way to attach sampling settings to a model at launch.
   "ollama run" takes no such flags, "/set parameter" only lives inside
@@ -93,7 +121,8 @@ APPLY OPTIMAL SETTINGS
   WORKED OUT ONCE, THEN KEPT
   The first lookup for a model takes about a fifth of a second. The
   answer is then saved to
-      %LOCALAPPDATA%\Zoomies\cacheesolved.json
+      %LOCALAPPDATA%\Zoomies\cache
+esolved.json
   and never expires. After that, clicking Apply - or switching modes -
   is instant and needs no internet at all, even if the cache is wiped.
   Press "Re-read docs" when you want Zoomies to go and look again,
@@ -116,9 +145,12 @@ APPLY OPTIMAL SETTINGS
   says so in orange, because sampling defaults rarely swing much between
   versions of a family. Check them before relying on them.
 
-  Context length is always capped to 32,768 even when the docs say
-  262,144, because the full window will not fit in 16 GB. The note under
-  the settings says so when it happens. Raise it if you have the room.
+  Context length is capped when the docs quote something your cards
+  cannot hold - they often say 262,144, which no consumer GPU can fit
+  beside the weights. The ceiling is worked out from the GPUs actually
+  present (Zoomies detects them; this machine has two RX 6800 XTs, about
+  32 GB total), not from a fixed number. The note under the settings
+  says what it did and why. Raise it if you want.
 
 
 GREYED-OUT FIELDS
@@ -136,14 +168,26 @@ NOTES FOR THIS MACHINE
     everything else here goes over HTTP instead.
   - Your llama.cpp build is Vulkan, not CUDA. Settings copied from
     CUDA-oriented guides (--flash-attn, -ngl) may be ignored or slower.
-  - qwen3.8:27b-q4_K_M is 16.5 GB and your RX 6800 XT has 16 GB. It
-    will not fit at useful context. Watch the "VRAM in use" figure.
-  - Model docs often list a 262,144 context. That is not achievable on
-    16 GB; set something realistic like 8192-32768.
+  - You have TWO RX 6800 XTs, about 32 GB of VRAM in total. Each card is
+    16 GB on its own, so a 16.5 GB model like qwen3.8:27b-q4_K_M does not
+    fit on a single card - Ollama will spread it or offload part of it.
+    Watch the "VRAM in use" figure.
+  - There is a stale NVIDIA RTX 4090 entry in the Windows registry from a
+    card that is no longer installed. Zoomies ignores it: it counts only
+    adapters Windows reports as present.
+  - Model docs often list a 262,144 context. Nothing here reaches that;
+    8192-65536 is the realistic range.
 
 
 STATUS
   v0    Ollama backend, manual settings, load/unload, dashboard.  DONE
   v0.5  the optimizer - recommended settings from the live docs.  DONE
-  next  the Unsloth Studio backend (the Unsloth radio button)
-  then  live tokens/sec, time-to-first-token and GPU metrics
+  v1    Unsloth Studio backend, both radio buttons live.          DONE
+  next  live tokens/sec, time-to-first-token and GPU utilisation
+
+KNOWN ROUGH EDGE
+  Unsloth reports a cached model's size as the whole downloaded folder,
+  which can include more than one quantisation. Qwen3.8-27B shows as
+  37.9 GB there but 16.5 GB in Ollama. Zoomies uses that figure to pick
+  a context ceiling, so for those models the suggested context comes out
+  lower than it needs to be. Raise it by hand if you know better.

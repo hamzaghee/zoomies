@@ -773,13 +773,56 @@ class Zoomies:
                          args=(plan, pre_existing), daemon=True).start()
 
     def _run_worker(self, plan, pre_existing):
-        res = runner.run_script(plan, on_line=lambda ln: self.out_queue.put(("line", ln)))
+        emit = lambda ln: self.out_queue.put(("line", ln))
+        if plan.long_lived:
+            res = self._spawn_server(plan, emit)
+        else:
+            res = runner.run_script(plan, on_line=emit)
         self.out_queue.put(("done", plan, pre_existing, res))
+
+    def _spawn_server(self, plan, emit):
+        """Start a server that is meant to outlive the script.
+
+        Waiting for it to exit would block forever, so the script is spawned
+        detached, its log is tailed for the user, and readiness is a TCP
+        connect - never a string match on log output, because log wording
+        changes between versions and a listening socket does not.
+        """
+        started = runner.spawn_script(plan)
+        if not started.ok:
+            return started
+        threading.Thread(
+            target=runner.tail_log,
+            args=(plan.log_path, emit, self.shutdown),
+            daemon=True).start()
+        emit("[zoomies] waiting for %s:%d ..." % (plan.host, plan.port))
+        up = state.wait_for_port(plan.host, plan.port, timeout=900,
+                                 cancel=self.shutdown)
+        if not up:
+            return runner.RunResult(
+                False, -1, started.pid, [],
+                "the server never started listening on port %d" % plan.port)
+        emit("[zoomies] %s is serving on port %d" % (plan.backend, plan.port))
+        return runner.RunResult(True, 0, started.pid)
 
     def _run_done(self, plan, pre_existing, res):
         self.busy = False
         self.load_btn.state(["!disabled"])
         if res.ok:
+            if plan.long_lived:
+                # Record enough to find this server again after a restart,
+                # and to kill it properly: the server spawns llama-server.exe
+                # as a child, so the parent pid alone is not enough.
+                model = self.selected_model()
+                self.session["unsloth"] = {
+                    "shell_pid": res.pid,
+                    "pid": (state.find_processes("unsloth.exe") or [0])[-1],
+                    "port": plan.port, "host": plan.host,
+                    "model_id": model.id if model else "",
+                    "label": model.label if model else "",
+                    "started": __import__("time").time(),
+                    "log": plan.log_path, "script": plan.script_path,
+                }
             if plan.creates_tag:
                 backends.record_created_tag(self.session, plan.creates_tag,
                                             plan.creates_tag[:-len(state.TAG_SUFFIX)],

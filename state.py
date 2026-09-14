@@ -242,3 +242,110 @@ def sweep_old_files(directory, keep=KEEP_FILES):
         except OSError:
             pass
     return removed
+
+
+# --------------------------------------------------------------------------
+# GPUs
+# --------------------------------------------------------------------------
+
+# Deliberately measured rather than assumed. Unsloth's /api/system/hardware
+# reports a single GPU, and believing it cost this app a wrong VRAM budget:
+# this machine has two RX 6800 XTs, not one. The registry also keeps entries
+# for cards that are no longer installed (there is a stale RTX 4090 here), so
+# a registry sweep alone over-reports. Present devices come from PnP, sizes
+# come from the registry, and the two are joined by name.
+_GPU_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+_IGNORE_GPU = ("microsoft", "remote display", "basic display", "basic render",
+               "virtual", "parsec", "meta ", "citrix")
+
+
+def _registry_vram():
+    """DriverDesc -> bytes, for every adapter the registry knows about."""
+    try:
+        import winreg
+    except ImportError:
+        return {}
+    sizes = {}
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _GPU_CLASS)
+    except OSError:
+        return {}
+    with root:
+        for i in range(256):
+            try:
+                sub = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            if not sub.isdigit():
+                continue
+            try:
+                with winreg.OpenKey(root, sub) as key:
+                    desc = winreg.QueryValueEx(key, "DriverDesc")[0]
+                    size = winreg.QueryValueEx(
+                        key, "HardwareInformation.qwMemorySize")[0]
+            except OSError:
+                continue
+            if desc and size:
+                sizes[str(desc).strip()] = max(int(size), sizes.get(desc, 0))
+    return sizes
+
+
+def _present_adapters():
+    """Names of display adapters actually installed right now."""
+    script = ("Get-PnpDevice -Class Display -Status OK -ErrorAction "
+              "SilentlyContinue | ForEach-Object { $_.FriendlyName }")
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=30,
+            creationflags=CREATE_NO_WINDOW).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+_gpu_cache = None
+
+
+def detect_gpus(refresh=False):
+    """[(name, vram_bytes), ...] for real, present, discrete GPUs.
+
+    Integrated graphics are excluded: they share system RAM, so counting them
+    towards a model's VRAM budget would be misleading.
+    """
+    global _gpu_cache
+    if _gpu_cache is not None and not refresh:
+        return _gpu_cache
+    sizes = _registry_vram()
+    found = []
+    for name in _present_adapters():
+        low = name.lower()
+        if any(bad in low for bad in _IGNORE_GPU):
+            continue
+        vram = sizes.get(name.strip(), 0)
+        if vram >= 1 << 30:          # ignore anything claiming under 1 GB
+            found.append((name.strip(), int(vram)))
+    _gpu_cache = found
+    return found
+
+
+def total_vram():
+    return sum(v for _n, v in detect_gpus())
+
+
+def largest_vram():
+    gpus = detect_gpus()
+    return max((v for _n, v in gpus), default=0)
+
+
+def describe_gpus():
+    gpus = detect_gpus()
+    if not gpus:
+        return "no discrete GPU detected"
+    counts = {}
+    for name, vram in gpus:
+        counts.setdefault((name, vram), 0)
+        counts[(name, vram)] += 1
+    parts = ["%s%s (%.0f GB)" % ("%dx " % n if n > 1 else "", name, vram / 1024 ** 3)
+             for (name, vram), n in counts.items()]
+    return "%s - %.0f GB total" % (", ".join(parts), total_vram() / 1024 ** 3)
