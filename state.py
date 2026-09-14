@@ -16,11 +16,14 @@ there are already stale .pid files on this machine from weeks ago, so a bare
 we would happily taskkill it.
 """
 
+import ctypes
 import json
 import os
+import re
 import socket
 import subprocess
 import time
+from ctypes import wintypes
 
 APP_NAME = "Zoomies"
 TAG_SUFFIX = "-zoomies"          # reserved namespace; see backends.can_remove_tag
@@ -316,6 +319,16 @@ def detect_gpus(refresh=False):
     global _gpu_cache
     if _gpu_cache is not None and not refresh:
         return _gpu_cache
+
+    # DXGI first: it reports dedicated VRAM per adapter, flags software
+    # rasterizers, and lists only adapters that actually exist right now -
+    # the registry keeps entries for cards that have been removed.
+    dxgi = [a for a in enumerate_adapters()
+            if not a["is_software"] and a["vram"] >= 1 << 30]
+    if dxgi:
+        _gpu_cache = [(a["name"], a["vram"]) for a in dxgi]
+        return _gpu_cache
+
     sizes = _registry_vram()
     found = []
     for name in _present_adapters():
@@ -344,8 +357,145 @@ def describe_gpus():
         return "no discrete GPU detected"
     counts = {}
     for name, vram in gpus:
-        counts.setdefault((name, vram), 0)
-        counts[(name, vram)] += 1
-    parts = ["%s%s (%.0f GB)" % ("%dx " % n if n > 1 else "", name, vram / 1024 ** 3)
-             for (name, vram), n in counts.items()]
+        # Group on whole GB: two identical cards can report VRAM a few KB
+        # apart, which would otherwise list them as separate models.
+        bucket = (name, round(vram / 1024 ** 3))
+        counts.setdefault(bucket, 0)
+        counts[bucket] += 1
+    parts = ["%s%s (%d GB)" % ("%dx " % n if n > 1 else "", name, gb)
+             for (name, gb), n in counts.items()]
     return "%s - %.0f GB total" % (", ".join(parts), total_vram() / 1024 ** 3)
+
+
+# --------------------------------------------------------------------------
+# DXGI adapter enumeration
+# --------------------------------------------------------------------------
+#
+# Ported from the Ollama Monitor, which had already solved this properly.
+#
+# Windows' performance counters identify a GPU only by LUID, and a LUID is
+# handed out per enumeration - the same card gets a different one after a
+# reboot, a driver restart or a TDR recovery, and can briefly hold two at
+# once. So LUIDs are treated strictly as this-boot handles for joining
+# counter rows, and DXGI is used to turn each one into a real adapter name
+# plus a vendor/device/subsystem triple that survives reboots.
+#
+# It also reports DedicatedVideoMemory per adapter, which is a better source
+# for the VRAM total than the registry: no stale entries for cards that have
+# been removed, and software adapters are flagged rather than guessed at.
+
+DXGI_ADAPTER_FLAG_SOFTWARE = 2
+
+# COM vtable slots. IUnknown occupies 0-2 and IDXGIObject 3-6, which puts
+# IDXGIFactory1::EnumAdapters1 at 12 and IDXGIAdapter1::GetDesc1 at 10.
+_VT_RELEASE = 2
+_VT_ENUM_ADAPTERS1 = 12
+_VT_GET_DESC1 = 10
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class _DXGI_ADAPTER_DESC1(ctypes.Structure):
+    _fields_ = [
+        ("Description", ctypes.c_wchar * 128),
+        ("VendorId", ctypes.c_uint),
+        ("DeviceId", ctypes.c_uint),
+        ("SubSysId", ctypes.c_uint),
+        ("Revision", ctypes.c_uint),
+        ("DedicatedVideoMemory", ctypes.c_size_t),
+        ("DedicatedSystemMemory", ctypes.c_size_t),
+        ("SharedSystemMemory", ctypes.c_size_t),
+        ("AdapterLuid", _LUID),
+        ("Flags", ctypes.c_uint),
+    ]
+
+
+_IID_IDXGIFactory1 = _GUID(
+    0x770AAE78, 0xF26F, 0x4DBA,
+    (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87),
+)
+
+
+def _com_call(iface, slot, restype, argtypes, *args):
+    """Invoke a COM method by vtable slot - ctypes has no COM support."""
+    vtable = ctypes.cast(
+        iface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    fn = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtable[slot])
+    return fn(iface, *args)
+
+
+def adapter_key(vendor_id, device_id, subsys_id):
+    """Identity that survives reboots."""
+    return "%04X:%04X:%08X" % (vendor_id, device_id, subsys_id)
+
+
+def short_name(description):
+    name = re.sub(r"\(R\)|\(TM\)|Corporation", "", description)
+    name = re.sub(r"^\s*(NVIDIA|AMD|Intel|Microsoft)\s+", "", name.strip())
+    return re.sub(r"\s{2,}", " ", name).strip() or description.strip()
+
+
+def enumerate_adapters():
+    """Every display adapter DXGI knows about, as plain dicts.
+
+    Returns [] rather than raising if DXGI is unavailable - the app has to
+    stay useful without GPU numbers.
+    """
+    try:
+        dxgi = ctypes.WinDLL("dxgi")
+    except OSError:
+        return []
+
+    factory = ctypes.c_void_p()
+    if dxgi.CreateDXGIFactory1(ctypes.byref(_IID_IDXGIFactory1),
+                               ctypes.byref(factory)) != 0:
+        return []
+
+    adapters = []
+    try:
+        index = 0
+        while True:
+            iface = ctypes.c_void_p()
+            # non-zero is DXGI_ERROR_NOT_FOUND, i.e. the end of the list
+            hr = _com_call(factory, _VT_ENUM_ADAPTERS1, ctypes.c_long,
+                           [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)],
+                           index, ctypes.byref(iface))
+            if hr != 0:
+                break
+            try:
+                desc = _DXGI_ADAPTER_DESC1()
+                if _com_call(iface, _VT_GET_DESC1, ctypes.c_long,
+                             [ctypes.POINTER(_DXGI_ADAPTER_DESC1)],
+                             ctypes.byref(desc)) == 0:
+                    adapters.append({
+                        # two hex halves, matching the counter instance names
+                        # exactly so the two sources can be joined on it
+                        "luid": "%08X_%08X" % (desc.AdapterLuid.HighPart,
+                                               desc.AdapterLuid.LowPart),
+                        "name": short_name(desc.Description),
+                        "key": adapter_key(desc.VendorId, desc.DeviceId,
+                                           desc.SubSysId),
+                        "subsys": "%08X" % desc.SubSysId,
+                        "vram": int(desc.DedicatedVideoMemory),
+                        "is_software": bool(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE),
+                    })
+            finally:
+                _com_call(iface, _VT_RELEASE, ctypes.c_ulong, [])
+            index += 1
+    finally:
+        _com_call(factory, _VT_RELEASE, ctypes.c_ulong, [])
+    return adapters
+
+
+def display_label(adapter, among):
+    """Disambiguate identical cards by subsystem id, but only when needed."""
+    if sum(1 for a in among if a["name"] == adapter["name"]) > 1:
+        return "%s (%s)" % (adapter["name"], adapter["subsys"][-4:])
+    return adapter["name"]

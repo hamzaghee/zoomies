@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import backends
+import metrics
 import runner
 import state
 
@@ -133,6 +134,7 @@ class Zoomies:
         self.mode_keys = {}
         self.opt_result = None
 
+        self.metrics = None
         self._build_style()
         self._build_widgets()
 
@@ -142,6 +144,9 @@ class Zoomies:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(60, self._startup_checks)
+
+        self.metrics = metrics.Metrics(
+            self.shutdown, model_namer=self._live_model_name).start()
 
         self.workers = [
             threading.Thread(target=self._poll_loop, daemon=True, name="poll"),
@@ -170,7 +175,7 @@ class Zoomies:
         # physical size. Raw pixel measurements still need px() by hand.
         self.root.tk.call("tk", "scaling", dpi / 72.0)
 
-        want_w, want_h = self.px(980), self.px(720)
+        want_w, want_h = self.px(980), self.px(800)
         max_w = int(self.root.winfo_screenwidth() * 0.92)
         max_h = int(self.root.winfo_screenheight() * 0.92)
         width, height = min(want_w, max_w), min(want_h, max_h)
@@ -232,6 +237,17 @@ class Zoomies:
         st.configure("TLabelframe.Label", background=BG, foreground=ACCENT,
                      font=FONT_BOLD)
         st.configure("TSeparator", background=BORDER)
+        st.configure("Zoom.Horizontal.TProgressbar",
+                     background=ACCENT, troughcolor=BG_FIELD,
+                     bordercolor=BORDER, lightcolor=ACCENT,
+                     darkcolor=ACCENT, thickness=self.px(12))
+        st.configure("TNotebook", background=BG, bordercolor=BORDER,
+                     tabmargins=(2, 4, 2, 0))
+        st.configure("TNotebook.Tab", background=BG_FIELD,
+                     foreground=FG_DIM, padding=(14, 5))
+        st.map("TNotebook.Tab",
+               background=[("selected", BG_PANEL)],
+               foreground=[("selected", ACCENT)])
 
         self.root.option_add("*TCombobox*Listbox.background", BG_FIELD)
         self.root.option_add("*TCombobox*Listbox.foreground", FG)
@@ -373,15 +389,15 @@ class Zoomies:
 
         # ---- loaded --------------------------------------------------
         lbox = ttk.LabelFrame(self.root, text=" Loaded ")
-        lbox.pack(fill="both", expand=True, padx=8, pady=3)
+        lbox.pack(fill="x", padx=8, pady=3)
         cols = ("model", "backend", "vram", "context", "endpoint", "pid", "until")
         widths = (300, 90, 80, 80, 150, 60, 80)
-        self.tree = ttk.Treeview(lbox, columns=cols, show="headings", height=4)
+        self.tree = ttk.Treeview(lbox, columns=cols, show="headings", height=3)
         for col, w in zip(cols, widths):
             self.tree.heading(col, text=col.title())
             self.tree.column(col, width=self.px(w), minwidth=self.px(40),
                              anchor="w" if col in ("model", "endpoint") else "center")
-        self.tree.pack(fill="both", expand=True, padx=8, pady=(6, 2))
+        self.tree.pack(fill="x", padx=8, pady=(6, 2))
         self.tree.tag_configure("foreign", foreground=FG_DIM)
         self.tree.tag_configure("ours", foreground=FG)
         self.tree.bind("<Double-1>", lambda e: self._unload_selected())
@@ -397,18 +413,76 @@ class Zoomies:
         self.vram_lbl = ttk.Label(lbar, text="", style="Dim.TLabel")
         self.vram_lbl.pack(side="right")
 
-        # ---- output --------------------------------------------------
-        obox = ttk.LabelFrame(self.root, text=" Output ")
-        obox.pack(fill="both", expand=True, padx=8, pady=(3, 8))
-        obar = ttk.Frame(obox)
-        obar.pack(fill="x", padx=8, pady=(4, 0))
-        ttk.Button(obar, text="Open log", command=self._open_log).pack(side="right")
-        ttk.Button(obar, text="Open folder", command=self._open_scripts).pack(
-            side="right", padx=(0, 6))
+        self._build_live(self.root)
 
-        wrap = ttk.Frame(obox)
-        wrap.pack(fill="both", expand=True, padx=8, pady=(4, 8))
-        self.out = tk.Text(wrap, height=7, bg=BG_PANEL, fg=FG, font=FONT_MONO,
+        self._on_backend_change(initial=True)
+        self._toggle_top()
+
+    def _build_live(self, parent):
+        """Compact live-metrics strip plus a tabbed History/Output pane.
+
+        Tabs rather than three stacked panes: the window is already tall, and
+        History and Output are rarely both wanted at once.
+        """
+        box = ttk.LabelFrame(parent, text=" Live ")
+        box.pack(fill="both", expand=True, padx=8, pady=3)
+
+        top = ttk.Frame(box)
+        top.pack(fill="x", padx=8, pady=(6, 2))
+        self.live_status = ttk.Label(top, text="Waiting for activity...",
+                                     style="Head.TLabel")
+        self.live_status.pack(side="left")
+        self.live_gpu = ttk.Label(top, text="", style="Dim.TLabel")
+        self.live_gpu.pack(side="right")
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", padx=8, pady=(0, 2))
+        self.live_stats = {}
+        for key, label in (("prompt", "Prompt eval"), ("ttft", "TTFT"),
+                           ("gen", "Generation"), ("tokens", "Generated")):
+            cell = ttk.Frame(row)
+            cell.pack(side="left", padx=(0, self.px(22)))
+            ttk.Label(cell, text=label, style="Dim.TLabel").pack(anchor="w")
+            value = ttk.Label(cell, text="-", style="TLabel",
+                              font=("Consolas", 11, "bold"))
+            value.pack(anchor="w")
+            self.live_stats[key] = value
+
+        ctx = ttk.Frame(box)
+        ctx.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Label(ctx, text="Context", style="Dim.TLabel",
+                  width=9).pack(side="left")
+        self.ctx_bar = ttk.Progressbar(ctx, mode="determinate", maximum=1000,
+                                       style="Zoom.Horizontal.TProgressbar")
+        self.ctx_bar.pack(side="left", fill="x", expand=True)
+        self.ctx_label = ttk.Label(ctx, text="-", style="Dim.TLabel")
+        self.ctx_label.pack(side="left", padx=(8, 0))
+
+        tabs = ttk.Notebook(box)
+        tabs.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        hist = ttk.Frame(tabs)
+        tabs.add(hist, text="  History  ")
+        cols = ("time", "backend", "model", "ttft", "tok/s", "tokens", "context")
+        widths = (70, 80, 240, 70, 80, 80, 90)
+        self.hist_tree = ttk.Treeview(hist, columns=cols, show="headings",
+                                      height=7)
+        for col, w in zip(cols, widths):
+            self.hist_tree.heading(col, text=col.title())
+            self.hist_tree.column(col, width=self.px(w), minwidth=self.px(40),
+                                  anchor="w" if col == "model" else "center")
+        self.hist_tree.pack(fill="both", expand=True)
+
+        out = ttk.Frame(tabs)
+        tabs.add(out, text="  Output  ")
+        bar = ttk.Frame(out)
+        bar.pack(fill="x", pady=(4, 2))
+        ttk.Button(bar, text="Open log", command=self._open_log).pack(side="right")
+        ttk.Button(bar, text="Open folder",
+                   command=self._open_scripts).pack(side="right", padx=(0, 6))
+        wrap = ttk.Frame(out)
+        wrap.pack(fill="both", expand=True)
+        self.out = tk.Text(wrap, height=6, bg=BG_PANEL, fg=FG, font=FONT_MONO,
                            relief="flat", wrap="none", insertbackground=FG,
                            highlightthickness=1, highlightbackground=BORDER)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.out.yview)
@@ -417,9 +491,89 @@ class Zoomies:
         sb.pack(side="right", fill="y")
         self.out.tag_configure("err", foreground=BAD)
         self.out.tag_configure("note", foreground=ACCENT)
+        self.tabs = tabs
 
-        self._on_backend_change(initial=True)
-        self._toggle_top()
+    def _refresh_live(self):
+        snap = self.metrics.snapshot()
+
+        backend = snap.get("backend") or ""
+        label = backend and (backends.get(backend).display_name
+                             if backends.get(backend) else backend)
+        status = snap.get("status") or ""
+        self.live_status.configure(
+            text="%s%s" % (status, "   -   %s" % label if label else ""),
+            style="Ok.TLabel" if status == "Generating..." else "Head.TLabel")
+
+        self.live_stats["prompt"].configure(
+            text=metrics.fmt(snap.get("prompt_tps"), " t/s"))
+        self.live_stats["ttft"].configure(
+            text=metrics.fmt(snap.get("ttft"), "s", 2))
+        gen = metrics.fmt(snap.get("tg"), " t/s")
+        if snap.get("tg3s") is not None:
+            gen += "  (3s %s)" % metrics.fmt(snap.get("tg3s"))
+        self.live_stats["gen"].configure(text=gen)
+        self.live_stats["tokens"].configure(
+            text=metrics.fmt_int(snap.get("n_gen")))
+
+        used, total = snap.get("n_tokens"), snap.get("n_ctx")
+        if used and total:
+            self.ctx_bar.configure(value=min(1000, int(1000.0 * used / total)))
+            self.ctx_label.configure(text="%s / %s" % (format(used, ","),
+                                                       format(total, ",")))
+        else:
+            self.ctx_bar.configure(value=0)
+            self.ctx_label.configure(text="-")
+
+        gpus = snap.get("gpus") or []
+        if gpus:
+            parts = []
+            for gpu in gpus:
+                pct = gpu.get("pct")
+                parts.append("%s %s" % (gpu["name"],
+                                        "-" if pct is None else "%.0f%%" % pct))
+            self.live_gpu.configure(text="   ".join(parts), style="Dim.TLabel")
+        elif snap.get("gpu_error"):
+            self.live_gpu.configure(text="GPU: %s" % snap["gpu_error"],
+                                    style="Bad.TLabel")
+
+        rows = snap.get("history") or []
+        existing = set(self.hist_tree.get_children(""))
+        wanted = set()
+        for i, row in enumerate(rows):
+            iid = "h%d" % i
+            wanted.add(iid)
+            be = backends.get(row.get("backend") or "")
+            values = (
+                row.get("time", ""),
+                be.display_name if be else (row.get("backend") or "-"),
+                row.get("model") or "-",
+                metrics.fmt(row.get("ttft"), "s", 2),
+                metrics.fmt(row.get("tg3s")),
+                metrics.fmt_int(row.get("n_gen")),
+                metrics.fmt_int(row.get("n_ctx")),
+            )
+            if iid in existing:
+                self.hist_tree.item(iid, values=values)
+            else:
+                self.hist_tree.insert("", "end", iid=iid, values=values)
+        for iid in existing - wanted:
+            self.hist_tree.delete(iid)
+
+    def _live_model_name(self, backend):
+        """What to label a finished request with.
+
+        Whatever that backend reports as loaded right now is the best answer
+        available - llama.cpp's timing lines carry no model name at all.
+        """
+        try:
+            be = backends.get(backend)
+            loaded = be.list_loaded() if be else []
+            if loaded:
+                return loaded[0].label
+        except Exception:                          # noqa: BLE001
+            pass
+        model = self.selected_model()
+        return model.label if model else ""
 
     # ------------------------------------------------------------------
     # helpers
@@ -1040,6 +1194,9 @@ class Zoomies:
         for iid in existing - wanted:
             self.tree.delete(iid)
 
+        if self.metrics is not None:
+            self._refresh_live()
+
         total = sum(i.vram_bytes for i in loaded)
         self.vram_lbl.configure(
             text="VRAM in use: %s" % human_bytes(total) if total else "")
@@ -1074,6 +1231,8 @@ class Zoomies:
                 self.root.after_cancel(self.after_id)
             except tk.TclError:
                 pass
+        if self.metrics is not None:
+            self.metrics.cleanup()
         self.cfg["unload_on_exit"] = bool(self.unload_exit.get())
         state.save_config(self.cfg)
         state.save_session(self.session)

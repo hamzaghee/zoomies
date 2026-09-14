@@ -179,11 +179,42 @@ NOTES FOR THIS MACHINE
     8192-65536 is the realistic range.
 
 
+THE LIVE PANEL
+  Once a model is answering, the Live strip shows what it is actually
+  doing: prompt-eval speed, time to first token, generation rate (plus a
+  3-second average), tokens produced, and how much of the context window
+  is used. Your GPUs and their utilisation sit on the right.
+
+  This works for BOTH backends from one parser. Ollama and Unsloth both
+  run llama.cpp underneath, and llama.cpp writes the same timing lines
+  either way - Unsloth just puts a timestamp in front. Only the location
+  differs:
+
+    Ollama    %LOCALAPPDATA%\Ollama\server.log      one file
+    Unsloth   ~\.unsloth\studio\logs\llama-server\  a new file per run
+
+  so the Unsloth reader follows whichever file is newest.
+
+  The History tab keeps the last 25 requests. A request is filed when the
+  next one starts OR once it has been quiet for five seconds - so the
+  last request of a session still appears, which it would not if it only
+  filed on the next prompt.
+
+  GPU numbers come from Windows' own "GPU Engine" counters, the same
+  source Task Manager reads, and show the highest engine per card rather
+  than the sum (summing would double count engines running in parallel).
+  Cards are named through DXGI, and two identical cards are told apart by
+  the last four digits of their subsystem ID.
+
+
 STATUS
   v0    Ollama backend, manual settings, load/unload, dashboard.  DONE
   v0.5  the optimizer - recommended settings from the live docs.  DONE
   v1    Unsloth Studio backend, both radio buttons live.          DONE
-  next  live tokens/sec, time-to-first-token and GPU utilisation
+  v1.5  live tokens/sec, TTFT, context bar and GPU utilisation.   DONE
+
+  Zoomies now covers everything the separate Ollama Monitor did, for
+  both backends rather than just Ollama.
 
 KNOWN ROUGH EDGE
   Unsloth reports a cached model's size as the whole downloaded folder,
