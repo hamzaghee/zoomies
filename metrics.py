@@ -68,6 +68,18 @@ RE_GEN = re.compile(
     r"n_gen\s*=\s*(?P<n_gen>\d+), tg\s*=\s*(?P<tg>[\d.]+) t/s, "
     r"tg_3s\s*=\s*(?P<tg3s>[\d.]+) t/s")
 
+# Printed once a request finishes - exact averages, better than anything we
+# can derive. "eval time" also appears inside "prompt eval time", so the
+# generation pattern must refuse a match preceded by "prompt ".
+RE_PROMPT_EVAL = re.compile(
+    r"prompt eval time =\s*(?P<ms>[\d.]+) ms /\s*(?P<n>\d+) tokens"
+    r".*?(?P<tps>[\d.]+) tokens per second")
+RE_EVAL = re.compile(
+    r"(?<!prompt )eval time =\s*(?P<ms>[\d.]+) ms /\s*(?P<n>\d+) tokens"
+    r".*?(?P<tps>[\d.]+) tokens per second")
+RE_TOTAL = re.compile(r"total time =\s*(?P<ms>[\d.]+) ms")
+RE_KV = re.compile(r"llama_kv_cache:.*?K \((?P<k>[^)]+)\).*?V \((?P<v>[^)]+)\)")
+
 LUID_RE = re.compile(r"luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)")
 
 GPU_POLL_SECONDS = 2
@@ -149,7 +161,7 @@ def backend_for_image(path):
 
 
 def llama_server_ports():
-    """{port: backend} for every llama-server listening on this machine.
+    """{port: (backend, pid)} for every llama-server on this machine.
 
     llama-server picks a random port each time a model loads, so it has to
     be discovered. netstat maps listening ports to pids in about 60 ms.
@@ -178,10 +190,52 @@ def llama_server_ports():
         if address not in ("127.0.0.1", "0.0.0.0", "[::1]", "[::]"):
             continue
         try:
-            found[int(port)] = backend_for_image(process_image(pid))
+            found[int(port)] = (backend_for_image(process_image(pid)), pid)
         except ValueError:
             continue
     return found
+
+
+def parse_cache_types(cmdline):
+    """KV cache quantisation from a llama-server command line.
+
+    llama-server does not report its cache type on any endpoint, but the
+    launcher always spells it out on the command line - Ollama turns the
+    OLLAMA_KV_CACHE_TYPE environment variable into --cache-type-k/-v flags.
+    No flag means llama.cpp's default, f16.
+    """
+    def find(flags):
+        for flag in flags:
+            m = re.search(r"(?:^|\s)%s(?:\s+|=)(\S+)" % re.escape(flag),
+                          cmdline or "")
+            if m:
+                return m.group(1).strip('"')
+        return "f16"
+    k = find(("--cache-type-k", "-ctk"))
+    v = find(("--cache-type-v", "-ctv"))
+    return k if k == v else "K %s / V %s" % (k, v)
+
+
+_KV_BY_PID = {}
+
+
+def cache_types_for_pid(pid):
+    """Looked up once per llama-server process - about a quarter of a second
+    through WMI - and cached, since the flags cannot change while it runs."""
+    if pid in _KV_BY_PID:
+        return _KV_BY_PID[pid]
+    script = ("(Get-CimInstance Win32_Process -Filter 'ProcessId=%d')"
+              ".CommandLine" % int(pid))
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=30,
+            creationflags=CREATE_NO_WINDOW).stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    kv = parse_cache_types(out) if out.strip() else None
+    _KV_BY_PID[pid] = kv
+    return kv
 
 
 def fetch_slots(port, timeout=1.0):
@@ -231,6 +285,7 @@ class Metrics:
             "n_gen": None, "tg": None, "tg3s": None, "ttft": None,
             "last_update": None, "request_start": None,
             "first_gen_seen": False, "filed": False,
+            "gen_avg": None, "runtime": None, "kv": None,
             "gpus": [], "gpu_error": "",
         }
 
@@ -335,6 +390,7 @@ class Metrics:
                         "n_gen": None, "tg": None, "tg3s": None, "ttft": None,
                         "request_start": now, "first_gen_seen": False,
                         "last_update": now, "filed": False,
+                        "gen_avg": None, "runtime": None, "gen0": None,
                     })
                 continue
 
@@ -350,8 +406,37 @@ class Metrics:
                     })
                 continue
 
+            m = RE_KV.search(line)
+            if m:
+                k, v = m.group("k").strip(), m.group("v").strip()
+                with self.lock:
+                    self.state["kv"] = k if k == v else "K %s / V %s" % (k, v)
+                continue
+
+            m = RE_PROMPT_EVAL.search(line)
+            if m:
+                with self.lock:
+                    self.state["prompt_tps"] = float(m.group("tps"))
+                    self.state["last_update"] = now
+                continue
+
+            m = RE_EVAL.search(line)
+            if m:
+                with self.lock:          # exact run average, first to last token
+                    self.state["gen_avg"] = float(m.group("tps"))
+                    self.state["last_update"] = now
+                continue
+
+            m = RE_TOTAL.search(line)
+            if m:
+                with self.lock:
+                    self.state["runtime"] = float(m.group("ms")) / 1000.0
+                    self.state["last_update"] = now
+                continue
+
             m = RE_GEN.search(line)
             if m:
+                n_gen = int(m.group("n_gen"))
                 with self.lock:
                     # Time to first token is wall clock between the prompt
                     # arriving and the first generation line, because
@@ -359,9 +444,18 @@ class Metrics:
                     if not self.state["first_gen_seen"] and self.state["request_start"]:
                         self.state["ttft"] = now - self.state["request_start"]
                         self.state["first_gen_seen"] = True
+                    # Estimates until llama.cpp prints its exact end-of-request
+                    # figures, which then overwrite these.
+                    gen0 = self.state.get("gen0")
+                    if gen0 is None:
+                        self.state["gen0"] = (now, n_gen)
+                    elif now > gen0[0] and n_gen > gen0[1]:
+                        self.state["gen_avg"] = (n_gen - gen0[1]) / (now - gen0[0])
+                    if self.state.get("request_start"):
+                        self.state["runtime"] = now - self.state["request_start"]
                     self.state.update({
                         "status": "Generating...", "backend": backend,
-                        "n_gen": int(m.group("n_gen")),
+                        "n_gen": n_gen,
                         "tg": float(m.group("tg")),
                         "tg3s": float(m.group("tg3s")),
                         "last_update": now,
@@ -374,9 +468,10 @@ class Metrics:
             now = time.time()
             if now - scanned > PORT_REFRESH_SECONDS:
                 ports, scanned = self.port_finder(), now
-            for port, backend in ports.items():
+            for port, (backend, pid) in ports.items():
+                kv = cache_types_for_pid(pid)
                 for slot in fetch_slots(port):
-                    self._observe_slot(port, backend, slot, time.time())
+                    self._observe_slot(port, backend, slot, time.time(), kv=kv)
             self._reap_idle()
             self.shutdown.wait(SLOTS_POLL_SECONDS)
 
@@ -395,7 +490,7 @@ class Metrics:
                     and last and time.time() - last > IDLE_AFTER):
                 self._push_history(self.state.get("backend") or "")
 
-    def _observe_slot(self, port, backend, slot, now):
+    def _observe_slot(self, port, backend, slot, now, kv=None):
         """Turn one /slots sample into the same state the log parser builds.
 
         n_prompt_tokens already includes generated tokens (prompt + decoded),
@@ -425,12 +520,17 @@ class Metrics:
                          "prompt_t": now,
                          # prompt-phase baseline, only if we arrived before
                          # generation started; otherwise the average is unknown
-                         "p0": None, "pt0": None}
+                         "p0": None, "pt0": None,
+                         # generation: first token, previous sample, latest token
+                         "t_first": None, "d_first": None,
+                         "t_prev": None, "d_prev": None,
+                         "t_last": None, "d_last": None}
                 self._tracks[key] = track
                 self.state.update({"n_gen": None, "tg": None, "tg3s": None,
                                    "ttft": None, "prompt_tps": None,
                                    "request_start": now, "filed": False,
-                                   "first_gen_seen": False})
+                                   "first_gen_seen": False,
+                                   "gen_avg": None, "runtime": None})
 
             processed = int(slot.get("n_prompt_tokens_processed") or 0)
             n_prompt = int(slot.get("n_prompt_tokens") or 0)
@@ -457,6 +557,8 @@ class Metrics:
             update = {"backend": backend, "last_update": now,
                       "n_ctx": slot.get("n_ctx"), "n_tokens": n_prompt,
                       "prompt_progress": min(1.0, processed / prompt_total)}
+            if kv:
+                update["kv"] = kv
             if decoded > 0:
                 if track["first_tok"] is None:
                     track["first_tok"] = now
@@ -466,17 +568,22 @@ class Metrics:
                     if track["prompt_done"]:
                         update["ttft"] = now - track["start"]
                     update["first_gen_seen"] = True
-                samples = track["samples"]
-                samples.append((now, decoded))
-                while len(samples) > 2 and now - samples[0][0] > 3.0:
-                    samples.popleft()
-                if len(samples) >= 2:
-                    (t0, d0), (t1, d1) = samples[-2], samples[-1]
-                    if t1 > t0:
-                        update["tg"] = (d1 - d0) / (t1 - t0)
-                    ta, da = samples[0]
-                    if t1 > ta:
-                        update["tg3s"] = (d1 - da) / (t1 - ta)
+                    track["t_first"], track["d_first"] = now, decoded
+                # Current rate: since the previous sample, stalls included.
+                if track["t_prev"] is not None and now > track["t_prev"]:
+                    update["tg"] = (decoded - track["d_prev"]) / (now - track["t_prev"])
+                track["t_prev"], track["d_prev"] = now, decoded
+                # Run average: first token to the latest token. The end is the
+                # last time the count actually rose, so time spent idle after
+                # the final token does not dilute it.
+                if track["d_last"] is None or decoded > track["d_last"]:
+                    track["t_last"], track["d_last"] = now, decoded
+                if track["t_last"] > track["t_first"]:
+                    update["gen_avg"] = ((track["d_last"] - track["d_first"])
+                                         / (track["t_last"] - track["t_first"]))
+                # Runtime only if the request was watched from its start.
+                if track["p0"] is not None:
+                    update["runtime"] = track["t_last"] - track["start"]
                 update["status"] = "Generating..."
                 update["n_gen"] = decoded
             else:
@@ -503,6 +610,8 @@ class Metrics:
             "model": self.model_namer(s.get("backend") or backend),
             "ttft": s.get("ttft"), "tg3s": s.get("tg3s"),
             "prompt_tps": s.get("prompt_tps"),
+            "gen_avg": s.get("gen_avg"), "runtime": s.get("runtime"),
+            "kv": s.get("kv"),
             "n_gen": s.get("n_gen"), "n_tokens": s.get("n_tokens"),
             "n_ctx": s.get("n_ctx"),
         })
@@ -651,6 +760,25 @@ def fmt(value, suffix="", digits=1):
     if isinstance(value, float):
         return ("%%.%df%%s" % digits) % (value, suffix)
     return "%s%s" % (value, suffix)
+
+
+BAR_FULL, BAR_EMPTY = "\u2588", "\u2591"
+
+
+def bar_text(used, total, width=12):
+    """A text bar for a table cell, where no real widget can go."""
+    if not used or not total:
+        return "-"
+    filled = max(0, min(width, int(width * used / float(total) + 0.5)))
+    return "%s%s  %s / %s" % (BAR_FULL * filled, BAR_EMPTY * (width - filled),
+                              format(int(used), ","), format(int(total), ","))
+
+
+def fmt_mmss(seconds):
+    if seconds is None:
+        return "-"
+    whole = int(round(seconds))
+    return "%02d:%02d" % (whole // 60, whole % 60)
 
 
 def fmt_int(value):

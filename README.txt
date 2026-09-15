@@ -153,6 +153,18 @@ esolved.json
   is greyed out: Ollama takes reasoning per request, so the app sending
   the prompt (jobbuddy, for example) decides, not the launcher.
 
+  KV CACHE
+  The KV cache dropdown sits beside Parallel and offers the same types
+  as Unsloth Studio's own: f16 (the default), bf16, q8_0, q4_0, q4_1,
+  q5_0, q5_1, iq4_nl and f32. Smaller types (q8_0, q4_0...) let a longer
+  context fit in the same VRAM, at some cost in quality.
+
+  Unsloth applies it every time a model loads. On Ollama it is greyed out
+  and shows the current value, because Ollama takes it from the
+  OLLAMA_KV_CACHE_TYPE environment variable for every model at once - on
+  this machine that is q8_0. The value actually in use shows in the Live
+  panel and in History either way.
+
   IT WILL LEAVE THE BOXES EMPTY RATHER THAN GUESS. If the docs have no
   page for your model you get an empty form and a list of pages to pick
   from, not a near-match. A wrong temperature looks exactly like a right

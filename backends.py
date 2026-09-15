@@ -171,6 +171,49 @@ def http_json(url, method="GET", payload=None, timeout=5.0):
 # base class
 # --------------------------------------------------------------------------
 
+# KV cache types, in the order Unsloth Studio's own dropdown lists them, with
+# llama.cpp's default spelled out first. One value sets both K and V, the same
+# single knob Unsloth exposes.
+KV_CACHE_DEFAULT = "f16 (default)"
+KV_CACHE_CHOICES = (KV_CACHE_DEFAULT, "bf16", "q8_0", "q4_0", "q4_1",
+                    "q5_0", "q5_1", "iq4_nl", "f32")
+
+
+def kv_choice_value(choice):
+    """The cache type to send, or None for llama.cpp's own default."""
+    value = str(choice or "").strip()
+    if not value or value == KV_CACHE_DEFAULT or value not in KV_CACHE_CHOICES:
+        return None
+    return value
+
+
+def ollama_kv_cache_type():
+    """Ollama's KV cache type is fixed server-wide by OLLAMA_KV_CACHE_TYPE.
+
+    Read from the registry as well as this process's environment, so a value
+    set after Zoomies started is still seen. A user value overrides the
+    machine one, the same precedence Windows itself applies.
+    """
+    value = os.environ.get("OLLAMA_KV_CACHE_TYPE", "")
+    if not value:
+        try:
+            import winreg
+            for root, path in (
+                    (winreg.HKEY_CURRENT_USER, "Environment"),
+                    (winreg.HKEY_LOCAL_MACHINE,
+                     r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+                try:
+                    with winreg.OpenKey(root, path) as key:
+                        value = winreg.QueryValueEx(key, "OLLAMA_KV_CACHE_TYPE")[0]
+                except OSError:
+                    continue
+                if value:
+                    break
+        except ImportError:
+            pass
+    return (value or "f16").strip()
+
+
 def reasoning_kwargs(settings):
     """Chat-template kwargs for the chosen reasoning setting, or None.
 
@@ -223,6 +266,10 @@ class Backend:
 
     def list_loaded(self):
         return []
+
+    def fixed_kv_cache(self):
+        """A KV cache type this backend imposes regardless of Zoomies, or None."""
+        return None
 
 
 REGISTRY = {}
@@ -469,6 +516,9 @@ class OllamaBackend(Backend):
             ))
         out.sort(key=lambda m: m.label.lower())
         return out
+
+    def fixed_kv_cache(self):
+        return ollama_kv_cache_type()
 
     def installed_names(self):
         data, err = http_json(OLLAMA_BASE + "/api/tags", timeout=6.0)
@@ -915,6 +965,8 @@ class UnslothBackend(Backend):
             return "passed to llama-server"
         if key == "reasoning":
             return "applied at load"
+        if key == "kv_cache":
+            return "applied at load"
         return ""          # keep_alive: the model lives as long as the server
 
     # -- what is loaded ----------------------------------------------------
@@ -1047,6 +1099,12 @@ class UnslothBackend(Backend):
             raw = json.dumps(kwargs, separators=(",", ":"))
             args.append("'--chat-template-kwargs',%s"
                         % runner.ps_single(raw.replace('"', '\\"')))
+        kv_type = kv_choice_value(settings.get("kv_cache"))
+        if kv_type:
+            # Plain passthrough: Unsloth leaves --cache-type-* to llama.cpp and
+            # appends them after its own flags, so these win.
+            args.append("'--cache-type-k',%s" % runner.ps_single(kv_type))
+            args.append("'--cache-type-v',%s" % runner.ps_single(kv_type))
         # Always explicit, always headless: the requirement is that the
         # backend's own window never opens.
         args.extend(["'--host',%s" % runner.ps_single(UNSLOTH_HOST),
@@ -1083,6 +1141,9 @@ class UnslothBackend(Backend):
                 fields[target] = value
         if model.quant:
             fields["gguf_variant"] = model.quant
+        kv_type = kv_choice_value(settings.get("kv_cache"))
+        if kv_type:
+            fields["cache_type_kv"] = kv_type
 
         pinned = [label for key, label in
                   (("temperature", "Temperature"), ("top_p", "Top P"),

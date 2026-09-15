@@ -138,6 +138,7 @@ class Zoomies:
         self.mode_keys = {}
         self.reasoning = None             # docs' reasoning control, if any
         self._pending_reason = None       # level to keep across a mode re-read
+        self._kv_choice = backends.KV_CACHE_DEFAULT   # remembered across toggles
         self._reasoning_is_variant = False
         self.opt_result = None
 
@@ -367,7 +368,10 @@ class Zoomies:
                             style="Dim.TLabel", anchor="e")
             lab.grid(row=row, column=col * 2, sticky="e", padx=(0, 6), pady=3)
             var = tk.StringVar()
-            ent = ttk.Entry(grid, textvariable=var, justify="left")
+            # Small minimum width: the columns stretch to fill the window
+            # anyway, and the default 20 characters made the grid wider
+            # than the window at its minimum size.
+            ent = ttk.Entry(grid, textvariable=var, justify="left", width=8)
             ent.grid(row=row, column=col * 2 + 1, sticky="ew",
                      padx=(0, self.px(18)), pady=3,
                      columnspan=(span * 2 - 1) if span > 1 else 1)
@@ -380,6 +384,20 @@ class Zoomies:
             for col, key in enumerate(keys):
                 if key:
                     make_field(key, row, col)
+        # KV cache takes the free cell beside Parallel: it is a load-time
+        # setting like its neighbours, and the top bar has no room left.
+        kv_row = len(backends.SETTING_ROWS) - 1
+        self.kv_label = ttk.Label(grid, text="KV cache", style="Dim.TLabel",
+                                  anchor="e")
+        self.kv_label.grid(row=kv_row, column=6, sticky="e", padx=(0, 6), pady=3)
+        self.kv_var = tk.StringVar(value=backends.KV_CACHE_DEFAULT)
+        self.kv_box = ttk.Combobox(grid, textvariable=self.kv_var,
+                                   state="readonly", width=8,
+                                   values=backends.KV_CACHE_CHOICES)
+        self.kv_box.grid(row=kv_row, column=7, sticky="ew",
+                         padx=(0, self.px(18)), pady=3)
+        self.kv_box.bind("<<ComboboxSelected>>", lambda e: self._kv_changed())
+
         for key in backends.SETTING_WIDE:
             row += 1
             make_field(key, row, 0, span=4)
@@ -453,7 +471,8 @@ class Zoomies:
         row.pack(fill="x", padx=8, pady=(0, 2))
         self.live_stats = {}
         for key, label in (("prompt", "Prompt eval (avg)"), ("ttft", "TTFT"),
-                           ("gen", "Generation"), ("tokens", "Generated")):
+                           ("gen", "Generation"), ("tokens", "Generated"),
+                           ("kv", "KV cache")):
             cell = ttk.Frame(row)
             cell.pack(side="left", padx=(0, self.px(22)))
             ttk.Label(cell, text=label, style="Dim.TLabel").pack(anchor="w")
@@ -478,17 +497,19 @@ class Zoomies:
         hist = ttk.Frame(tabs)
         tabs.add(hist, text="  History  ")
         cols = ("time", "backend", "model", "ttft", "prompt", "gen",
-                "tokens", "context")
-        widths = (70, 80, 220, 65, 90, 80, 70, 80)
+                "runtime", "tokens", "kv")
+        widths = (65, 75, 185, 60, 95, 90, 65, 245, 70)
         headings = {"time": "Time", "backend": "Backend", "model": "Model",
                     "ttft": "TTFT", "prompt": "Prompt t/s (avg)",
-                    "gen": "Gen t/s", "tokens": "Tokens", "context": "Context"}
+                    "gen": "Gen t/s (avg)", "runtime": "Runtime",
+                    "tokens": "Tokens (context used)", "kv": "KV"}
         self.hist_tree = ttk.Treeview(hist, columns=cols, show="headings",
                                       height=7)
         for col, w in zip(cols, widths):
             self.hist_tree.heading(col, text=headings[col])
             self.hist_tree.column(col, width=self.px(w), minwidth=self.px(40),
-                                  anchor="w" if col == "model" else "center")
+                                  anchor="w" if col in ("model", "tokens")
+                                  else "center")
         self.hist_tree.pack(fill="both", expand=True)
 
         out = ttk.Frame(tabs)
@@ -526,12 +547,10 @@ class Zoomies:
             text=metrics.fmt(snap.get("prompt_tps"), " t/s"))
         self.live_stats["ttft"].configure(
             text=metrics.fmt(snap.get("ttft"), "s", 2))
-        gen = metrics.fmt(snap.get("tg"), " t/s")
-        if snap.get("tg3s") is not None:
-            gen += "  (3s %s)" % metrics.fmt(snap.get("tg3s"))
-        self.live_stats["gen"].configure(text=gen)
+        self.live_stats["gen"].configure(text=metrics.fmt(snap.get("tg"), " t/s"))
         self.live_stats["tokens"].configure(
             text=metrics.fmt_int(snap.get("n_gen")))
+        self.live_stats["kv"].configure(text=snap.get("kv") or "-")
 
         used, total = snap.get("n_tokens"), snap.get("n_ctx")
         if used and total:
@@ -567,9 +586,10 @@ class Zoomies:
                 row.get("model") or "-",
                 metrics.fmt(row.get("ttft"), "s", 2),
                 metrics.fmt(row.get("prompt_tps")),
-                metrics.fmt(row.get("tg3s")),
-                metrics.fmt_int(row.get("n_gen")),
-                metrics.fmt_int(row.get("n_ctx")),
+                metrics.fmt(row.get("gen_avg")),
+                metrics.fmt_mmss(row.get("runtime")),
+                self._token_cell(row),
+                row.get("kv") or "-",
             )
             if iid in existing:
                 self.hist_tree.item(iid, values=values)
@@ -577,6 +597,14 @@ class Zoomies:
                 self.hist_tree.insert("", "end", iid=iid, values=values)
         for iid in existing - wanted:
             self.hist_tree.delete(iid)
+
+    @staticmethod
+    def _token_cell(row):
+        """Context used as a bar, with the tokens this request generated."""
+        cell = metrics.bar_text(row.get("n_tokens"), row.get("n_ctx"))
+        if cell != "-" and row.get("n_gen"):
+            cell += "  (+%s)" % metrics.fmt_int(row.get("n_gen"))
+        return cell
 
     def _live_model_name(self, backend):
         """What to label a finished request with.
@@ -622,6 +650,10 @@ class Zoomies:
         if info and level in info["levels"] and self.backend().supports("reasoning"):
             out["reasoning"] = level
             out["reasoning_style"] = info["style"]
+        if self.backend().supports("kv_cache"):
+            kv_type = backends.kv_choice_value(self.kv_var.get())
+            if kv_type:
+                out["kv_cache"] = kv_type
         return out
 
     def _mark_dirty(self, key):
@@ -699,8 +731,13 @@ class Zoomies:
         if not be.supports("reasoning"):
             msg += (" Reasoning is chosen per request by whichever app sends "
                     "the prompt.")
+        fixed_kv = be.fixed_kv_cache()
+        if fixed_kv and not be.supports("kv_cache"):
+            msg += (" KV cache is fixed at %s by OLLAMA_KV_CACHE_TYPE for "
+                    "every model." % fixed_kv)
         self.notes_lbl.configure(text=msg)
         self._refresh_reason_box()
+        self._refresh_kv_box()
 
         self._reload_models()
 
@@ -906,6 +943,28 @@ class Zoomies:
             self.reason_var.set(info["default"])
         self.reason_box.state(["!disabled"] if be.supports("reasoning")
                               else ["disabled"])
+
+    def _refresh_kv_box(self):
+        """Selectable where the backend applies it per load (Unsloth); on
+        Ollama it shows the server-wide value, greyed out, because Ollama
+        takes it from an environment variable, not from a load request."""
+        be = self.backend()
+        if be.supports("kv_cache"):
+            self.kv_box.configure(values=backends.KV_CACHE_CHOICES)
+            self.kv_var.set(self._kv_choice)
+            self.kv_box.state(["!disabled"])
+            self.kv_label.configure(style="Dim.TLabel")
+        else:
+            fixed = be.fixed_kv_cache()
+            self.kv_box.configure(values=())
+            self.kv_var.set("%s (fixed)" % fixed if fixed else "")
+            self.kv_box.state(["disabled"])
+            self.kv_label.configure(style="Off.TLabel")
+
+    def _kv_changed(self):
+        if backends.kv_choice_value(self.kv_var.get()) or \
+                self.kv_var.get() == backends.KV_CACHE_DEFAULT:
+            self._kv_choice = self.kv_var.get()
 
     def _reason_changed(self):
         """Switching reasoning off moves Mode to Instruct, and switching it on
