@@ -230,6 +230,14 @@ def reasoning_kwargs(settings):
             return None
         return {"enable_thinking": level == "on"}
     if style == "reasoning_effort":
+        if level in ("none", "off"):
+            # Thinking off is enable_thinking=false, never a "none" level.
+            # Qwen3.8's docs list "none", but its chat template only accepts
+            # xhigh/high/medium/low and raises on anything else - measured
+            # live: reasoning_effort "none" turned every request into an
+            # HTTP 500, while enable_thinking=false gave zero reasoning.
+            # Unsloth Studio disables these models the same way.
+            return {"enable_thinking": False}
         return {"reasoning_effort": level}
     return None
 
@@ -983,7 +991,11 @@ class UnslothBackend(Backend):
         context = int((status or {}).get("context_length") or 0)
         session = state.load_session()
         record = session.get("unsloth") or {}
-        ours = record.get("model_id", "")
+        # Loaded by Zoomies either by starting the server, or by loading into
+        # one that was already running. Missing the second case made Unload
+        # warn "not started by Zoomies" about a model Zoomies had just loaded.
+        ours = {record.get("model_id", ""),
+                (session.get("zoomies_loads") or {}).get(self.name, "")} - {""}
         out = []
         for item in (listing or {}).get("data", []) or []:
             if not item.get("loaded"):
@@ -994,7 +1006,7 @@ class UnslothBackend(Backend):
                 label=item.get("display_name") or repo,
                 context=context, endpoint=UNSLOTH_BASE,
                 pid=int(record.get("pid") or 0),
-                owned_by_us=(repo == ours),
+                owned_by_us=(repo in ours),
                 log_path=record.get("log", "")))
         return out
 
@@ -1129,7 +1141,7 @@ class UnslothBackend(Backend):
             kind="load", backend=self.name, script_text=body,
             script_path=script_path, log_path=log_path,
             endpoint=UNSLOTH_BASE, host=UNSLOTH_HOST, port=UNSLOTH_PORT,
-            long_lived=True, notes=notes)
+            long_lived=True, notes=notes, model_id=model.id)
 
     def _load_into_running(self, model, settings, extra, notes, script_path,
                            log_path, source_note):
@@ -1195,7 +1207,7 @@ class UnslothBackend(Backend):
             kind="load", backend=self.name, script_text=body,
             script_path=script_path, log_path=log_path,
             endpoint=UNSLOTH_BASE, host=UNSLOTH_HOST, port=UNSLOTH_PORT,
-            long_lived=False, notes=notes)
+            long_lived=False, notes=notes, model_id=model.id)
 
     def build_stop(self, loaded, session):
         script_path, log_path = runner.new_paths(self.name,

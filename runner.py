@@ -76,6 +76,7 @@ class LaunchPlan:
     long_lived: bool = False
     creates_tag: str = ""           # Ollama: tag to record for later cleanup
     removes_tag: str = ""           # Ollama: tag this script deletes
+    model_id: str = ""              # the model a load plan brings up, if known
     notes: list = field(default_factory=list)   # warnings shown BEFORE running
 
 

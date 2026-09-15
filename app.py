@@ -1149,6 +1149,11 @@ class Zoomies:
         self.busy = False
         self.load_btn.state(["!disabled"])
         if res.ok:
+            loads = self.session.setdefault("zoomies_loads", {})
+            if plan.kind == "load" and plan.model_id:
+                loads[plan.backend] = plan.model_id
+            elif plan.kind == "stop":
+                loads.pop(plan.backend, None)
             if plan.long_lived:
                 # Record enough to find this server again after a restart,
                 # and to kill it properly: the server spawns llama-server.exe
