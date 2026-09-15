@@ -126,12 +126,19 @@ class Zoomies:
 
         self.busy = False
         self.models = []
+        # Model lists per (backend, folder), so flipping backends shows the
+        # last known list instantly while a fresh one loads in the background.
+        self.model_cache = {}
+        self._model_req = 0
         self.current_plan = None
         self.after_id = None
         self.source_note = ""
         self.doc_line = ""
         self.scale = 1.0
         self.mode_keys = {}
+        self.reasoning = None             # docs' reasoning control, if any
+        self._pending_reason = None       # level to keep across a mode re-read
+        self._reasoning_is_variant = False
         self.opt_result = None
 
         self.metrics = None
@@ -328,6 +335,13 @@ class Zoomies:
                                      state="readonly", width=22)
         self.mode_box.pack(side="left")
         self.mode_box.bind("<<ComboboxSelected>>", lambda e: self._mode_changed())
+        ttk.Label(bar, text="Reasoning").pack(side="left", padx=(14, 4))
+        self.reason_var = tk.StringVar()
+        self.reason_box = ttk.Combobox(bar, textvariable=self.reason_var,
+                                       state="readonly", width=14)
+        self.reason_box.pack(side="left")
+        self.reason_box.bind("<<ComboboxSelected>>",
+                             lambda e: self._reason_changed())
         ttk.Button(bar, text="Clear", command=self._clear_settings).pack(
             side="left", padx=(10, 0))
         # Answers are saved permanently once found, so there has to be a way
@@ -438,7 +452,7 @@ class Zoomies:
         row = ttk.Frame(box)
         row.pack(fill="x", padx=8, pady=(0, 2))
         self.live_stats = {}
-        for key, label in (("prompt", "Prompt eval"), ("ttft", "TTFT"),
+        for key, label in (("prompt", "Prompt eval (avg)"), ("ttft", "TTFT"),
                            ("gen", "Generation"), ("tokens", "Generated")):
             cell = ttk.Frame(row)
             cell.pack(side="left", padx=(0, self.px(22)))
@@ -463,12 +477,16 @@ class Zoomies:
 
         hist = ttk.Frame(tabs)
         tabs.add(hist, text="  History  ")
-        cols = ("time", "backend", "model", "ttft", "tok/s", "tokens", "context")
-        widths = (70, 80, 240, 70, 80, 80, 90)
+        cols = ("time", "backend", "model", "ttft", "prompt", "gen",
+                "tokens", "context")
+        widths = (70, 80, 220, 65, 90, 80, 70, 80)
+        headings = {"time": "Time", "backend": "Backend", "model": "Model",
+                    "ttft": "TTFT", "prompt": "Prompt t/s (avg)",
+                    "gen": "Gen t/s", "tokens": "Tokens", "context": "Context"}
         self.hist_tree = ttk.Treeview(hist, columns=cols, show="headings",
                                       height=7)
         for col, w in zip(cols, widths):
-            self.hist_tree.heading(col, text=col.title())
+            self.hist_tree.heading(col, text=headings[col])
             self.hist_tree.column(col, width=self.px(w), minwidth=self.px(40),
                                   anchor="w" if col == "model" else "center")
         self.hist_tree.pack(fill="both", expand=True)
@@ -548,6 +566,7 @@ class Zoomies:
                 be.display_name if be else (row.get("backend") or "-"),
                 row.get("model") or "-",
                 metrics.fmt(row.get("ttft"), "s", 2),
+                metrics.fmt(row.get("prompt_tps")),
                 metrics.fmt(row.get("tg3s")),
                 metrics.fmt_int(row.get("n_gen")),
                 metrics.fmt_int(row.get("n_ctx")),
@@ -598,7 +617,12 @@ class Zoomies:
         self.status_lbl.configure(text=text, style=style)
 
     def settings_dict(self):
-        return {k: v.get().strip() for k, v in self.vars.items()}
+        out = {k: v.get().strip() for k, v in self.vars.items()}
+        info, level = self.reasoning, self.reason_var.get()
+        if info and level in info["levels"] and self.backend().supports("reasoning"):
+            out["reasoning"] = level
+            out["reasoning_style"] = info["style"]
+        return out
 
     def _mark_dirty(self, key):
         self.dirty[key] = True
@@ -632,6 +656,10 @@ class Zoomies:
         self.mode_keys = {}
         self.opt_result = None
         self.source_note = ""
+        self.reasoning = None
+        self._pending_reason = None
+        self._reasoning_is_variant = False
+        self._refresh_reason_box()
 
     # ------------------------------------------------------------------
     # backend / model wiring
@@ -663,31 +691,72 @@ class Zoomies:
 
         unsupported = [lab for key, lab in backends.SETTING_LABELS
                        if not be.supports(key)]
+        if not be.supports("reasoning"):
+            unsupported.append("Reasoning")
         msg = ""
         if unsupported:
             msg = "%s ignores: %s." % (be.display_name, ", ".join(unsupported))
+        if not be.supports("reasoning"):
+            msg += (" Reasoning is chosen per request by whichever app sends "
+                    "the prompt.")
         self.notes_lbl.configure(text=msg)
+        self._refresh_reason_box()
 
         self._reload_models()
 
     def _reload_models(self):
+        """Refresh the model dropdown without freezing the window.
+
+        This used to call list_models() on the UI thread, so every backend
+        toggle stalled while Unsloth answered two HTTP requests. Now the last
+        known list for that backend appears immediately and the real one is
+        fetched on a worker, landing through the queue like everything else.
+        """
         be = self.backend()
         folder = self.folder_var.get() if be.uses_model_folder else None
-        self.models = be.list_models(folder)
+        key = (be.name, folder or "")
+        cached = self.model_cache.get(key)
+        if cached is not None:
+            self._show_models(be, cached)
+        else:
+            self.models = []
+            self.model_box.configure(values=())
+            self.model_var.set("Loading models...")
+        self._model_req += 1
+        threading.Thread(target=self._load_models_worker,
+                         args=(be, folder, key, self._model_req),
+                         daemon=True).start()
+
+    def _load_models_worker(self, be, folder, key, req):
+        try:
+            models = be.list_models(folder)
+        except Exception as exc:                      # noqa: BLE001
+            be.last_error = str(exc)
+            models = []
+        self.out_queue.put(("models", key, req, models, be.last_error))
+
+    def _models_ready(self, key, req, models, err):
+        self.model_cache[key] = models
+        be = self.backend()
+        folder = self.folder_var.get() if be.uses_model_folder else None
+        # The user may have toggled again while this was loading.
+        if key != (be.name, folder or "") or req != self._model_req:
+            return
+        self._show_models(be, models, err)
+
+    def _show_models(self, be, models, err=""):
+        current = self.selected_model()
+        want = current.id if current else self.cfg.get("last_model", "")
+        self.models = list(models)
         labels = [m.describe() for m in self.models]
         self.model_box.configure(values=labels)
-        want = self.cfg.get("last_model", "")
-        chosen = 0
-        for i, m in enumerate(self.models):
-            if m.id == want:
-                chosen = i
-                break
+        chosen = next((i for i, m in enumerate(self.models) if m.id == want), 0)
         if labels:
             self.model_box.current(chosen)
         else:
             self.model_var.set("")
-        if be.last_error and not labels:
-            self.log("%s: %s" % (be.display_name, be.last_error), "err")
+            if err:
+                self.log("%s: %s" % (be.display_name, err), "err")
 
     def _browse(self):
         chosen = filedialog.askdirectory(
@@ -764,6 +833,9 @@ class Zoomies:
                                       "Nothing usable found on that page.")
             self.set_status("No settings found - type them in, or pick a page.",
                             "Warn.TLabel")
+            self.reasoning = None
+            self._reasoning_is_variant = False
+            self._refresh_reason_box()
             if result.candidates:
                 self._offer_page_picker(model, result.candidates)
             return
@@ -785,6 +857,25 @@ class Zoomies:
         if result.mode:
             self.mode_var.set(result.mode_labels.get(result.mode, result.mode))
 
+        # Reasoning follows Mode, so the two can never contradict each other:
+        # Instruct (non-thinking) sampling with reasoning switched off, and
+        # thinking sampling with the level the docs call default - unless the
+        # user just picked a level, which is what caused this re-read.
+        self.reasoning = result.reasoning
+        self._reasoning_is_variant = (not result.reasoning and any(
+            "reason" in str(label).lower()
+            for label in result.mode_labels.values()))
+        if self.reasoning:
+            pending, self._pending_reason = self._pending_reason, None
+            levels = self.reasoning["levels"]
+            if pending in levels:
+                self.reason_var.set(pending)
+            elif result.mode == "instruct" and self.reasoning.get("off"):
+                self.reason_var.set(self.reasoning["off"])
+            else:
+                self.reason_var.set(self.reasoning["default"])
+        self._refresh_reason_box()
+
         self.source_note = result.source_line()
         self.source_lbl.configure(text=result.describe())
         msg = "Applied %d setting%s." % (len(applied),
@@ -794,6 +885,42 @@ class Zoomies:
         self.set_status(msg, "Ok.TLabel")
         for hint in result.suggestions:
             self.log("Not applied: " + hint, "note")
+
+    def _refresh_reason_box(self):
+        """Offer exactly the reasoning levels this model's docs describe.
+
+        Nothing is hardcoded because the scales differ: Qwen3.8 has four
+        effort levels, Gemma 4 is on or off, and Ministral 3 cannot be
+        switched at all - its Reasoning version is a separate download.
+        """
+        be = self.backend()
+        info = self.reasoning
+        if not info:
+            self.reason_box.configure(values=())
+            self.reason_var.set("separate model" if self._reasoning_is_variant
+                                else "")
+            self.reason_box.state(["disabled"])
+            return
+        self.reason_box.configure(values=tuple(info["levels"]))
+        if self.reason_var.get() not in info["levels"]:
+            self.reason_var.set(info["default"])
+        self.reason_box.state(["!disabled"] if be.supports("reasoning")
+                              else ["disabled"])
+
+    def _reason_changed(self):
+        """Switching reasoning off moves Mode to Instruct, and switching it on
+        moves Mode to Thinking, so the sampling numbers always match."""
+        info, level = self.reasoning, self.reason_var.get()
+        if not info or level not in info["levels"]:
+            return
+        want = "instruct" if level == info.get("off") else "thinking"
+        current = self.mode_keys.get(self.mode_var.get())
+        if want == current or want not in self.mode_keys.values():
+            return
+        self._pending_reason = level
+        label = next(l for l, k in self.mode_keys.items() if k == want)
+        self.mode_var.set(label)
+        self._mode_changed()
 
     def _mode_changed(self):
         """Re-read the docs for the mode the user just picked."""
@@ -1151,6 +1278,8 @@ class Zoomies:
                     self._run_done(msg[1], msg[2], msg[3])
                 elif kind == "optimal":
                     self._apply_result(msg[1], msg[2])
+                elif kind == "models":
+                    self._models_ready(msg[1], msg[2], msg[3], msg[4])
         except queue.Empty:
             pass
 
@@ -1232,7 +1361,10 @@ class Zoomies:
             except tk.TclError:
                 pass
         if self.metrics is not None:
-            self.metrics.cleanup()
+            # stop(), not just cleanup(): the GPU thread may be halfway through
+            # a typeperf sample. Exiting without killing it leaves typeperf
+            # running and writing a sample file nobody will ever delete.
+            self.metrics.stop()
         self.cfg["unload_on_exit"] = bool(self.unload_exit.get())
         state.save_config(self.cfg)
         state.save_session(self.session)

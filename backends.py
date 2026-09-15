@@ -171,6 +171,26 @@ def http_json(url, method="GET", payload=None, timeout=5.0):
 # base class
 # --------------------------------------------------------------------------
 
+def reasoning_kwargs(settings):
+    """Chat-template kwargs for the chosen reasoning setting, or None.
+
+    The style comes from the model's docs page, so a Gemma level can never be
+    sent to a Qwen model: enable_thinking takes on/off, reasoning_effort takes
+    whatever levels that page listed.
+    """
+    style = str(settings.get("reasoning_style") or "")
+    level = str(settings.get("reasoning") or "").strip().lower()
+    if not style or not level:
+        return None
+    if style == "enable_thinking":
+        if level not in ("on", "off"):
+            return None
+        return {"enable_thinking": level == "on"}
+    if style == "reasoning_effort":
+        return {"reasoning_effort": level}
+    return None
+
+
 class Backend:
     name = ""
     display_name = ""
@@ -418,7 +438,10 @@ class OllamaBackend(Backend):
             return "this load only"
         if key == "keep_alive":
             return "how long it stays in VRAM"
-        return ""       # gpu_layers, parallel, flash_attn, extra_flags
+        # gpu_layers, parallel, flash_attn, extra_flags - and reasoning:
+        # Ollama takes "think" per request, so whichever app sends the
+        # prompt decides, and a launcher cannot set it for them.
+        return ""
 
     # -- what is loaded ----------------------------------------------------
 
@@ -890,6 +913,8 @@ class UnslothBackend(Backend):
             return "passed to llama-server"
         if key == "extra_flags":
             return "passed to llama-server"
+        if key == "reasoning":
+            return "applied at load"
         return ""          # keep_alive: the model lives as long as the server
 
     # -- what is loaded ----------------------------------------------------
@@ -1012,6 +1037,16 @@ class UnslothBackend(Backend):
         if model.quant:
             args.append("'--gguf-variant',%s" % runner.ps_single(model.quant))
         args.extend(runner.ps_single(token) for token in extra)
+        kwargs = reasoning_kwargs(settings)
+        if kwargs:
+            # Windows PowerShell 5.1 strips bare double quotes from arguments
+            # it hands to a native program, so {"reasoning_effort":"low"}
+            # arrives as {reasoning_effort:low} and llama-server rejects it.
+            # Backslash-escaped quotes survive the trip - verified by echoing
+            # the argument back from a real process.
+            raw = json.dumps(kwargs, separators=(",", ":"))
+            args.append("'--chat-template-kwargs',%s"
+                        % runner.ps_single(raw.replace('"', '\\"')))
         # Always explicit, always headless: the requirement is that the
         # backend's own window never opens.
         args.extend(["'--host',%s" % runner.ps_single(UNSLOTH_HOST),
@@ -1066,9 +1101,16 @@ class UnslothBackend(Backend):
             value = fields[key]
             lines.append("  %-12s = %s" % (
                 key, runner.ps_single(value) if isinstance(value, str) else value))
-        if extra:
+        passthrough = list(extra)
+        kwargs = reasoning_kwargs(settings)
+        if kwargs:
+            # Sent inside a JSON body, not on a command line, so no quote
+            # escaping here - ConvertTo-Json takes care of it.
+            passthrough += ["--chat-template-kwargs",
+                            json.dumps(kwargs, separators=(",", ":"))]
+        if passthrough:
             lines.append("  llama_extra_args = @(%s)"
-                         % ", ".join(runner.ps_single(t) for t in extra))
+                         % ", ".join(runner.ps_single(t) for t in passthrough))
         lines.append("} | ConvertTo-Json -Depth 6")
 
         body = "\n".join([

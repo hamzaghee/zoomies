@@ -323,8 +323,7 @@ def detect_gpus(refresh=False):
     # DXGI first: it reports dedicated VRAM per adapter, flags software
     # rasterizers, and lists only adapters that actually exist right now -
     # the registry keeps entries for cards that have been removed.
-    dxgi = [a for a in enumerate_adapters()
-            if not a["is_software"] and a["vram"] >= 1 << 30]
+    dxgi = physical_adapters(enumerate_adapters())
     if dxgi:
         _gpu_cache = [(a["name"], a["vram"]) for a in dxgi]
         return _gpu_cache
@@ -492,6 +491,27 @@ def enumerate_adapters():
     finally:
         _com_call(factory, _VT_RELEASE, ctypes.c_ulong, [])
     return adapters
+
+
+def physical_adapters(adapters, live_luids=None):
+    """One entry per physical card.
+
+    DXGI keeps listing a card under its old LUID after a driver reinstall or
+    a TDR recovery, so the same RX 6800 XT can appear twice - which briefly
+    made this machine look like it had 48 GB of VRAM instead of 32. The
+    vendor/device/subsystem key is identical for both entries, so group on
+    it. When live counter data is available, prefer the LUID that is
+    actually reporting; otherwise keep the first one DXGI returned.
+    """
+    live = live_luids or {}
+    chosen = {}
+    for a in adapters:
+        if a["is_software"] or a["vram"] < 1 << 30:
+            continue
+        held = chosen.get(a["key"])
+        if held is None or (held["luid"] not in live and a["luid"] in live):
+            chosen[a["key"]] = a
+    return list(chosen.values())
 
 
 def display_label(adapter, among):

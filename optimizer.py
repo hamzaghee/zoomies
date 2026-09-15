@@ -723,6 +723,7 @@ class Result:
     notes: list = field(default_factory=list)
     suggestions: list = field(default_factory=list)
     candidates: list = field(default_factory=list)
+    reasoning: dict = None          # see parse_reasoning()
 
     def source_line(self):
         """One line for the generated script's header comment."""
@@ -776,7 +777,7 @@ def recommend(model, cfg=None, mode=None, force_refresh=False):
 def _result_from(saved, model, mode):
     """Rebuild a Result from the saved answer. Returns None if the saved
     shape is from an older version and cannot be trusted."""
-    if int(saved.get("v") or 1) < 2:
+    if int(saved.get("v") or 1) < 3:
         return None                    # older shape: re-resolve instead
     try:
         merged = {k: dict(v) for k, v in saved["merged"].items()}
@@ -813,7 +814,8 @@ def _result_from(saved, model, mode):
         page=saved.get("page", ""), url=saved.get("url", ""),
         section=saved.get("section", ""), line=int(saved.get("line") or 0),
         age=age, notes=notes,
-        suggestions=list(saved.get("suggestions") or []))
+        suggestions=list(saved.get("suggestions") or []),
+        reasoning=saved.get("reasoning"))
 
 
 def _resolve(model, cfg, mode, force_refresh):
@@ -898,6 +900,7 @@ def _resolve(model, cfg, mode, force_refresh):
             notes.append(note)
 
     lift, suggest = parse_extras(lines)
+    reasoning = parse_reasoning(lines)
     if lift:
         settings["extra_flags"] = " ".join(lift)
 
@@ -915,7 +918,9 @@ def _resolve(model, cfg, mode, force_refresh):
         # re-resolved rather than replayed: the clamp note used to be frozen
         # into the payload, so a saved answer kept telling the user "will not
         # fit in 16 GB" long after the VRAM detection was corrected.
-        "v": 2,
+        # v3 added "reasoning"; older saved answers re-resolve to pick it up.
+        "v": 3,
+        "reasoning": reasoning,
         "doc_context": doc_ctx,
         "merged": {mk: dict(vals) for mk, vals in merged.items()},
         "modes": list(modes), "labels": labels, "always": always,
@@ -928,8 +933,59 @@ def _resolve(model, cfg, mode, force_refresh):
         settings=out, modes=modes, mode_labels=labels, mode=chosen,
         page=entry["title"], url=entry["url"], section=section,
         line=block_start + 1, age=page_age, notes=notes,
-        suggestions=suggestions)
+        suggestions=suggestions, reasoning=reasoning)
     return result, payload
+
+
+_LEVEL = re.compile(
+    r"^\s*[*\-+]\s+`?([A-Za-z]{2,10})`?\s*(\(default\))?\s*(?:[:\-]|$)")
+
+
+def parse_reasoning(lines):
+    """How this model's reasoning is controlled, according to its docs page.
+
+        {"style": "reasoning_effort", "levels": ["xhigh", "medium", "low", "none"],
+         "default": "xhigh", "off": "none"}                        # Qwen3.8
+        {"style": "enable_thinking", "levels": ["on", "off"],
+         "default": "on", "off": "off"}                            # Gemma 4
+        None                                                       # Ministral 3
+
+    Scales differ per model, which is why they are read from the page rather
+    than hardcoded. When the page names reasoning_effort but no list of
+    levels can be found, this returns None: offering levels a model may not
+    understand would be the confident-but-wrong kind of answer.
+    """
+    text = "\n".join(lines)
+    if "reasoning_effort" in text:
+        for i, line in enumerate(lines):
+            if "reasoning_effort" not in line or "chat-template-kwargs" in line:
+                continue
+            levels, default = [], None
+            for nxt in lines[i + 1:i + 14]:
+                if not nxt.strip():
+                    if levels:
+                        break
+                    continue
+                m = _LEVEL.match(nxt)
+                if not m:
+                    if levels:
+                        break
+                    continue
+                level = m.group(1).lower()
+                if level not in levels:
+                    levels.append(level)
+                if m.group(2):
+                    default = level
+            if len(levels) >= 2:
+                off = next((l for l in levels
+                            if l in ("none", "off", "minimal")), None)
+                return {"style": "reasoning_effort", "levels": levels,
+                        "default": default or levels[0], "off": off}
+        return None
+    if "enable_thinking" in text:
+        return {"style": "enable_thinking", "levels": ["on", "off"],
+                "default": "on", "off": "off"}
+    return None
 
 
 def _clamp_context(doc_ctx, model):

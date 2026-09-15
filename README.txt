@@ -133,7 +133,25 @@ esolved.json
 
   The Mode dropdown appears when a model documents more than one set of
   numbers (Thinking vs Instruct, Instruct vs Reasoning). Switching it
-  re-reads that column.
+  re-reads that column. It only changes sampling numbers; it does not
+  turn thinking on or off by itself - that is the Reasoning dropdown.
+
+  REASONING
+  The Reasoning dropdown offers exactly what the model's docs page says,
+  because models do this differently:
+
+      qwen3.8       effort level: xhigh (default), medium, low, none
+      gemma4        on / off
+      ministral-3   cannot be switched - "separate model": its Reasoning
+                    version is a different download
+
+  Reasoning and Mode move together so they never contradict each other:
+  choosing Instruct switches reasoning off, and choosing a reasoning level
+  switches Mode back to Thinking.
+
+  Unsloth applies the choice when the model loads. On Ollama the dropdown
+  is greyed out: Ollama takes reasoning per request, so the app sending
+  the prompt (jobbuddy, for example) decides, not the launcher.
 
   IT WILL LEAVE THE BOXES EMPTY RATHER THAN GUESS. If the docs have no
   page for your model you get an empty form and a list of pages to pick
@@ -185,20 +203,27 @@ THE LIVE PANEL
   3-second average), tokens produced, and how much of the context window
   is used. Your GPUs and their utilisation sit on the right.
 
-  This works for BOTH backends from one parser. Ollama and Unsloth both
-  run llama.cpp underneath, and llama.cpp writes the same timing lines
-  either way - Unsloth just puts a timestamp in front. Only the location
-  differs:
+  WHERE THE NUMBERS COME FROM
+  Both backends run a program called llama-server underneath, whoever
+  started them. Zoomies finds every running llama-server and asks it
+  directly, twice a second, what it is doing. This works even when the
+  model was launched by another app - jobbuddy, for example, starts
+  Ollama with its log switched off, so a log-reading monitor would see
+  nothing at all.
+
+  Speeds are worked out from how many tokens were added between two
+  checks, so time-to-first-token is accurate to about half a second, and
+  a request shorter than half a second can be missed entirely.
+
+  If no llama-server can be reached, Zoomies falls back to reading the
+  backend's log file instead, when one exists:
 
     Ollama    %LOCALAPPDATA%\Ollama\server.log      one file
     Unsloth   ~\.unsloth\studio\logs\llama-server\  a new file per run
 
-  so the Unsloth reader follows whichever file is newest.
-
-  The History tab keeps the last 25 requests. A request is filed when the
-  next one starts OR once it has been quiet for five seconds - so the
-  last request of a session still appears, which it would not if it only
-  filed on the next prompt.
+  The History tab keeps the last 25 requests. A request is filed when it
+  finishes, when the next one starts, or once it has been quiet for five
+  seconds.
 
   GPU numbers come from Windows' own "GPU Engine" counters, the same
   source Task Manager reads, and show the highest engine per card rather
