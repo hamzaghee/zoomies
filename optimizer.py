@@ -33,6 +33,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -288,7 +289,16 @@ SIZE_CUT = re.compile(r"(?i)[-_](\d+(?:\.\d+)?[bmt]|a\d+b|\d+x\d+b)(?:[-_]|$)")
 
 
 def model_family(model_id):
-    """Family key from a model name, in either naming style.
+    return norm_key(_family_text(model_id))
+
+
+def search_name(model_id):
+    """The family as written, for searching: "Ornith-1.5", "ornith-1.5"."""
+    return _family_text(model_id).strip(" -_.")
+
+
+def _family_text(model_id):
+    """Family name from a model name, in either naming style.
 
         qwen3.8:27b-q4_K_M                       -> qwen3.8   (Ollama tag)
         unsloth/Qwen3.8-27B-GGUF                 -> qwen3.8   (HF repo)
@@ -310,7 +320,7 @@ def model_family(model_id):
             cut = SIZE_CUT.search(name)
             if cut:
                 name = name[:cut.start()]
-    return norm_key(name)
+    return name
 
 
 def fetch_index(force=False):
@@ -724,12 +734,18 @@ class Result:
     suggestions: list = field(default_factory=list)
     candidates: list = field(default_factory=list)
     reasoning: dict = None          # see parse_reasoning()
+    origin: str = "unsloth"         # "unsloth" | "huggingface" | "ollama"
 
     def source_line(self):
         """One line for the generated script's header comment."""
         if not self.page:
             return ""
-        bits = ['unsloth.ai docs "%s"' % self.page]
+        if self.origin == "huggingface":
+            bits = ['Hugging Face model card "%s"' % self.page]
+        elif self.origin == "ollama":
+            bits = ['parameters packaged with Ollama model "%s"' % self.page]
+        else:
+            bits = ['unsloth.ai docs "%s"' % self.page]
         if self.section:
             bits.append(self.section)
         if self.mode:
@@ -815,34 +831,81 @@ def _result_from(saved, model, mode):
         section=saved.get("section", ""), line=int(saved.get("line") or 0),
         age=age, notes=notes,
         suggestions=list(saved.get("suggestions") or []),
-        reasoning=saved.get("reasoning"))
+        reasoning=saved.get("reasoning"),
+        origin=saved.get("origin") or "unsloth")
 
 
 def _resolve(model, cfg, mode, force_refresh):
-    """Do the actual lookup. Returns (Result, payload-to-save-or-None)."""
-    def fail(**kw):
-        return Result(**kw), None
+    """Do the actual lookup. Returns (Result, payload-to-save-or-None).
 
+    Sources, best first:
+      1. the Unsloth docs page for this model, or the one the user picked
+      2. the publisher's Hugging Face model card
+      3. the Unsloth page for an earlier release of the same family
+      4. the parameters packaged inside an Ollama model
+    A card about this exact model beats docs about its predecessor, which is
+    why the older-release page sits below it.
+    """
     family = model_family(getattr(model, "id", ""))
     manual_title = (cfg.get("manual_page_map") or {}).get(family, "")
 
     index, age, err = fetch_index(force=force_refresh)
+    entry, how = find_page(index, family, manual_title) if index else (None, "")
+    titles = sorted(e["title"] for e in (index or {}).values())
+
+    misses, older = [], None
+    if entry is not None:
+        if how == "older":
+            older = entry
+        else:
+            result, payload = _resolve_docs(model, mode, entry, how, titles,
+                                            force_refresh)
+            if payload:
+                return result, payload
+            misses.append(result.error)
+
+    result, payload, tried = _resolve_card(model, family, mode, force_refresh)
+    if payload:
+        return result, payload
+
+    if older is not None:
+        result, payload = _resolve_docs(model, mode, older, "older", titles,
+                                        force_refresh)
+        if payload:
+            return result, payload
+        misses.append(result.error)
+
+    result, payload = _resolve_ollama_params(model, family, mode)
+    if payload:
+        return result, payload
+
+    looked = []
     if not index:
-        return fail(age=age, error=(
-            "Could not reach unsloth.ai (%s) and no documentation is cached. "
-            "Type the settings in by hand, or try again when you are online."
-            % err) if err else "No documentation available.")
+        looked.append("could not reach unsloth.ai (%s)" % err if err
+                      else "no Unsloth docs available")
+    elif entry is None:
+        looked.append("no Unsloth docs page")
+    looked.extend(m for m in misses if m)
+    if tried:
+        looked.append("no recommended settings on the Hugging Face card%s %s"
+                      % ("s" if len(tried) > 1 else "", ", ".join(tried)))
+    else:
+        looked.append("no Hugging Face model card found")
+    return Result(age=age, candidates=titles, error=(
+        'Nothing filled in for "%s": %s. Pick an Unsloth page if one applies, '
+        "or search the web and type the numbers in."
+        % (family, "; ".join(looked)))), None
 
-    entry, how = find_page(index, family, manual_title)
-    titles = sorted(e["title"] for e in index.values())
-    if entry is None:
-        return fail(age=age, candidates=titles, error=(
-            'No Unsloth docs page for "%s", so nothing was filled in. '
-            "Pick a page below if you know which one applies." % family))
 
+def _resolve_docs(model, mode, entry, how, titles, force_refresh):
+    """Read settings from one Unsloth docs page."""
+    def fail(**kw):
+        return Result(**kw), None
+
+    family = model_family(getattr(model, "id", ""))
     text, page_age, page_err = fetch_page(entry, force=force_refresh)
     if not text:
-        return fail(age=age, candidates=titles, error=(
+        return fail(age=page_age, candidates=titles, error=(
             'Found "%s" in the index but could not download it (%s).'
             % (entry["title"], page_err)))
 
@@ -920,6 +983,7 @@ def _resolve(model, cfg, mode, force_refresh):
         # fit in 16 GB" long after the VRAM detection was corrected.
         # v3 added "reasoning"; older saved answers re-resolve to pick it up.
         "v": 3,
+        "origin": "unsloth",
         "reasoning": reasoning,
         "doc_context": doc_ctx,
         "merged": {mk: dict(vals) for mk, vals in merged.items()},
@@ -987,6 +1051,333 @@ def parse_reasoning(lines):
                 "default": "on", "off": "off"}
     return None
 
+
+# --------------------------------------------------------------------------
+# beyond the Unsloth docs: the publisher's model card, then Ollama
+# --------------------------------------------------------------------------
+#
+# Plenty of models never get an Unsloth guide - Ornith, most fine-tunes - but
+# their publisher nearly always states recommended sampling on the Hugging
+# Face model card. It is read the same deterministic way as the docs, with
+# two extra rules: numbers only count inside a passage that calls itself a
+# recommendation, and never inside a code example or a benchmark note. The
+# same cards quote the settings their benchmarks ran with (Ornith's lists
+# temperature=1.0, top_p=1.0 for Terminal-Bench), and those are not advice.
+
+HF_BASE = "https://huggingface.co"
+CARD_DIR = os.path.join(state.CACHE_DIR, "cards")
+HF_LINK = re.compile(r"huggingface\.co/([\w.\-]+/[\w.\-]+)")
+HF_REPO_ID = re.compile(r"^[\w.\-]+/[\w.\-]+$")
+RECOMMEND = re.compile(r"(?i)\b(recommend\w*|suggest\w*|best\s+practices?|optimal)\b")
+CARD_KEYS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+             "presence_penalty")
+_BENCH = re.compile(r"(?i)(evaluat|benchmark|-bench\b|\bbench\b|harness|"
+                    r"averaged|pass@|leaderboard)")
+_CARD_FILLER = re.compile(
+    r"(?i)\b(we|you|should|recommend\w*|suggest\w*|use|using|set|setting|"
+    r"settings|sampling|parameters?|the|following|best|practices?|optimal)\b")
+MAX_CARDS = 6
+
+
+def _card_text(line):
+    """A card line with benchmark asides in brackets removed, or "" if the
+    whole line is about a benchmark. Ornith 1.0 puts both in one sentence:
+        Recommended sampling parameters: temperature=0.6, top_p=0.95, top_k=20
+        (use temperature=1.0 to reproduce the reported benchmark setup).
+    """
+    text = re.sub(r"\([^)]*\)",
+                  lambda m: " " if _BENCH.search(m.group(0)) else m.group(0),
+                  clean(line))
+    return "" if _BENCH.search(text) else text
+
+
+def _unique(items):
+    seen, out = set(), []
+    for item in items:
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
+            out.append(item)
+    return out
+
+
+def hf_json(url):
+    """(data, error) from the Hugging Face API. Never raises."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                               "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace")), ""
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, str(getattr(exc, "reason", exc))
+
+
+def fetch_card(repo, force=False):
+    """Return (text, age_label, error) for a repo's README, cached like the docs."""
+    safe = re.sub(r"[^\w.\-]+", "__", repo)
+    return _cached(os.path.join(CARD_DIR, safe + ".md"), "card:" + repo,
+                   "%s/%s/raw/main/README.md" % (HF_BASE, repo), force,
+                   min_bytes=100)
+
+
+def card_lines(text):
+    """A model card as lines: HTML lists and headings turned into their
+    Markdown shapes, and every code example blanked. Example calls such as
+    client.chat.completions.create(temperature=0.6, max_tokens=1024) show
+    how to call the API, not what to use."""
+    out, fence = [], False
+    for raw in str(text).split("\n"):
+        if raw.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+            out.append("")
+            continue
+        out.append("" if fence else raw)
+    t = "\n".join(out)
+    t = re.sub(r"(?is)<(pre|script|style)\b.*?</\1>",
+               lambda m: "\n" * m.group(0).count("\n"), t)
+    t = re.sub(r"(?i)<li\b[^>]*>", "\n* ", t)
+    t = re.sub(r"(?i)<h([1-6])\b[^>]*>",
+               lambda m: "\n" + "#" * int(m.group(1)) + " ", t)
+    t = re.sub(r"(?i)<br\s*/?>|</(p|li|ul|ol|div|h[1-6]|tr|table)>", "\n", t)
+    return t.split("\n")
+
+
+def find_recommendation(lines):
+    """(start, end, title) of the passage that recommends settings, or None.
+
+    A heading that says so ("Best Practices") wins over a sentence that says
+    so ("Recommended sampling parameters:"). Either way the passage must hold
+    assignments, and it stops at the next heading.
+    """
+    def next_heading(i, depth=6):
+        for j in range(i + 1, len(lines)):
+            m = HEADING.match(lines[j])
+            if m and len(m.group(1)) <= depth:
+                return j
+        return len(lines)
+
+    def has_values(a, b):
+        return any(ASSIGN.search(_card_text(l)) for l in lines[a:b])
+
+    for i, line in enumerate(lines):
+        m = HEADING.match(line)
+        if m and RECOMMEND.search(clean(m.group(2))):
+            end = next_heading(i, len(m.group(1)))
+            if has_values(i + 1, end):
+                return i, end, clean(m.group(2))
+    for i, line in enumerate(lines):
+        text = _card_text(line)
+        if HEADING.match(line) or not RECOMMEND.search(text):
+            continue
+        end = min(next_heading(i), i + 16)
+        if has_values(i, end):
+            first = ASSIGN.search(text)          # name the passage, not its numbers
+            return i, end, (text[:first.start()] if first else text)[:80].rstrip(" :,")
+    return None
+
+
+def parse_card(block_lines):
+    """Mode -> settings from a recommendation passage.
+
+        * For general tasks: temperature=1.0, top_p=0.95, ...      (Ornith)
+        - For thinking mode (enable_thinking=True), use Temperature=0.6 ...
+        - For non-thinking mode (...), we suggest using Temperature=0.7 ...
+
+    The words before the first number name the mode; with the filler words
+    removed, nothing left means it applies to everything.
+    """
+    out, labels = {}, {}
+    for raw in block_lines:
+        text = _card_text(raw)
+        first = ASSIGN.search(text)
+        if not first:
+            continue
+        hits = []
+        for name, value_raw in ASSIGN.findall(text):
+            key = canon(name)
+            value = to_number(value_raw, key)
+            if key in CARD_KEYS and value is not None:
+                hits.append((key, value))
+        if not hits:
+            continue
+        head = re.sub(r"\([^)]*\)", " ", text[:first.start()])
+        head = re.sub(r"\s+", " ", _CARD_FILLER.sub(" ", head)).strip(" :,.;-*")
+        if not head or len(head) > 48:
+            mk, label = "default", "Default"
+        else:
+            mk, label = mode_key(head), head[0].upper() + head[1:]
+        labels.setdefault(mk, label)
+        for key, value in hits:
+            out.setdefault(mk, {})[key] = value
+    return out, labels
+
+
+def _ollama_show(model_id):
+    data, _err = backends.http_json(backends.OLLAMA_BASE + "/api/show", "POST",
+                                    {"model": model_id}, timeout=5.0)
+    return data or {}
+
+
+def card_repos(model):
+    """Repos whose card speaks for this model, most direct first: the repo
+    the model came from, or the Hugging Face link written into the GGUF
+    file's own metadata when it was converted."""
+    mid = str(getattr(model, "id", "")).replace("\\", "/")
+    out = []
+    if mid.lower().startswith(("hf.co/", "huggingface.co/")):
+        out.append(mid.split("/", 1)[1].split(":")[0])
+    elif getattr(model, "backend", "") == "ollama":
+        info = _ollama_show(mid).get("model_info") or {}
+        for value in info.values():
+            if isinstance(value, str):
+                out.extend(r for r in HF_LINK.findall(value)
+                           if not r.startswith(("datasets/", "spaces/")))
+    elif HF_REPO_ID.match(mid):
+        out.append(mid)
+    return _unique(out)
+
+
+def base_models(repo):
+    """What a repo says it was made from - a GGUF repo's card often only
+    points back at the original."""
+    data, _err = hf_json("%s/api/models/%s" % (HF_BASE, repo))
+    base = ((data or {}).get("cardData") or {}).get("base_model") or []
+    if isinstance(base, str):
+        base = [base]
+    return [b for b in base if isinstance(b, str) and HF_REPO_ID.match(b)]
+
+
+def search_repos(model, family):
+    """Hugging Face search, as a last resort. Only repos of exactly the same
+    family count - searching "ornith-1.5" must never land on Ornith 1.0 -
+    and a matching size is preferred."""
+    mid = getattr(model, "id", "")
+    name = search_name(mid)
+    if not name:
+        return []
+    data, _err = hf_json("%s/api/models?search=%s&sort=downloads&limit=40"
+                         % (HF_BASE, urllib.parse.quote(name)))
+    repos = [m.get("id", "") for m in (data if isinstance(data, list) else [])
+             if isinstance(m, dict)]
+    repos = [r for r in repos if model_family(r) == family]
+    want = size_tokens(mid)
+    same_size = [r for r in repos if want and size_tokens(r) & want]
+    return _unique(same_size + repos)[:3]
+
+
+def _resolve_card(model, family, mode, force):
+    """Returns (Result, payload, repos_tried); payload is None on a miss."""
+    queue, tried, searched = card_repos(model), [], False
+    while len(tried) < MAX_CARDS:
+        if not queue:
+            if searched:
+                break
+            searched = True
+            queue = [r for r in search_repos(model, family) if r not in tried]
+            if not queue:
+                break
+        repo = queue.pop(0)
+        if repo in tried:
+            continue
+        tried.append(repo)
+        text, age, _err = fetch_card(repo, force)
+        if text:
+            built = _card_result(model, family, mode, repo, text, age, searched)
+            if built:
+                return built + (tried,)
+        queue.extend(b for b in base_models(repo)
+                     if b not in tried and b not in queue)
+    return Result(), None, tried
+
+
+def _card_result(model, family, mode, repo, text, age, from_search):
+    lines = card_lines(text)
+    found = find_recommendation(lines)
+    if not found:
+        return None
+    start, end, title = found
+    merged, labels = parse_card(lines[start:end])
+    if not merged:
+        return None
+    modes = tuple(merged)
+    chosen = _pick_mode(modes, model, mode)
+    settings = dict(merged[chosen])
+
+    notes = ["From the publisher's model card, not an Unsloth guide."]
+    if from_search:
+        notes.append('Found by searching Hugging Face for "%s" - check it is '
+                     "the right model." % search_name(getattr(model, "id", "")))
+    doc_ctx = parse_context(lines[start:end],
+                            [l for l in lines if not _BENCH.search(l)])
+    if doc_ctx:
+        ctx, note = _clamp_context(doc_ctx, model)
+        settings["context_length"] = ctx
+        if note:
+            notes.append(note)
+    reasoning = parse_reasoning(str(text).split("\n"))
+
+    url = "%s/%s" % (HF_BASE, repo)
+    payload = {
+        "v": 3, "origin": "huggingface", "reasoning": reasoning,
+        "doc_context": doc_ctx,
+        "merged": {mk: dict(vals) for mk, vals in merged.items()},
+        "modes": list(modes), "labels": labels, "always": {},
+        "page": repo, "url": url, "section": title, "line": start + 1,
+        "notes": notes, "suggestions": [], "family": family,
+    }
+    result = Result(
+        settings={k: (v if isinstance(v, str) else fmt(v))
+                  for k, v in settings.items()},
+        modes=modes, mode_labels=labels, mode=chosen, page=repo, url=url,
+        section=title, line=start + 1, age=age, notes=notes,
+        reasoning=reasoning, origin="huggingface")
+    return result, payload
+
+
+OLLAMA_PARAMS = {
+    "temperature": "temperature", "top_p": "top_p", "top_k": "top_k",
+    "min_p": "min_p", "repeat_penalty": "repeat_penalty",
+    "presence_penalty": "presence_penalty", "num_ctx": "context_length",
+}
+
+
+def _resolve_ollama_params(model, family, mode):
+    """The parameters an Ollama model was published with. Last in line: they
+    come from whoever packaged it for Ollama, not necessarily its authors."""
+    mid = str(getattr(model, "id", ""))
+    if getattr(model, "backend", "") != "ollama" or state.TAG_SUFFIX in mid:
+        return Result(), None           # a -zoomies tag holds our own numbers
+    values = {}
+    for line in str(_ollama_show(mid).get("parameters") or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] in OLLAMA_PARAMS:
+            key = OLLAMA_PARAMS[parts[0]]
+            value = to_number(parts[1].strip().strip('"'), key)
+            if value is not None:
+                values[key] = value
+    doc_ctx = values.pop("context_length", None)
+    if not values:
+        return Result(), None
+    notes = ["From the parameters packaged with this Ollama model - set by "
+             "whoever published it on Ollama, not necessarily its authors."]
+    settings = dict(values)
+    if doc_ctx:
+        ctx, note = _clamp_context(doc_ctx, model)
+        settings["context_length"] = ctx
+        if note:
+            notes.append(note)
+    payload = {
+        "v": 3, "origin": "ollama", "reasoning": None, "doc_context": doc_ctx,
+        "merged": {"default": dict(values)}, "modes": ["default"],
+        "labels": {"default": "Default"}, "always": {}, "page": mid, "url": "",
+        "section": "", "line": 0, "notes": notes, "suggestions": [],
+        "family": family,
+    }
+    result = Result(
+        settings={k: (v if isinstance(v, str) else fmt(v))
+                  for k, v in settings.items()},
+        modes=("default",), mode_labels={"default": "Default"}, mode="default",
+        page=mid, notes=notes, origin="ollama")
+    return result, payload
 
 def _clamp_context(doc_ctx, model):
     """Return (context_to_use, explanation_or_empty).

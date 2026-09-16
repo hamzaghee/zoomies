@@ -1136,7 +1136,11 @@ class UnslothBackend(Backend):
             "\n".join("  " + a for a in args),
             ")",
             "Write-Log ('starting: ' + ($a -join ' '))",
-            "& $exe @a *>> $log",
+            "# Windows PowerShell 5.1 turns each stderr line of a native program",
+            "# into an error record, and under 'Stop' the first one - uvicorn's",
+            "# startup banner - ends this script and takes the server down with it.",
+            "$ErrorActionPreference = 'Continue'",
+            "& $exe @a 2>&1 | ForEach-Object { \"$_\" | Out-File -FilePath $log -Append -Encoding utf8 }",
             "Write-Log ('unsloth exited with ' + $LASTEXITCODE)",
             "",
         ])
@@ -1144,7 +1148,13 @@ class UnslothBackend(Backend):
             kind="load", backend=self.name, script_text=body,
             script_path=script_path, log_path=log_path,
             endpoint=UNSLOTH_BASE, host=UNSLOTH_HOST, port=UNSLOTH_PORT,
-            long_lived=True, notes=notes, model_id=model.id)
+            long_lived=True, notes=notes, model_id=model.id,
+            ready_check=self._model_loaded)
+
+    def _model_loaded(self):
+        listing, err = http_json(UNSLOTH_BASE + "/v1/models", timeout=5.0)
+        return not err and any(item.get("loaded")
+                               for item in (listing or {}).get("data", []) or [])
 
     def _load_into_running(self, model, settings, extra, notes, script_path,
                            log_path, source_note):
@@ -1257,6 +1267,7 @@ class UnslothBackend(Backend):
                            "{ taskkill /T /F /PID %d *>> $log }" % (pid, pid))
         body = "\n".join([
             self._preamble(log_path, "stop Unsloth Studio", "", ""),
+            "$ErrorActionPreference = 'Continue'   # stderr must not skip the kill below",
             "& %s studio stop *>> $log" % runner.ps_single(self.exe),
             "Start-Sleep -Milliseconds 2000",
             kill_parent,

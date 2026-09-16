@@ -17,6 +17,8 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import urllib.parse
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 import backends
@@ -1004,10 +1006,12 @@ class Zoomies:
             daemon=True).start()
 
     def _offer_page_picker(self, model, candidates):
-        """The docs have no page under this model's name.
+        """No source had settings for this model: no Unsloth docs page, no
+        recommendation on its Hugging Face card, nothing packaged with it.
 
         Rather than guessing a near-match - which is how a model quietly ends
-        up running another model's sampling settings - ask.
+        up running another model's sampling settings - ask, or hand the
+        search to the user's own browser.
         """
         win = tk.Toplevel(self.root)
         win.title("Which docs page?")
@@ -1016,12 +1020,15 @@ class Zoomies:
         win.transient(self.root)
         ttk.Label(win, wraplength=self.px(580), justify="left",
                   style="Warn.TLabel",
-                  text=('There is no Unsloth docs page named "%s", so nothing '
-                        "was filled in.\n\nIf you know which page applies, pick "
-                        "it here and Zoomies will remember the choice for this "
-                        "model. Leave it alone if you are not sure - a wrong "
-                        "page is worse than an empty box."
-                        % model.match_key)).pack(fill="x", padx=12, pady=(12, 8))
+                  text=('No recommended settings found for "%s" - not in the '
+                        "Unsloth docs, not on its Hugging Face model card, and "
+                        "none packaged with the model - so nothing was filled "
+                        "in.\n\nIf an Unsloth page applies, pick it here and "
+                        "Zoomies will remember the choice for this model. Or "
+                        "search the web and type the numbers in yourself. Leave "
+                        "it alone if you are not sure - a wrong page is worse "
+                        "than an empty box." % optimizer.search_name(model.id))
+                  ).pack(fill="x", padx=12, pady=(12, 8))
 
         box = tk.Listbox(win, bg=BG_PANEL, fg=FG, font=FONT, relief="flat",
                          highlightthickness=1, highlightbackground=BORDER,
@@ -1044,6 +1051,15 @@ class Zoomies:
 
         ttk.Button(bar, text="Use this page", style="Go.TButton",
                    command=use_it).pack(side="left")
+        def search_web():
+            size = " ".join(sorted(optimizer.size_tokens(model.id)))
+            query = " ".join(filter(None, (
+                optimizer.search_name(model.id), size,
+                "recommended settings temperature top_p top_k")))
+            webbrowser.open("https://duckduckgo.com/?q=" + urllib.parse.quote(query))
+
+        ttk.Button(bar, text="Search the web",
+                   command=search_web).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="left",
                                                                  padx=(8, 0))
 
@@ -1149,6 +1165,20 @@ class Zoomies:
                 False, -1, started.pid, [],
                 "the server never started listening on port %d" % plan.port)
         emit("[zoomies] %s is serving on port %d" % (plan.backend, plan.port))
+        if plan.ready_check is not None:
+            emit("[zoomies] waiting for the model to finish loading ...")
+            while not self.shutdown.is_set():
+                if plan.ready_check():
+                    emit("[zoomies] model loaded")
+                    break
+                if not state.alive_and_named(started.pid, "powershell"):
+                    if plan.ready_check():      # finished in the last moment
+                        break
+                    return runner.RunResult(
+                        False, -1, started.pid, [],
+                        "%s exited before the model loaded - see the log above"
+                        % plan.backend)
+                self.shutdown.wait(2.0)
         return runner.RunResult(True, 0, started.pid)
 
     def _run_done(self, plan, pre_existing, res):
