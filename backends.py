@@ -28,6 +28,8 @@ A note on the Ollama design, because it is not obvious:
 import json
 import os
 import re
+import subprocess
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -281,6 +283,13 @@ class Backend:
     def fixed_kv_cache(self):
         """A KV cache type this backend imposes regardless of Zoomies, or None."""
         return None
+
+    def remember_server(self, session, plan, shell_pid, model):
+        """Record a server Zoomies started, so it can be found and stopped
+        after a restart."""
+
+    def forget_server(self, session, plan):
+        """Drop that record once the server is stopped."""
 
 
 REGISTRY = {}
@@ -833,6 +842,48 @@ def find_unsloth_exe():
     return ""
 
 
+def scan_gguf_folder(backend, folder):
+    """Loose .gguf files under a folder.
+
+    Skips the pieces that are not a model you can load on their own:
+    projector files, speculative-decoding sidecars, llama.cpp's tiny vocab
+    fixtures, and every shard of a split model except the first (llama.cpp
+    finds the rest itself).
+    """
+    if not folder or not os.path.isdir(folder):
+        return []
+    skip = ("mmproj", "dspark", "ggml-vocab", "-draft")
+    out, seen = [], set()
+    for base, dirs, files in os.walk(folder):
+        if base[len(folder):].count(os.sep) >= 4:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in files:
+            low = fname.lower()
+            if not low.endswith(".gguf") or any(s in low for s in skip):
+                continue
+            shard = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", low)
+            if shard and shard.group(1) != "00001":
+                continue
+            path = os.path.join(base, fname)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size < 50 * 1024 * 1024 or path in seen:
+                continue
+            seen.add(path)
+            quant = re.search(r"(?i)(UD-[A-Z0-9_]+|IQ\d[_A-Z0-9]*|"
+                              r"Q\d[_A-Z0-9]*|MXFP4|BF16|F16|F32)", fname)
+            out.append(ModelRecord(
+                backend=backend, id=path,
+                label=os.path.splitext(fname)[0],
+                quant=quant.group(1) if quant else "",
+                size_bytes=size, source="folder", gguf_path=path))
+    return out
+
+
 class UnslothBackend(Backend):
     """Unsloth Studio.
 
@@ -917,45 +968,7 @@ class UnslothBackend(Backend):
         return out
 
     def _from_folder(self, folder):
-        """Loose .gguf files the user points us at.
-
-        Skips the pieces that are not a model you can load on their own:
-        projector files, speculative-decoding sidecars, llama.cpp's tiny
-        vocab fixtures, and every shard of a split model except the first
-        (llama.cpp finds the rest itself).
-        """
-        if not folder or not os.path.isdir(folder):
-            return []
-        skip = ("mmproj", "dspark", "ggml-vocab", "-draft")
-        out, seen = [], set()
-        for base, dirs, files in os.walk(folder):
-            if base[len(folder):].count(os.sep) >= 4:
-                dirs[:] = []
-                continue
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for fname in files:
-                low = fname.lower()
-                if not low.endswith(".gguf") or any(s in low for s in skip):
-                    continue
-                shard = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", low)
-                if shard and shard.group(1) != "00001":
-                    continue
-                path = os.path.join(base, fname)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size < 50 * 1024 * 1024 or path in seen:
-                    continue
-                seen.add(path)
-                quant = re.search(r"(?i)(UD-[A-Z0-9_]+|IQ\d[_A-Z0-9]*|"
-                                  r"Q\d[_A-Z0-9]*|BF16|F16)", fname)
-                out.append(ModelRecord(
-                    backend=self.name, id=path,
-                    label=os.path.splitext(fname)[0],
-                    quant=quant.group(1) if quant else "",
-                    size_bytes=size, source="folder", gguf_path=path))
-        return out
+        return scan_gguf_folder(self.name, folder)
 
     # -- capability matrix -------------------------------------------------
 
@@ -1015,6 +1028,19 @@ class UnslothBackend(Backend):
 
     def installed_names(self):
         return [m.id for m in self.list_models(None)]
+
+    def remember_server(self, session, plan, shell_pid, model):
+        # unsloth.exe spawns llama-server.exe as a child, so the parent pid
+        # alone is not enough to kill it properly.
+        session["unsloth"] = {
+            "shell_pid": shell_pid,
+            "pid": (state.find_processes("unsloth.exe") or [0])[-1],
+            "port": plan.port, "host": plan.host,
+            "model_id": model.id if model else "",
+            "label": model.label if model else "",
+            "started": time.time(),
+            "log": plan.log_path, "script": plan.script_path,
+        }
 
     # -- script generation -------------------------------------------------
 
@@ -1285,3 +1311,473 @@ class UnslothBackend(Backend):
 
 
 register(UnslothBackend())
+
+
+# --------------------------------------------------------------------------
+# llama.cpp
+# --------------------------------------------------------------------------
+#
+# The engine underneath both other backends, run directly. Every setting is
+# a command-line flag, so the launch script is one command line and nothing
+# is written anywhere else.
+#
+# Zoomies starts its own `llama.exe serve` per model on its own port rather
+# than loading into the llama.cpp app's router: the router takes a model's
+# flags from a saved presets file, so per-load settings would mean editing
+# that file - a permanent change. Models the app has loaded still show up in
+# Loaded, and can be unloaded through the router's own /models/unload.
+
+LLAMACPP_HOST = "127.0.0.1"
+LLAMACPP_PORT = 8080            # the first port Zoomies serves on
+
+# Sampling set this way is the server's default: a request that sends its
+# own values still wins.
+LLAMACPP_FLAGS = (
+    ("temperature", "--temp"), ("top_p", "--top-p"), ("top_k", "--top-k"),
+    ("min_p", "--min-p"), ("repeat_penalty", "--repeat-penalty"),
+    ("presence_penalty", "--presence-penalty"), ("seed", "--seed"),
+    ("context_length", "-c"), ("gpu_layers", "-ngl"), ("parallel", "-np"),
+)
+LLAMACPP_INT_FLAGS = {"top_k", "seed", "context_length", "gpu_layers", "parallel"}
+LLAMACPP_SAMPLING = {"temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+                     "presence_penalty", "seed"}
+# Zoomies decides where the server listens and which model it serves.
+LLAMACPP_DENIED = {"--port", "--host", "-m", "--model", "-hf", "-hfr",
+                   "--hf-repo", "--models-dir", "--models-preset"}
+# Shared-memory GPUs report system RAM as VRAM, so llama.cpp will place
+# layers there - and every token then crawls across the bus.
+INTEGRATED_GPU = re.compile(
+    r"(?i)\b(UHD|Iris|Intel\(R\) Graphics|Radeon\(TM\) Graphics|Radeon Graphics)\b")
+HF_REPO_QUANT = re.compile(r"^[\w.\-]+/[\w.\-]+(:[\w.\-]+)?$")
+
+
+def find_llama_exe():
+    """llama.exe from the llama.cpp app (an App Execution Alias under
+    WindowsApps), or llama-server.exe from a release zip. Never Unsloth's
+    bundled copy, which is going away."""
+    dirs = (os.environ.get("PATH") or "").split(os.pathsep)
+    dirs.append(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft",
+                             "WindowsApps"))
+    for name in ("llama.exe", "llama-server.exe"):
+        for directory in dirs:
+            directory = directory.strip('"')
+            if not directory:
+                continue
+            candidate = os.path.join(directory, name)
+            # os.path.exists, not isfile: an execution alias is a reparse point
+            if os.path.exists(candidate) and "unsloth" not in candidate.lower():
+                return candidate
+    return ""
+
+
+def hf_hub_dir():
+    """The Hugging Face cache, where `llama.exe -hf` downloads land."""
+    if os.environ.get("HF_HUB_CACHE"):
+        return os.environ["HF_HUB_CACHE"]
+    if os.environ.get("HF_HOME"):
+        return os.path.join(os.environ["HF_HOME"], "hub")
+    return os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+
+
+def seconds_from(text):
+    """"30m" -> 1800, "90" -> 90, "1h" -> 3600; None if unreadable."""
+    m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*([smh]?)\s*", str(text or "").lower())
+    if not m:
+        return None
+    return int(float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)])
+
+
+def setting_number(settings, key, as_int=False):
+    raw = settings.get(key, "")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(str(raw).replace(",", ""))
+    except ValueError:
+        return None
+    return int(value) if as_int else value
+
+
+def split_extra_flags(settings, denied):
+    """Split the free-text flags field; returns (kept, dropped)."""
+    raw = str(settings.get("extra_flags") or "").strip()
+    if not raw:
+        return [], []
+    try:
+        import shlex
+        parts = shlex.split(raw, posix=False)
+    except ValueError:
+        parts = raw.split()
+    kept, dropped, skip_next = [], [], False
+    for i, token in enumerate(parts):
+        if skip_next:
+            skip_next = False
+            continue
+        if token.split("=", 1)[0] in denied:
+            dropped.append(token)
+            if "=" not in token and i + 1 < len(parts) \
+                    and not parts[i + 1].startswith("-"):
+                skip_next = True
+            continue
+        kept.append(token)
+    return kept, dropped
+
+
+_DEVICES = {}
+
+
+def list_devices(exe, prefix):
+    """[(id, description)] from --list-devices, asked once per run."""
+    if exe in _DEVICES:
+        return _DEVICES[exe]
+    try:
+        res = subprocess.run([exe] + prefix + ["--list-devices"],
+                             capture_output=True, text=True, timeout=60,
+                             creationflags=state.CREATE_NO_WINDOW)
+        text = (res.stdout or "") + (res.stderr or "")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    # "Vulkan1: Intel(R) UHD Graphics 770 (32622 MiB, ...)" - the name itself
+    # can hold brackets, so it ends at the memory figure, not the first one.
+    found = re.findall(r"^\s*([A-Za-z]+\d+):\s*(.+?)\s*\(\d+ MiB", text, re.M)
+    if found:
+        _DEVICES[exe] = found
+    return found
+
+
+class LlamaCppBackend(Backend):
+    name = "llamacpp"
+    display_name = "llama.cpp"
+    uses_model_folder = True
+    host = LLAMACPP_HOST
+    port = LLAMACPP_PORT
+
+    def __init__(self):
+        Backend.__init__(self)
+        self.exe = find_llama_exe()
+        # llama.exe is a multi-tool (`llama serve`, `llama download`);
+        # llama-server.exe is the server alone.
+        self.prefix = ["serve"] if os.path.basename(self.exe).lower() == "llama.exe" else []
+        self.default_folder = hf_hub_dir()
+        self.endpoint = "http://%s:%d" % (LLAMACPP_HOST, LLAMACPP_PORT)
+        self._ports, self._ports_at = {}, 0.0
+
+    # -- availability ------------------------------------------------------
+
+    def is_available(self):
+        if not self.exe:
+            return False, "llama.cpp not found"
+        return True, "installed"
+
+    def can_download(self):
+        return bool(self.prefix)
+
+    # -- discovery ---------------------------------------------------------
+
+    def list_models(self, folder=None):
+        models = self._from_cache()
+        seen = {os.path.normcase(m.gguf_path) for m in models}
+        for record in scan_gguf_folder(self.name, folder):
+            if os.path.normcase(record.gguf_path) not in seen:
+                models.append(record)
+        models.sort(key=lambda m: m.label.lower())
+        return models
+
+    def _from_cache(self):
+        """Models in the Hugging Face cache, named the way `-hf` takes them:
+        ggml-org/Qwen3.5-0.8B-GGUF:Q8_0."""
+        hub = hf_hub_dir()
+        try:
+            entries = os.listdir(hub)
+        except OSError:
+            return []
+        found = {}
+        for entry in entries:
+            if not entry.startswith("models--"):
+                continue
+            repo = entry[len("models--"):].replace("--", "/", 1)
+            snaps = os.path.join(hub, entry, "snapshots")
+            try:
+                revs = sorted((os.path.getmtime(os.path.join(snaps, r)), r)
+                              for r in os.listdir(snaps))
+            except OSError:
+                continue
+            for _mtime, rev in reversed(revs):          # newest revision wins
+                for rec in scan_gguf_folder(self.name, os.path.join(snaps, rev)):
+                    if rec.quant:
+                        mid = "%s:%s" % (repo, rec.quant)
+                        source = "hf-cache"
+                    else:
+                        mid, source = rec.gguf_path, "folder"
+                    if mid in found:
+                        continue
+                    found[mid] = ModelRecord(
+                        backend=self.name, id=mid, label=mid, quant=rec.quant,
+                        size_bytes=rec.size_bytes, source=source,
+                        gguf_path=rec.gguf_path)
+        return list(found.values())
+
+    # -- capability matrix -------------------------------------------------
+
+    def supports(self, key):
+        if key in LLAMACPP_SAMPLING:
+            return "server default - a request's own value wins"
+        return {
+            "context_length": "-c",
+            "gpu_layers": "-ngl",
+            "parallel": "-np (slots share the context)",
+            "keep_alive": "sleeps when idle, wakes on the next request",
+            "extra_flags": "passed to llama-server",
+            "reasoning": "applied at launch",
+            "kv_cache": "applied at launch",
+        }.get(key, "")
+
+    # -- what is loaded ----------------------------------------------------
+
+    def _servers(self, session=None):
+        session = session if session is not None else state.load_session()
+        return (session.get(self.name) or {}).get("servers") or {}
+
+    def list_loaded(self):
+        out, ours = [], set()
+        for rec in self._servers().values():
+            port = int(rec.get("port") or 0)
+            if not port or not state.port_open(LLAMACPP_HOST, port):
+                continue
+            props, err = http_json("http://%s:%d/props" % (LLAMACPP_HOST, port),
+                                   timeout=3.0)
+            if err:
+                continue
+            ours.add(port)
+            settings = (props or {}).get("default_generation_settings") or {}
+            out.append(LoadedModel(
+                backend=self.name, id=rec.get("model_id", ""),
+                label=rec.get("label") or rec.get("model_id", ""),
+                context=int(settings.get("n_ctx") or 0),
+                endpoint="http://%s:%d" % (LLAMACPP_HOST, port),
+                pid=int(rec.get("shell_pid") or 0), owned_by_us=True,
+                log_path=rec.get("log", "")))
+        out.extend(self._router_models(ours))
+        return out
+
+    def _router_models(self, skip):
+        """Models the llama.cpp app's router has loaded."""
+        import metrics                   # port discovery lives there
+        now = time.time()
+        if now - self._ports_at > 5:
+            self._ports, self._ports_at = metrics.llama_server_ports(), now
+        out = []
+        for port, (backend, pid) in self._ports.items():
+            if backend != self.name or port in skip:
+                continue
+            base = "http://%s:%d" % (LLAMACPP_HOST, port)
+            props, err = http_json(base + "/props", timeout=2.0)
+            if err or (props or {}).get("role") != "router":
+                continue                 # a router's own child, or not ours to show
+            listing, err = http_json(base + "/v1/models", timeout=3.0)
+            for item in (listing or {}).get("data", []) or []:
+                if ((item.get("status") or {}).get("value")) != "loaded":
+                    continue
+                out.append(LoadedModel(
+                    backend=self.name, id=item.get("id", ""),
+                    label=item.get("id", ""), endpoint=base, pid=pid,
+                    owned_by_us=False))
+        return out
+
+    def remember_server(self, session, plan, shell_pid, model):
+        servers = session.setdefault(self.name, {}).setdefault("servers", {})
+        servers[str(plan.port)] = {
+            "shell_pid": shell_pid, "port": plan.port,
+            "model_id": plan.model_id,
+            "label": model.label if model else plan.model_id,
+            "log": plan.log_path, "script": plan.script_path,
+            "started": time.time(),
+        }
+
+    def forget_server(self, session, plan):
+        if plan.port:
+            self._servers(session).pop(str(plan.port), None)
+
+    # -- script generation -------------------------------------------------
+
+    def _preamble(self, log_path, title, model, source_note):
+        return "\n".join([
+            runner.header(title, model, source_note),
+            "",
+            "$ErrorActionPreference = 'Stop'",
+            "$log  = %s" % runner.ps_single(log_path),
+            "",
+            "function Write-Log {",
+            "  param($m)",
+            "  $line = '[zoomies] ' + (Get-Date).ToString('o') + ' ' + $m",
+            "  Write-Output $line",
+            "  $line | Out-File -FilePath $log -Append -Encoding utf8",
+            "}",
+            "",
+        ])
+
+    def _native_call(self, args, what):
+        """Run llama.exe with its output in the log.
+
+        Windows PowerShell 5.1 turns each stderr line of a native program
+        into an error record, and llama.cpp logs everything to stderr: under
+        'Stop' the first line would end the script and the server with it.
+        """
+        return "\n".join([
+            "$exe = %s" % runner.ps_single(self.exe),
+            "$a = @(",
+            "\n".join("  " + a for a in args),
+            ")",
+            "Write-Log ('%s: ' + ($a -join ' '))" % what,
+            "$ErrorActionPreference = 'Continue'",
+            "& $exe @a 2>&1 | ForEach-Object { \"$_\" | Out-File -FilePath $log -Append -Encoding utf8 }",
+            "$code = $LASTEXITCODE",
+            "Write-Log ('llama.cpp exited with ' + $code)",
+            "exit $code",
+            "",
+        ])
+
+    def free_port(self, session):
+        taken = {int(p) for p in self._servers(session)}
+        for port in range(LLAMACPP_PORT, LLAMACPP_PORT + 50):
+            if port not in taken and not state.port_open(LLAMACPP_HOST, port):
+                return port
+        return LLAMACPP_PORT
+
+    def build_launch(self, model, settings, session, source_note=""):
+        port = self.free_port(session)
+        base = "http://%s:%d" % (LLAMACPP_HOST, port)
+        script_path, log_path = runner.new_paths(self.name, model.label)
+        extra, dropped = split_extra_flags(settings, LLAMACPP_DENIED)
+        notes = ["Starts llama.cpp on port %d. Apps connect to %s/v1; its "
+                 "own chat page is at %s." % (port, base, base)]
+        if dropped:
+            notes.append("Ignoring %s - Zoomies sets the model and port itself."
+                         % ", ".join(dropped))
+
+        a = [runner.ps_single(p) for p in self.prefix]
+        if model.source == "hf-cache":
+            # -hf finds the model in the cache along with its vision projector
+            # and any split parts; --offline keeps it from touching the network.
+            a += ["'-hf'", runner.ps_single(model.id), "'--offline'"]
+        else:
+            a += ["'-m'", runner.ps_single(model.gguf_path or model.id)]
+        a += ["'--alias'", runner.ps_single(model.id)]
+        for key, flag in LLAMACPP_FLAGS:
+            value = setting_number(settings, key, key in LLAMACPP_INT_FLAGS)
+            if value is not None:
+                a += [runner.ps_single(flag), runner.ps_single(value)]
+        idle = seconds_from(settings.get("keep_alive"))
+        if idle and idle > 0:
+            a += ["'--sleep-idle-seconds'", runner.ps_single(idle)]
+        kv_type = kv_choice_value(settings.get("kv_cache"))
+        if kv_type:
+            a += ["'-ctk'", runner.ps_single(kv_type),
+                  "'-ctv'", runner.ps_single(kv_type)]
+        kwargs = reasoning_kwargs(settings)
+        if kwargs:
+            # PowerShell 5.1 strips bare double quotes from native arguments;
+            # backslash-escaped ones arrive intact.
+            raw = json.dumps(kwargs, separators=(",", ":"))
+            a += ["'--chat-template-kwargs'", runner.ps_single(raw.replace('"', '\\"'))]
+        if not any(t.split("=", 1)[0] in ("-dev", "--device") for t in extra):
+            devices = list_devices(self.exe, self.prefix)
+            dedicated = [d for d in devices if not INTEGRATED_GPU.search(d[1])]
+            if dedicated and len(dedicated) < len(devices):
+                a += ["'--device'", runner.ps_single(",".join(d[0] for d in dedicated))]
+                notes.append("Using %s. Skipping %s: it shares system memory, "
+                             "so layers placed there run slowly."
+                             % (", ".join(d[1] for d in dedicated),
+                                ", ".join(d[1] for d in devices if d not in dedicated)))
+        a += [runner.ps_single(t) for t in extra]
+        a += ["'--host'", runner.ps_single(LLAMACPP_HOST),
+              "'--port'", runner.ps_single(port), "'--log-colors'", "'off'"]
+
+        if not self.exe:
+            body = "\n".join([self._preamble(log_path, "start llama.cpp", model.label,
+                                             source_note),
+                              "Write-Log 'llama.cpp was not found'", "exit 2", ""])
+        else:
+            body = "\n".join([self._preamble(log_path, "start llama.cpp", model.label,
+                                             source_note),
+                              self._native_call(a, "starting")])
+        return runner.LaunchPlan(
+            kind="load", backend=self.name, script_text=body,
+            script_path=script_path, log_path=log_path, endpoint=base,
+            host=LLAMACPP_HOST, port=port, long_lived=True, notes=notes,
+            model_id=model.id, ready_check=lambda: self._ready(port))
+
+    def _ready(self, port):
+        data, err = http_json("http://%s:%d/health" % (LLAMACPP_HOST, port),
+                              timeout=3.0)
+        return not err and (data or {}).get("status") == "ok"
+
+    def build_stop(self, loaded, session):
+        port = 0
+        m = re.search(r":(\d+)$", loaded.endpoint or "")
+        if m:
+            port = int(m.group(1))
+        record = self._servers(session).get(str(port)) if port else None
+        script_path, log_path = runner.new_paths(self.name, "stop-" + loaded.label)
+
+        if record:
+            shell_pid = int(record.get("shell_pid") or 0)
+            notes = ["Stops the llama.cpp server on port %d." % port]
+            body = "\n".join([
+                self._preamble(log_path, "stop llama.cpp", loaded.label, ""),
+                "$ErrorActionPreference = 'Continue'",
+                "$port = %d" % port,
+                "$pids = @(%d)" % shell_pid,
+                "$pids += @(Get-NetTCPConnection -LocalPort $port -State Listen "
+                "-ErrorAction SilentlyContinue | ForEach-Object { $_.OwningProcess })",
+                "foreach ($p in ($pids | Where-Object { $_ } | Select-Object -Unique)) {",
+                "  $proc = Get-Process -Id $p -ErrorAction SilentlyContinue",
+                "  # A remembered pid can be reused by an unrelated program after a",
+                "  # restart; only ever kill something that is plausibly ours.",
+                "  if ($proc -and $proc.ProcessName -in @('powershell','llama','llama-server')) {",
+                "    taskkill /T /F /PID $p 2>&1 | ForEach-Object { \"$_\" | Out-File -FilePath $log -Append -Encoding utf8 }",
+                "  }",
+                "}",
+                "$n = 0",
+                "while ((Get-NetTCPConnection -LocalPort $port -State Listen "
+                "-ErrorAction SilentlyContinue) -and $n -lt 40) { Start-Sleep -Milliseconds 250; $n++ }",
+                "if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {",
+                "  Write-Log 'port is still in use'; exit 1",
+                "}",
+                "Write-Log 'stopped'",
+                "exit 0",
+                "",
+            ])
+        else:
+            notes = ["Unloads it from the llama.cpp app, which keeps running."]
+            body = "\n".join([
+                self._preamble(log_path, "unload from llama.cpp app", loaded.label, ""),
+                "$body = @{ model = %s } | ConvertTo-Json" % runner.ps_single(loaded.id),
+                "try {",
+                "  Invoke-RestMethod %s -Method Post -ContentType 'application/json' "
+                "-Body $body -TimeoutSec 120 | Out-Null"
+                % runner.ps_single((loaded.endpoint or "") + "/models/unload"),
+                "  Write-Log 'unloaded'",
+                "} catch { Write-Log ('unload failed: ' + $_.Exception.Message); exit 1 }",
+                "exit 0",
+                "",
+            ])
+        return runner.LaunchPlan(
+            kind="stop", backend=self.name, script_text=body,
+            script_path=script_path, log_path=log_path,
+            endpoint=loaded.endpoint, host=LLAMACPP_HOST,
+            port=port if record else 0, notes=notes)
+
+    def build_download(self, repo_quant):
+        """`llama download -hf org/repo:QUANT` into the shared cache."""
+        script_path, log_path = runner.new_paths(self.name, "download-" + repo_quant)
+        a = ["'download'", "'-hf'", runner.ps_single(repo_quant)]
+        body = "\n".join([self._preamble(log_path, "download", repo_quant, ""),
+                          self._native_call(a, "downloading")])
+        return runner.LaunchPlan(
+            kind="download", backend=self.name, script_text=body,
+            script_path=script_path, log_path=log_path,
+            notes=["Downloads %s into the Hugging Face cache." % repo_quant])
+
+
+register(LlamaCppBackend())

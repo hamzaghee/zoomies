@@ -158,7 +158,7 @@ def backend_for_image(path):
         return "ollama"
     if "unsloth" in low:
         return "unsloth"
-    return "llama"
+    return "llamacpp"
 
 
 def llama_server_ports():
@@ -167,7 +167,10 @@ def llama_server_ports():
     llama-server picks a random port each time a model loads, so it has to
     be discovered. netstat maps listening ports to pids in about 60 ms.
     """
-    pids = set(state.find_processes("llama-server.exe"))
+    # llama.exe is the llama.cpp app's server (`llama serve`), including the
+    # per-model children its router starts on random ports.
+    pids = set(state.find_processes("llama-server.exe")) | set(
+        state.find_processes("llama.exe"))
     if not pids:
         return {}
     try:

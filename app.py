@@ -19,7 +19,7 @@ import threading
 import tkinter as tk
 import urllib.parse
 import webbrowser
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import backends
 import metrics
@@ -288,7 +288,7 @@ class Zoomies:
         row.grid(row=0, column=1, sticky="ew")
         self.backend_var = tk.StringVar(value=self.cfg.get("last_backend", "ollama"))
         self.backend_status = {}
-        for name in ("ollama", "unsloth"):
+        for name in ("ollama", "llamacpp", "unsloth"):
             be = backends.get(name)
             rb = ttk.Radiobutton(
                 row, text=(be.display_name if be else name.title()),
@@ -314,6 +314,9 @@ class Zoomies:
             row=0, column=2, padx=(6, 0))
         ttk.Button(frow, text="Rescan", command=self._reload_models).grid(
             row=0, column=3, padx=(6, 0))
+        self.download_btn = ttk.Button(frow, text="Download...",
+                                       command=self._download)
+        self.download_btn.grid(row=0, column=4, padx=(6, 0))
 
         ttk.Label(pick, text="Model").grid(row=2, column=0, sticky="w", pady=3)
         self.model_var = tk.StringVar()
@@ -706,13 +709,15 @@ class Zoomies:
         if be.uses_model_folder:
             self.folder_entry.state(["!disabled"])
             self.browse_btn.state(["!disabled"])
-            self.folder_var.set(self.cfg.get("unsloth_folder")
+            self.folder_var.set(self.cfg.get(self._folder_key(be))
                                 or be.default_folder or "")
         else:
             self.folder_var.set("%s   (%s manages these)"
                                 % (be.default_folder, be.display_name))
             self.folder_entry.state(["disabled"])
             self.browse_btn.state(["disabled"])
+        can_download = getattr(be, "can_download", lambda: False)()
+        self.download_btn.state(["!disabled"] if can_download else ["disabled"])
 
         for key, ent in self.entries.items():
             reason = be.supports(key)
@@ -803,8 +808,40 @@ class Zoomies:
             initialdir=self.folder_var.get() or os.path.expanduser("~"))
         if chosen:
             self.folder_var.set(chosen)
-            self.cfg["unsloth_folder"] = chosen
+            self.cfg[self._folder_key(self.backend())] = chosen
             self._reload_models()
+
+    @staticmethod
+    def _folder_key(be):
+        # "unsloth_folder" predates other backends having a folder
+        return "%s_folder" % be.name
+
+    def _download(self):
+        """Fetch a model for llama.cpp by its Hugging Face name."""
+        be = self.backend()
+        if self.busy or not getattr(be, "can_download", lambda: False)():
+            return
+        name = simpledialog.askstring(
+            "Download a model",
+            "Hugging Face name and quant, as llama.cpp takes it:\n\n"
+            "    ggml-org/Qwen3.5-0.8B-GGUF:Q8_0\n\n"
+            "Match the quant you tested on Ollama (for example Q4_K_M).",
+            parent=self.root)
+        name = (name or "").strip()
+        if not name:
+            return
+        if not backends.HF_REPO_QUANT.match(name):
+            self.set_status("That is not an org/repo:QUANT name.", "Warn.TLabel")
+            return
+        plan = be.build_download(name)
+        self.current_plan = plan
+        self.busy = True
+        self.load_btn.state(["disabled"])
+        self.set_status("Downloading %s..." % name)
+        self.log("")
+        self.log("=== %s ===" % os.path.basename(plan.script_path), "note")
+        threading.Thread(target=self._run_worker, args=(plan, False),
+                         daemon=True).start()
 
     def _open_folder(self):
         be = self.backend()
@@ -1190,20 +1227,16 @@ class Zoomies:
                 loads[plan.backend] = plan.model_id
             elif plan.kind == "stop":
                 loads.pop(plan.backend, None)
-            if plan.long_lived:
-                # Record enough to find this server again after a restart,
-                # and to kill it properly: the server spawns llama-server.exe
-                # as a child, so the parent pid alone is not enough.
-                model = self.selected_model()
-                self.session["unsloth"] = {
-                    "shell_pid": res.pid,
-                    "pid": (state.find_processes("unsloth.exe") or [0])[-1],
-                    "port": plan.port, "host": plan.host,
-                    "model_id": model.id if model else "",
-                    "label": model.label if model else "",
-                    "started": __import__("time").time(),
-                    "log": plan.log_path, "script": plan.script_path,
-                }
+            be = backends.get(plan.backend)
+            if plan.long_lived and be is not None:
+                # Enough to find this server again after a restart, and to
+                # stop the right process.
+                be.remember_server(self.session, plan, res.pid,
+                                   self.selected_model())
+            elif plan.kind == "stop" and be is not None:
+                be.forget_server(self.session, plan)
+            if plan.kind == "download":
+                self._reload_models()
             if plan.creates_tag:
                 backends.record_created_tag(self.session, plan.creates_tag,
                                             plan.creates_tag[:-len(state.TAG_SUFFIX)],

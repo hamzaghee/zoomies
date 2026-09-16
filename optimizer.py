@@ -309,6 +309,7 @@ def _family_text(model_id):
     name = str(model_id).replace("\\", "/")
     if "/" in name:                       # Hugging Face repo id
         name = name.rsplit("/", 1)[-1]
+        name = name.split(":")[0]         # llama.cpp's repo:QUANT
         name = re.sub(r"(?i)[-_]?gguf$", "", name)
         cut = SIZE_CUT.search(name)
         if cut:
@@ -1231,8 +1232,8 @@ def card_repos(model):
             if isinstance(value, str):
                 out.extend(r for r in HF_LINK.findall(value)
                            if not r.startswith(("datasets/", "spaces/")))
-    elif HF_REPO_ID.match(mid):
-        out.append(mid)
+    elif HF_REPO_ID.match(mid.split(":")[0]):
+        out.append(mid.split(":")[0])     # a repo id, or llama.cpp's repo:QUANT
     return _unique(out)
 
 
