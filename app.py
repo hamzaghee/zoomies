@@ -138,7 +138,7 @@ class Zoomies:
         self.mode_keys = {}
         self.reasoning = None             # docs' reasoning control, if any
         self._pending_reason = None       # level to keep across a mode re-read
-        self._kv_choice = backends.KV_CACHE_DEFAULT   # remembered across toggles
+        self._kv_choice = backends.KV_CACHE_START     # remembered across toggles
         self._reasoning_is_variant = False
         self.opt_result = None
 
@@ -390,7 +390,7 @@ class Zoomies:
         self.kv_label = ttk.Label(grid, text="KV cache", style="Dim.TLabel",
                                   anchor="e")
         self.kv_label.grid(row=kv_row, column=6, sticky="e", padx=(0, 6), pady=3)
-        self.kv_var = tk.StringVar(value=backends.KV_CACHE_DEFAULT)
+        self.kv_var = tk.StringVar(value=backends.KV_CACHE_START)
         self.kv_box = ttk.Combobox(grid, textvariable=self.kv_var,
                                    state="readonly", width=8,
                                    values=backends.KV_CACHE_CHOICES)
@@ -546,7 +546,7 @@ class Zoomies:
         self.live_stats["prompt"].configure(
             text=metrics.fmt(snap.get("prompt_tps"), " t/s"))
         self.live_stats["ttft"].configure(
-            text=metrics.fmt(snap.get("ttft"), "s", 2))
+            text=metrics.fmt_ttft(snap.get("ttft"), snap.get("ttft_upper")))
         self.live_stats["gen"].configure(text=metrics.fmt(snap.get("tg"), " t/s"))
         self.live_stats["tokens"].configure(
             text=metrics.fmt_int(snap.get("n_gen")))
@@ -584,7 +584,7 @@ class Zoomies:
                 row.get("time", ""),
                 be.display_name if be else (row.get("backend") or "-"),
                 row.get("model") or "-",
-                metrics.fmt(row.get("ttft"), "s", 2),
+                metrics.fmt_ttft(row.get("ttft"), row.get("ttft_upper")),
                 metrics.fmt(row.get("prompt_tps")),
                 metrics.fmt(row.get("gen_avg")),
                 metrics.fmt_mmss(row.get("runtime")),
@@ -858,9 +858,13 @@ class Zoomies:
                                          force_refresh=force)
         except Exception as exc:                      # noqa: BLE001
             result = optimizer.Result(error=str(exc))
-        self.out_queue.put(("optimal", model, result))
+        # Apply already asked before replacing typed values, so it may.
+        self.out_queue.put(("optimal", model, result, False))
 
-    def _apply_result(self, model, result):
+    def _apply_result(self, model, result, keep_edits=False):
+        """keep_edits: a Mode or Reasoning change re-reads the docs for new
+        sampling numbers, but must not touch what you typed - it used to put
+        the docs' context back over a context you had just raised."""
         self.apply_btn.state(["!disabled"])
         be = self.backend()
         self.opt_result = result
@@ -880,6 +884,8 @@ class Zoomies:
         applied, skipped = [], []
         for key, value in result.settings.items():
             if key not in self.vars:
+                continue
+            if keep_edits and self.dirty.get(key) and self.vars[key].get().strip():
                 continue
             if be.supports(key):
                 self._set_value(key, value, auto=True)
@@ -994,7 +1000,7 @@ class Zoomies:
         threading.Thread(
             target=lambda: self.out_queue.put(
                 ("optimal", model,
-                 optimizer.recommend(model, self.cfg, mode=key))),
+                 optimizer.recommend(model, self.cfg, mode=key), True)),
             daemon=True).start()
 
     def _offer_page_picker(self, model, candidates):
@@ -1341,7 +1347,7 @@ class Zoomies:
                 elif kind == "done":
                     self._run_done(msg[1], msg[2], msg[3])
                 elif kind == "optimal":
-                    self._apply_result(msg[1], msg[2])
+                    self._apply_result(msg[1], msg[2], keep_edits=msg[3])
                 elif kind == "models":
                     self._models_ready(msg[1], msg[2], msg[3], msg[4])
         except queue.Empty:

@@ -84,6 +84,7 @@ LUID_RE = re.compile(r"luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)")
 
 GPU_POLL_SECONDS = 2
 SLOTS_POLL_SECONDS = 0.5      # how often each llama-server is asked
+SLOTS_POLL_BUSY = 0.2         # ...while a request is running
 PORT_REFRESH_SECONDS = 5.0    # how often to look for new llama-server ports
 SLOTS_FRESH = 3.0             # slots data this recent outranks log lines
 GPU_SAMPLE_PREFIX = "zoomies_gpu_"
@@ -277,6 +278,7 @@ class Metrics:
         self._our_samples = set()
         self._slots_seen = {}         # backend -> last time /slots showed work
         self._tracks = {}             # (port, slot id) -> request tracker
+        self._idle_at = {}            # (port, slot id) -> last poll that saw it idle
         self.state = {
             "status": "Waiting for activity...",
             "backend": "",
@@ -473,7 +475,8 @@ class Metrics:
                 for slot in fetch_slots(port):
                     self._observe_slot(port, backend, slot, time.time(), kv=kv)
             self._reap_idle()
-            self.shutdown.wait(SLOTS_POLL_SECONDS)
+            # Poll faster while a request runs, so short ones are timed closely.
+            self.shutdown.wait(SLOTS_POLL_BUSY if self._tracks else SLOTS_POLL_SECONDS)
 
     def _reap_idle(self):
         """File a finished request once it has gone quiet, so the last one of
@@ -507,6 +510,7 @@ class Metrics:
 
         with self.lock:
             if not busy:
+                self._idle_at[key] = now
                 if track is not None:
                     self._push_history(backend)
                     self._tracks.pop(key, None)
@@ -516,6 +520,7 @@ class Metrics:
                 if track is not None:
                     self._push_history(backend)
                 track = {"task": task, "start": now, "first_tok": None,
+                         "idle_before": self._idle_at.get(key),
                          "samples": deque(maxlen=40), "prompt_done": 0,
                          "prompt_t": now,
                          # prompt-phase baseline, only if we arrived before
@@ -527,7 +532,8 @@ class Metrics:
                          "t_last": None, "d_last": None}
                 self._tracks[key] = track
                 self.state.update({"n_gen": None, "tg": None, "tg3s": None,
-                                   "ttft": None, "prompt_tps": None,
+                                   "ttft": None, "ttft_upper": False,
+                                   "prompt_tps": None,
                                    "request_start": now, "filed": False,
                                    "first_gen_seen": False,
                                    "gen_avg": None, "runtime": None})
@@ -562,11 +568,20 @@ class Metrics:
             if decoded > 0:
                 if track["first_tok"] is None:
                     track["first_tok"] = now
-                    # Only meaningful if the prompt phase was actually
-                    # watched. A request first seen mid-generation has an
-                    # unknown start, and "0.00s" would be a made-up number.
-                    if track["prompt_done"]:
+                    # Watched from its prompt phase: measured. (This used to
+                    # require prompt progress above zero, which a short prompt
+                    # often never shows, so small models got "-".)
+                    if track["p0"] is not None:
                         update["ttft"] = now - track["start"]
+                    elif (track["idle_before"] is not None and now
+                            - track["idle_before"] <= 3 * SLOTS_POLL_SECONDS):
+                        # Idle at the previous poll, already generating at
+                        # this one: the prompt and first token both fit
+                        # between two polls, so TTFT is at most that gap.
+                        update["ttft"] = now - track["idle_before"]
+                        update["ttft_upper"] = True
+                    # Otherwise first seen mid-generation with an unknown
+                    # start, and any number would be made up.
                     update["first_gen_seen"] = True
                     track["t_first"], track["d_first"] = now, decoded
                 # Current rate: since the previous sample, stalls included.
@@ -608,7 +623,8 @@ class Metrics:
             "time": datetime.now().strftime("%H:%M:%S"),
             "backend": s.get("backend") or backend,
             "model": self.model_namer(s.get("backend") or backend),
-            "ttft": s.get("ttft"), "tg3s": s.get("tg3s"),
+            "ttft": s.get("ttft"), "ttft_upper": s.get("ttft_upper"),
+            "tg3s": s.get("tg3s"),
             "prompt_tps": s.get("prompt_tps"),
             "gen_avg": s.get("gen_avg"), "runtime": s.get("runtime"),
             "kv": s.get("kv"),
@@ -772,6 +788,13 @@ def bar_text(used, total, width=12):
     filled = max(0, min(width, int(width * used / float(total) + 0.5)))
     return "%s%s  %s / %s" % (BAR_FULL * filled, BAR_EMPTY * (width - filled),
                               format(int(used), ","), format(int(total), ","))
+
+
+def fmt_ttft(seconds, upper=False):
+    """"<0.21s" when the request fit between two polls: an upper bound."""
+    if seconds is None:
+        return "-"
+    return ("<%.2fs" if upper else "%.2fs") % seconds
 
 
 def fmt_mmss(seconds):

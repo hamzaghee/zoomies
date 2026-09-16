@@ -177,6 +177,9 @@ def http_json(url, method="GET", payload=None, timeout=5.0):
 KV_CACHE_DEFAULT = "f16 (default)"
 KV_CACHE_CHOICES = (KV_CACHE_DEFAULT, "bf16", "q8_0", "q4_0", "q4_1",
                     "q5_0", "q5_1", "iq4_nl", "f32")
+# What the dropdown starts on: q8_0 halves the cache of f16 at a quality cost
+# too small to notice, and matches the q8_0 Ollama runs with here.
+KV_CACHE_START = "q8_0"
 
 
 def kv_choice_value(choice):
@@ -1163,9 +1166,13 @@ class UnslothBackend(Backend):
                   if str(settings.get(key) or "").strip()]
         if pinned:
             notes.append(
-                "Unsloth Studio is already running, and its load API has no "
-                "sampling fields - %s will NOT be applied. Stop the server "
-                "first if you need those pinned." % ", ".join(pinned))
+                "Not applied: %s. Unsloth Studio was already running, and a "
+                "running Studio only accepts context, GPU layers, KV cache "
+                "and reasoning when loading a model - sampling is chosen by "
+                "whichever app sends each chat (Unsloth's chat screen uses "
+                "its own sliders). To fix these numbers for every chat, "
+                "close Unsloth Studio and load from Zoomies, which then "
+                "starts the server with them." % ", ".join(pinned))
 
         lines = ["$body = @{",
                  "  model_path   = %s" % runner.ps_single(model.id),
