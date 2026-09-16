@@ -80,7 +80,6 @@ def write_json(path, data):
 
 
 DEFAULT_CONFIG = {
-    "unsloth_folder": "",
     "always_on_top": False,
     "unload_on_exit": False,
     "manual_page_map": {},       # model match_key -> docs page title chosen by hand
@@ -102,7 +101,6 @@ def save_config(cfg):
 DEFAULT_SESSION = {
     "version": 1,
     "ollama": {"created_tags": []},   # tags Zoomies made and must remove again
-    "unsloth": None,                  # dict once a server is running
 }
 
 
@@ -171,7 +169,7 @@ def alive_and_named(pid, want):
     """True only if the PID exists AND its image name matches.
 
     The name check is what defends against PID reuse: a recycled PID belonging
-    to some unrelated program will not be called unsloth.exe.
+    to some unrelated program will not be called powershell.exe.
     """
     if not pid:
         return False
@@ -180,9 +178,9 @@ def alive_and_named(pid, want):
 
 
 def kill_tree(pid, log_lines=None):
-    """taskkill /T /F. The /T is mandatory, not optional polish: unsloth.exe
-    spawns llama-server.exe as a child, and killing only the parent leaves the
-    child holding all the VRAM."""
+    """taskkill /T /F. The /T is mandatory, not optional polish: a server's
+    PowerShell script runs llama.exe as a child, and killing only the parent
+    leaves the child holding all the VRAM."""
     if not pid:
         return False
     try:
@@ -251,8 +249,8 @@ def sweep_old_files(directory, keep=KEEP_FILES):
 # GPUs
 # --------------------------------------------------------------------------
 
-# Deliberately measured rather than assumed. Unsloth's /api/system/hardware
-# reports a single GPU, and believing it cost this app a wrong VRAM budget:
+# Deliberately measured rather than assumed. A backend's own hardware report
+# once claimed a single GPU, and believing it cost this app a wrong VRAM budget:
 # this machine has two RX 6800 XTs, not one. The registry also keeps entries
 # for cards that are no longer installed (there is a stale RTX 4090 here), so
 # a registry sweep alone over-reports. Present devices come from PnP, sizes

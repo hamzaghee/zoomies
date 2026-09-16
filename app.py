@@ -286,9 +286,12 @@ class Zoomies:
         ttk.Label(pick, text="Backend").grid(row=0, column=0, sticky="w")
         row = ttk.Frame(pick)
         row.grid(row=0, column=1, sticky="ew")
-        self.backend_var = tk.StringVar(value=self.cfg.get("last_backend", "ollama"))
+        last = self.cfg.get("last_backend", "ollama")
+        if last not in backends.REGISTRY:       # e.g. the removed Unsloth backend
+            last = "ollama"
+        self.backend_var = tk.StringVar(value=last)
         self.backend_status = {}
-        for name in ("ollama", "llamacpp", "unsloth"):
+        for name in ("ollama", "llamacpp"):
             be = backends.get(name)
             rb = ttk.Radiobutton(
                 row, text=(be.display_name if be else name.title()),
@@ -752,7 +755,7 @@ class Zoomies:
         """Refresh the model dropdown without freezing the window.
 
         This used to call list_models() on the UI thread, so every backend
-        toggle stalled while Unsloth answered two HTTP requests. Now the last
+        toggle stalled while a backend answered its requests. Now the last
         known list for that backend appears immediately and the real one is
         fetched on a worker, landing through the queue like everything else.
         """
@@ -813,7 +816,6 @@ class Zoomies:
 
     @staticmethod
     def _folder_key(be):
-        # "unsloth_folder" predates other backends having a folder
         return "%s_folder" % be.name
 
     def _download(self):
@@ -990,7 +992,7 @@ class Zoomies:
                               else ["disabled"])
 
     def _refresh_kv_box(self):
-        """Selectable where the backend applies it per load (Unsloth); on
+        """Selectable where the backend applies it per load (llama.cpp); on
         Ollama it shows the server-wide value, greyed out, because Ollama
         takes it from an environment variable, not from a load request."""
         be = self.backend()

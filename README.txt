@@ -28,6 +28,7 @@ WHERE THINGS LIVE
     session.json   what is running, and what Zoomies created
     scripts\       every generated script, newest 20 kept
     logs\          matching log for each script, newest 20 kept
+    cache\         docs pages, model cards, and saved settings answers
 
   Use "Open folder" and "Open log" in the Output pane to get to them.
 
@@ -37,27 +38,37 @@ THE TWO BACKENDS
   OLLAMA
     Models come from Ollama's own registry, so the folder box is greyed
     out - Ollama manages those files itself. Sampling settings are
-    applied through a temporary tag (see below).
+    applied through a temporary tag (see below). Good for trying models
+    out, and what jobbuddy uses.
 
-  UNSLOTH STUDIO
-    Models come from the running Studio (its own API lists them, with
-    sizes and quants), plus any .gguf files in the folder you pick.
+  LLAMA.CPP
+    The engine underneath Ollama, run directly. Needs the llama.cpp app
+    (its llama.exe) or a llama-server.exe release on this machine.
 
-    Unsloth has the mirror-image of Ollama's problem. Its load API takes
-    context length, GPU layers and parallel slots, but has no field for
-    temperature. Sampling is pinned by the `unsloth run` command line
-    instead - which only happens when Zoomies is the one starting the
-    server. So:
+    Models come from the Hugging Face cache (~\.cache\huggingface\hub),
+    where llama.cpp downloads to, plus any .gguf files in the folder you
+    pick. "Download..." fetches a new one by its Hugging Face name:
 
-      Studio not running -> Zoomies starts it and pins everything.
-      Studio already running -> Zoomies loads into it, and tells you
-                                plainly which settings could not be
-                                applied. Stop the server first if you
-                                need them.
+        ggml-org/Qwen3.5-0.8B-GGUF:Q8_0
 
-    Unloading a model leaves Studio running. Zoomies only ever shuts the
-    whole server down if it started it, because "unsloth studio stop"
-    stops every server on the machine, not just ours.
+    Match the quant you tested on Ollama (Q4_K_M, for example).
+
+    Load starts a separate llama.cpp server for that model on the first
+    free port from 8080, with every setting on its command line - so
+    every field works, and nothing is saved anywhere else. Sampling
+    becomes the server's default: an app that sends its own values still
+    wins. The Output pane shows the address to point your apps at, and
+    the same address opens llama.cpp's own chat page.
+
+    Integrated graphics are left out automatically. They report system
+    memory as VRAM, so llama.cpp would happily put layers there, and
+    every token would crawl.
+
+    Models loaded in the llama.cpp app also show up under Loaded, marked
+    as not started by Zoomies, and Unload asks the app to unload them.
+    Zoomies does not load into the app itself: the app takes each model's
+    flags from a saved presets file, so per-load settings would mean
+    changing that file permanently.
 
 
 THE OLLAMA TEMPORARY TAG - READ THIS ONE
@@ -100,12 +111,27 @@ THE OLLAMA TEMPORARY TAG - READ THIS ONE
 
 
 APPLY OPTIMAL SETTINGS
-  Click it and Zoomies looks up that model's recommended sampling
-  settings in the Unsloth documentation and fills them in. The line
-  underneath says exactly where each number came from - page, section,
-  mode and line number - so you can always check it.
+  Click it and Zoomies looks up that model's recommended settings and
+  fills them in. The line underneath says exactly where each number came
+  from, so you can always check it.
 
-  HOW IT FINDS THE RIGHT PAGE
+  WHERE IT LOOKS, BEST FIRST
+    1. The Unsloth documentation page for that model.
+    2. The publisher's own Hugging Face model card - found through the
+       model's repo, the Hugging Face link stored inside the model file,
+       the original a GGUF was made from, or a search that only accepts
+       exactly the same model family.
+    3. The Unsloth page for an earlier release of the same family.
+    4. The settings packaged inside an Ollama model (set by whoever
+       published it on Ollama, not necessarily its authors).
+
+  On a model card, numbers only count inside a passage that calls itself
+  a recommendation - never in a code example or a benchmark note. Cards
+  often list the settings their benchmarks ran with right beside the
+  real advice (Ornith's lists temperature 1.0 for its benchmarks), and
+  those are not advice.
+
+  HOW IT FINDS THE UNSLOTH PAGE
   Unsloth publishes an index of every docs page at
   unsloth.ai/docs/llms.txt, and the page's web address is the model
   family name:
@@ -114,30 +140,27 @@ APPLY OPTIMAL SETTINGS
       gemma4:12b-it-q4_K_M   ->  gemma4      ->  .../models/gemma-4.md
       ministral-3:14b-...    ->  ministral3  ->  .../tutorials/ministral-3.md
 
-  Take the model name up to the colon, drop the punctuation, and it
-  matches. Zoomies then downloads that one page (about 30 KB) instead of
-  the whole documentation set.
+  Take the model name up to the colon (or the size, for a Hugging Face
+  name), drop the punctuation, and it matches.
 
   WORKED OUT ONCE, THEN KEPT
-  The first lookup for a model takes about a fifth of a second. The
-  answer is then saved to
-      %LOCALAPPDATA%\Zoomies\cache
-esolved.json
+  The answer for a model family is saved to
+      %LOCALAPPDATA%\Zoomies\cache\resolved.json
   and never expires. After that, clicking Apply - or switching modes -
-  is instant and needs no internet at all, even if the cache is wiped.
-  Press "Re-read docs" when you want Zoomies to go and look again,
-  which is the only thing that overwrites a saved answer.
+  is instant and needs no internet at all. Press "Re-read docs" when you
+  want Zoomies to go and look again, which is the only thing that
+  overwrites a saved answer.
 
-  Blue numbers came from the docs. Numbers you type turn white, and
-  Zoomies asks before overwriting anything you changed yourself.
+  Blue numbers came from a source. Numbers you type turn white, and
+  Zoomies asks before Apply overwrites anything you changed yourself.
+  Switching Mode or Reasoning updates the other numbers but keeps yours.
 
   The Mode dropdown appears when a model documents more than one set of
-  numbers (Thinking vs Instruct, Instruct vs Reasoning). Switching it
-  re-reads that column. It only changes sampling numbers; it does not
-  turn thinking on or off by itself - that is the Reasoning dropdown.
+  numbers (Thinking vs Instruct, general vs coding). Switching it
+  re-reads that set.
 
   REASONING
-  The Reasoning dropdown offers exactly what the model's docs page says,
+  The Reasoning dropdown offers exactly what the model's docs say,
   because models do this differently:
 
       qwen3.8       effort level: xhigh (default), medium, low, none
@@ -149,38 +172,34 @@ esolved.json
   choosing Instruct switches reasoning off, and choosing a reasoning level
   switches Mode back to Thinking.
 
-  Unsloth applies the choice when the model loads. On Ollama the dropdown
-  is greyed out: Ollama takes reasoning per request, so the app sending
-  the prompt (jobbuddy, for example) decides, not the launcher.
+  llama.cpp applies the choice when the server starts. On Ollama the
+  dropdown is greyed out: Ollama takes reasoning per request, so the app
+  sending the prompt (jobbuddy, for example) decides, not the launcher.
 
   KV CACHE
-  The KV cache dropdown sits beside Parallel and offers the same types
-  as Unsloth Studio's own: f16 (the default), bf16, q8_0, q4_0, q4_1,
-  q5_0, q5_1, iq4_nl and f32. Smaller types (q8_0, q4_0...) let a longer
-  context fit in the same VRAM, at some cost in quality.
+  The KV cache dropdown sits beside Parallel: f16 (llama.cpp's default),
+  bf16, q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl and f32. It starts on q8_0.
+  Smaller types let a longer context fit in the same VRAM, at some cost
+  in quality.
 
-  Unsloth applies it every time a model loads. On Ollama it is greyed out
+  llama.cpp applies it when the server starts. On Ollama it is greyed out
   and shows the current value, because Ollama takes it from the
   OLLAMA_KV_CACHE_TYPE environment variable for every model at once - on
   this machine that is q8_0. The value actually in use shows in the Live
   panel and in History either way.
 
-  IT WILL LEAVE THE BOXES EMPTY RATHER THAN GUESS. If the docs have no
-  page for your model you get an empty form and a list of pages to pick
-  from, not a near-match. A wrong temperature looks exactly like a right
-  one; an empty box does not. Your pick is remembered for that model.
+  IT WILL LEAVE THE BOXES EMPTY RATHER THAN GUESS. If no source has
+  settings for your model you get an empty form, a list of Unsloth pages
+  to pick from, and a "Search the web" button - not a near-match. A wrong
+  temperature looks exactly like a right one; an empty box does not. A
+  page you pick is remembered for that model.
 
-  The one exception is an older release of the same family: if there is
-  no gemma9 page but gemma4 exists, Zoomies uses gemma4's settings and
-  says so in orange, because sampling defaults rarely swing much between
-  versions of a family. Check them before relying on them.
-
-  Context length is capped when the docs quote something your cards
+  Context length is capped when a source quotes something your cards
   cannot hold - they often say 262,144, which no consumer GPU can fit
   beside the weights. The ceiling is worked out from the GPUs actually
-  present (Zoomies detects them; this machine has two RX 6800 XTs, about
-  32 GB total), not from a fixed number. The note under the settings
-  says what it did and why. Raise it if you want.
+  present (this machine has two RX 6800 XTs, about 32 GB total), not
+  from a fixed number. The note under the settings says what it did and
+  why. Raise it if you want.
 
 
 GREYED-OUT FIELDS
@@ -196,42 +215,37 @@ NOTES FOR THIS MACHINE
   - The only ollama command Zoomies ever runs is "ollama serve".
     Every other ollama subcommand launches the Ollama tray app;
     everything else here goes over HTTP instead.
-  - Your llama.cpp build is Vulkan, not CUDA. Settings copied from
-    CUDA-oriented guides (--flash-attn, -ngl) may be ignored or slower.
+  - llama.cpp here is the Vulkan build, not CUDA. Settings copied from
+    CUDA-oriented guides may be ignored or slower.
   - You have TWO RX 6800 XTs, about 32 GB of VRAM in total. Each card is
     16 GB on its own, so a 16.5 GB model like qwen3.8:27b-q4_K_M does not
-    fit on a single card - Ollama will spread it or offload part of it.
-    Watch the "VRAM in use" figure.
+    fit on a single card - it is spread across both. Watch the "VRAM in
+    use" figure.
   - There is a stale NVIDIA RTX 4090 entry in the Windows registry from a
     card that is no longer installed. Zoomies ignores it: it counts only
     adapters Windows reports as present.
-  - Model docs often list a 262,144 context. Nothing here reaches that;
-    8192-65536 is the realistic range.
 
 
 THE LIVE PANEL
   Once a model is answering, the Live strip shows what it is actually
-  doing: prompt-eval speed, time to first token, generation rate (plus a
-  3-second average), tokens produced, and how much of the context window
-  is used. Your GPUs and their utilisation sit on the right.
+  doing: prompt-eval speed, time to first token, generation rate, tokens
+  produced, KV cache type, and how much of the context window is used.
+  Your GPUs and their utilisation sit on the right.
 
   WHERE THE NUMBERS COME FROM
-  Both backends run a program called llama-server underneath, whoever
-  started them. Zoomies finds every running llama-server and asks it
-  directly, twice a second, what it is doing. This works even when the
-  model was launched by another app - jobbuddy, for example, starts
-  Ollama with its log switched off, so a log-reading monitor would see
-  nothing at all.
+  Both backends run llama.cpp underneath, whoever started them. Zoomies
+  finds every running llama.cpp server and asks it directly what it is
+  doing - twice a second, five times a second while a request runs. This
+  works even when another app launched the model - jobbuddy, for
+  example, starts Ollama with its log switched off, so a log-reading
+  monitor would see nothing at all.
 
   Speeds are worked out from how many tokens were added between two
-  checks, so time-to-first-token is accurate to about half a second, and
-  a request shorter than half a second can be missed entirely.
+  checks. When a request's prompt and first token both land between two
+  checks, time to first token shows as an upper bound, like "<0.20s".
 
-  If no llama-server can be reached, Zoomies falls back to reading the
-  backend's log file instead, when one exists:
-
-    Ollama    %LOCALAPPDATA%\Ollama\server.log      one file
-    Unsloth   ~\.unsloth\studio\logs\llama-server\  a new file per run
+  If no server can be reached, Zoomies falls back to reading Ollama's
+  log, %LOCALAPPDATA%\Ollama\server.log, when it exists.
 
   The History tab keeps the last 25 requests. A request is filed when it
   finishes, when the next one starts, or once it has been quiet for five
@@ -247,15 +261,9 @@ THE LIVE PANEL
 STATUS
   v0    Ollama backend, manual settings, load/unload, dashboard.  DONE
   v0.5  the optimizer - recommended settings from the live docs.  DONE
-  v1    Unsloth Studio backend, both radio buttons live.          DONE
-  v1.5  live tokens/sec, TTFT, context bar and GPU utilisation.   DONE
+  v1    live tokens/sec, TTFT, context bar and GPU utilisation.   DONE
+  v1.5  settings from model cards and Ollama; llama.cpp backend.  DONE
+        (the Unsloth Studio backend was removed in favour of it)
 
-  Zoomies now covers everything the separate Ollama Monitor did, for
-  both backends rather than just Ollama.
-
-KNOWN ROUGH EDGE
-  Unsloth reports a cached model's size as the whole downloaded folder,
-  which can include more than one quantisation. Qwen3.8-27B shows as
-  37.9 GB there but 16.5 GB in Ollama. Zoomies uses that figure to pick
-  a context ceiling, so for those models the suggested context comes out
-  lower than it needs to be. Raise it by hand if you know better.
+  Zoomies covers everything the separate Ollama Monitor did, for both
+  backends rather than just Ollama.

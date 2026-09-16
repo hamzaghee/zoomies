@@ -1,18 +1,12 @@
 r"""
 Zoomies - live inference metrics.
 
-Ported from the Ollama Monitor, generalised to both backends.
+Ported from the Ollama Monitor, generalised to Ollama and llama.cpp.
 
-Ollama and Unsloth both run llama.cpp underneath, and llama.cpp writes the
-same `slot print_timing:` lines either way - Unsloth just prefixes each one
-with a timestamp. Since the patterns are searched rather than anchored, one
-parser serves both. What differs is only where the log lives:
-
-  Ollama    %LOCALAPPDATA%\Ollama\server.log        one fixed file
-  Unsloth   ~\.unsloth\studio\logs\llama-server\    a new file per run, named
-                                                    with a random inner port
-
-so the Unsloth source re-resolves to the newest file as it goes.
+Both run llama.cpp underneath. The primary source is llama-server's own
+GET /slots, which answers no matter who started the server; Ollama's
+server.log, with the `slot print_timing:` lines llama.cpp writes, is the
+fallback when no server can be reached.
 
 GPU utilisation comes from Windows' own "GPU Engine" counters - the same
 source Task Manager reads - joined to real adapter names through DXGI.
@@ -101,21 +95,7 @@ def ollama_log():
                         "server.log")
 
 
-def unsloth_log():
-    """Newest llama-server log. Unsloth starts a fresh one per run, so the
-    answer changes underneath us and has to be re-checked."""
-    folder = os.path.join(os.path.expanduser("~"), ".unsloth", "studio",
-                          "logs", "llama-server")
-    try:
-        entries = [(os.path.getmtime(os.path.join(folder, n)),
-                    os.path.join(folder, n))
-                   for n in os.listdir(folder) if n.endswith(".log")]
-    except OSError:
-        return ""
-    return max(entries)[1] if entries else ""
-
-
-SOURCES = (("ollama", ollama_log), ("unsloth", unsloth_log))
+SOURCES = (("ollama", ollama_log),)
 
 
 # --------------------------------------------------------------------------
@@ -156,8 +136,6 @@ def backend_for_image(path):
     low = (path or "").lower().replace("\\", "/")
     if "/ollama/" in low:
         return "ollama"
-    if "unsloth" in low:
-        return "unsloth"
     return "llamacpp"
 
 

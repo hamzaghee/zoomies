@@ -10,7 +10,7 @@ Two execution shapes:
   short-lived   ollama create / load / rm. We wait for the exit code and read
                 the output back.
 
-  long-lived    the Unsloth server. We start it and walk away. The script
+  long-lived    a llama.cpp server. We start it and walk away. The script
                 redirects its own output to a log file and the GUI tails that
                 file, so closing Zoomies cannot break a pipe and kill the
                 server, and a restarted Zoomies can pick the log back up.
@@ -51,7 +51,6 @@ EXIT_MEANING = {
     6: "creating the temporary tag failed",
 }
 
-API_KEY_RE = re.compile(r"\b(sk-[A-Za-z0-9_\-]{16,})")
 ERROR_RE = re.compile(
     r"(?i)\b(error|failed|fatal|exception|traceback|cannot|denied|refused|unable)\b"
 )
@@ -240,16 +239,6 @@ def read_log_tail(path, max_lines=400):
             return fh.read().splitlines()[-max_lines:]
     except OSError:
         return []
-
-
-def find_api_key(lines):
-    """Unsloth prints its API key to stdout; the user needs it to point any
-    client at the server, and it would otherwise be buried in a log file."""
-    for line in reversed(lines):
-        m = API_KEY_RE.search(line)
-        if m:
-            return m.group(1)
-    return ""
 
 
 def looks_like_error(line):
