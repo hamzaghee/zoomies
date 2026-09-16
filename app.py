@@ -23,6 +23,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import backends
 import metrics
+import processes
 import runner
 import state
 
@@ -424,6 +425,10 @@ class Zoomies:
         self.load_btn.pack(side="left")
         ttk.Button(act, text="Preview script",
                    command=self._preview).pack(side="left", padx=(8, 0))
+        self.one_at_a_time = tk.BooleanVar(
+            value=self.cfg.get("one_model_at_a_time", True))
+        ttk.Checkbutton(act, text="One model at a time",
+                        variable=self.one_at_a_time).pack(side="left", padx=(12, 0))
         self.status_lbl = ttk.Label(act, text="", style="Dim.TLabel")
         self.status_lbl.pack(side="left", padx=(16, 0))
 
@@ -501,6 +506,7 @@ class Zoomies:
 
         tabs = ttk.Notebook(box)
         tabs.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.tabs = tabs
 
         hist = ttk.Frame(tabs)
         tabs.add(hist, text="  History  ")
@@ -538,6 +544,40 @@ class Zoomies:
         sb.pack(side="right", fill="y")
         self.out.tag_configure("err", foreground=BAD)
         self.out.tag_configure("note", foreground=ACCENT)
+
+        # Every llama.cpp / Ollama process, including ones no API reports -
+        # a terminal chat, a server whose launcher exited - so a slow machine
+        # can be explained and cleaned up without Task Manager.
+        pw = ttk.Frame(tabs)
+        tabs.add(pw, text="  Processes  ")
+        self.procs_tab = pw
+        pbar = ttk.Frame(pw)
+        pbar.pack(fill="x", pady=(4, 2))
+        ttk.Button(pbar, text="Refresh",
+                   command=self._refresh_processes).pack(side="left")
+        ttk.Button(pbar, text="Clean up leftovers",
+                   command=self._clean_leftovers).pack(side="left", padx=(8, 0))
+        ttk.Button(pbar, text="End selected",
+                   command=self._end_selected).pack(side="left", padx=(8, 0))
+        self.procs_lbl = ttk.Label(pbar, text="", style="Dim.TLabel")
+        self.procs_lbl.pack(side="left", padx=(16, 0))
+        cols = ("what", "ram", "pid", "started", "parent")
+        widths = (560, 75, 65, 95, 120)
+        headings = {"what": "What it is", "ram": "RAM", "pid": "PID",
+                    "started": "Started", "parent": "Started by"}
+        self.proc_tree = ttk.Treeview(pw, columns=cols, show="headings", height=7)
+        for col, w in zip(cols, widths):
+            self.proc_tree.heading(col, text=headings[col])
+            self.proc_tree.column(col, width=self.px(w), minwidth=self.px(40),
+                                  anchor="w" if col in ("what", "parent") else "center")
+        self.proc_tree.pack(fill="both", expand=True)
+        self.proc_tree.tag_configure("leftover", foreground=WARN)
+        self.proc_tree.tag_configure("protected", foreground=FG_DIM)
+        self.procs = []
+        self._procs_busy = False
+        tabs.bind("<<NotebookTabChanged>>",
+                  lambda e: self._refresh_processes()
+                  if tabs.select() == str(pw) else None)
         self.tabs = tabs
 
     def _refresh_live(self):
@@ -1161,9 +1201,15 @@ class Zoomies:
         model = self.selected_model()
         self.cfg["last_model"] = model.id if model else ""
 
-        pre = self.backend().installed_names() if hasattr(
-            self.backend(), "installed_names") else None
-        pre_existing = bool(pre) and plan.creates_tag in pre
+        be = self.backend()
+        clear_first = bool(self.one_at_a_time.get())
+
+        def tag_existed():
+            # Asked after any unloading, which can itself remove a tag: asked
+            # before, a tag about to be deleted would be recorded as one that
+            # already existed, and Zoomies would then refuse to remove it.
+            pre = be.installed_names() if hasattr(be, "installed_names") else None
+            return bool(pre) and plan.creates_tag in pre
 
         self.busy = True
         self.load_btn.state(["disabled"])
@@ -1171,15 +1217,46 @@ class Zoomies:
         self.log("")
         self.log("=== %s ===" % os.path.basename(plan.script_path), "note")
         threading.Thread(target=self._run_worker,
-                         args=(plan, pre_existing), daemon=True).start()
+                         args=(plan, tag_existed, clear_first), daemon=True).start()
 
-    def _run_worker(self, plan, pre_existing):
+    def _run_worker(self, plan, pre_existing, clear_first=False):
         emit = lambda ln: self.out_queue.put(("line", ln))
+        if clear_first:
+            self._unload_others(emit)
+        if callable(pre_existing):
+            pre_existing = pre_existing()
         if plan.long_lived:
             res = self._spawn_server(plan, emit)
         else:
             res = runner.run_script(plan, on_line=emit)
         self.out_queue.put(("done", plan, pre_existing, res))
+
+    def _unload_others(self, emit):
+        """One model at a time: unload everything reachable before loading.
+
+        A fresh list, not the dashboard's copy, which can be two seconds old.
+        Each unload is the same plan the Unload button runs, so Ollama's
+        temporary tags are still removed and records still updated.
+        """
+        loaded = []
+        for be in backends.REGISTRY.values():
+            try:
+                loaded.extend(be.list_loaded())
+            except Exception:                         # noqa: BLE001
+                pass
+        for item in loaded:
+            be = backends.get(item.backend)
+            if be is None:
+                continue
+            emit("[zoomies] one model at a time - unloading %s (%s)"
+                 % (item.label, be.display_name))
+            try:
+                stop = be.build_stop(item, self.session)
+                res = runner.run_script(stop, on_line=emit, timeout=180)
+            except Exception as exc:                  # noqa: BLE001
+                emit("[zoomies] could not unload %s: %s" % (item.label, exc))
+                continue
+            self.out_queue.put(("cleared", stop, res))
 
     def _spawn_server(self, plan, emit):
         """Start a server that is meant to outlive the script.
@@ -1224,34 +1301,135 @@ class Zoomies:
         self.busy = False
         self.load_btn.state(["!disabled"])
         if res.ok:
-            loads = self.session.setdefault("zoomies_loads", {})
-            if plan.kind == "load" and plan.model_id:
-                loads[plan.backend] = plan.model_id
-            elif plan.kind == "stop":
-                loads.pop(plan.backend, None)
-            be = backends.get(plan.backend)
-            if plan.long_lived and be is not None:
-                # Enough to find this server again after a restart, and to
-                # stop the right process.
-                be.remember_server(self.session, plan, res.pid,
-                                   self.selected_model())
-            elif plan.kind == "stop" and be is not None:
-                be.forget_server(self.session, plan)
-            if plan.kind == "download":
-                self._reload_models()
-            if plan.creates_tag:
-                backends.record_created_tag(self.session, plan.creates_tag,
-                                            plan.creates_tag[:-len(state.TAG_SUFFIX)],
-                                            pre_existing)
-            if plan.removes_tag:
-                backends.forget_tag(self.session, plan.removes_tag)
-            state.save_session(self.session)
+            self._record(plan, pre_existing, res)
             self.set_status("Done.", "Ok.TLabel")
         else:
             detail = res.message or "exit code %s" % res.returncode
             self.set_status("Failed - %s" % detail, "Bad.TLabel")
             self.log("FAILED: %s" % detail, "err")
         self._poll_once()
+        self._refresh_processes()
+
+    def _record(self, plan, pre_existing, res):
+        """Session bookkeeping for a plan that succeeded."""
+        loads = self.session.setdefault("zoomies_loads", {})
+        if plan.kind == "load" and plan.model_id:
+            loads[plan.backend] = plan.model_id
+        elif plan.kind == "stop":
+            loads.pop(plan.backend, None)
+        be = backends.get(plan.backend)
+        if plan.long_lived and be is not None:
+            # Enough to find this server again after a restart, and to
+            # stop the right process.
+            be.remember_server(self.session, plan, res.pid,
+                               self.selected_model())
+        elif plan.kind == "stop" and be is not None:
+            be.forget_server(self.session, plan)
+        if plan.kind == "download":
+            self._reload_models()
+        if plan.creates_tag:
+            backends.record_created_tag(self.session, plan.creates_tag,
+                                        plan.creates_tag[:-len(state.TAG_SUFFIX)],
+                                        pre_existing)
+        if plan.removes_tag:
+            backends.forget_tag(self.session, plan.removes_tag)
+        state.save_session(self.session)
+
+    # ------------------------------------------------------------------
+    # processes
+    # ------------------------------------------------------------------
+
+    def _refresh_processes(self):
+        """Read the process table on a worker; a PowerShell round trip takes
+        a second or two."""
+        if self._procs_busy or self.shutdown.is_set():
+            return
+        self._procs_busy = True
+
+        def work():
+            try:
+                items = processes.listing()
+            except Exception:                         # noqa: BLE001
+                items = None
+            self.out_queue.put(("procs", items))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _procs_ready(self, items):
+        self._procs_busy = False
+        if items is None:
+            self.procs_lbl.configure(text="Could not read the process list.",
+                                     style="Bad.TLabel")
+            return
+        self.procs = items
+        self.proc_tree.delete(*self.proc_tree.get_children(""))
+        for i, p in enumerate(items):
+            started = p.started[5:16].replace("T", " ") if p.started else "-"
+            tag = "leftover" if p.leftover else ("protected" if p.protected else "")
+            self.proc_tree.insert("", "end", iid=str(i), tags=(tag,) if tag else (),
+                                  values=(("LEFTOVER   " if p.leftover else "") + p.what,
+                                          processes.fmt_ram(p.ram), p.pid, started,
+                                          p.parent or "(exited)"))
+        left = [p for p in items if p.leftover]
+        text = "%d processes using %s" % (len(items),
+                                          processes.fmt_ram(sum(p.ram for p in items)))
+        if left:
+            text += "  -  %d leftover%s using %s" % (
+                len(left), "" if len(left) == 1 else "s",
+                processes.fmt_ram(sum(p.ram for p in left)))
+        self.procs_lbl.configure(text=text,
+                                 style="Warn.TLabel" if left else "Dim.TLabel")
+        self.tabs.tab(self.procs_tab, text=(
+            "  Processes (%d leftover%s)  " % (len(left), "" if len(left) == 1 else "s")
+            if left else "  Processes  "))
+
+    def _describe_procs(self, chosen):
+        return "\n".join("  %s  (%s, pid %d)" % (p.what, processes.fmt_ram(p.ram), p.pid)
+                         for p in chosen)
+
+    def _clean_leftovers(self):
+        left = [p for p in self.procs if p.leftover]
+        if not left:
+            self.set_status("No leftovers to clean up.", "Ok.TLabel")
+            return
+        if not messagebox.askyesno(
+                "Clean up leftovers?",
+                "End these processes?\n\n%s\n\nA chat still open in a terminal "
+                "will be closed." % self._describe_procs(left), parent=self.root):
+            return
+        self._end_procs(left)
+
+    def _end_selected(self):
+        chosen = [self.procs[int(r)] for r in self.proc_tree.selection()
+                  if 0 <= int(r) < len(self.procs)]
+        if not chosen:
+            self.set_status("Select a row in Processes first.", "Warn.TLabel")
+            return
+        kept = [p for p in chosen if p.protected]
+        chosen = [p for p in chosen if not p.protected]
+        if kept:
+            self.log("Not ending %s - Ollama's own server and tray app are left "
+                     "alone." % ", ".join(p.what for p in kept), "note")
+        if not chosen:
+            return
+        if not messagebox.askyesno(
+                "End selected?",
+                "End these processes?\n\n%s" % self._describe_procs(chosen),
+                parent=self.root):
+            return
+        self._end_procs(chosen)
+
+    def _end_procs(self, chosen):
+        self.log("")
+        self.log("=== ending %d process%s ===" % (len(chosen),
+                                                "" if len(chosen) == 1 else "es"), "note")
+
+        def work():
+            for p in chosen:
+                ok, message = processes.end(p, self.session)
+                self.out_queue.put(("line", "[zoomies] %s (pid %d): %s"
+                                    % (p.what, p.pid, message)))
+            self.out_queue.put(("procs_ended", None))
+        threading.Thread(target=work, daemon=True).start()
 
     def _unload_selected(self):
         rows = self.tree.selection()
@@ -1397,8 +1575,12 @@ class Zoomies:
             self.shared["status"] = status
 
     def _poll_loop(self):
+        n = 0
         while not self.shutdown.is_set():
             self._poll_once()
+            if n % 15 == 0:                 # every 30 s: keeps the leftover count current
+                self._refresh_processes()
+            n += 1
             self.shutdown.wait(POLL_SECONDS)
 
     def refresh(self):
@@ -1411,6 +1593,20 @@ class Zoomies:
                     self.log(msg[1], "err" if runner.looks_like_error(msg[1]) else None)
                 elif kind == "done":
                     self._run_done(msg[1], msg[2], msg[3])
+                elif kind == "cleared":
+                    if msg[2].ok:
+                        self._record(msg[1], False, msg[2])
+                    else:
+                        self.log("could not unload before loading: %s"
+                                 % (msg[2].message or "exit code %s" % msg[2].returncode),
+                                 "err")
+                elif kind == "procs":
+                    self._procs_ready(msg[1])
+                elif kind == "procs_ended":
+                    state.save_session(self.session)
+                    self._poll_once()
+                    self._procs_busy = False
+                    self._refresh_processes()
                 elif kind == "optimal":
                     self._apply_result(msg[1], msg[2], keep_edits=msg[3])
                 elif kind == "models":
@@ -1501,6 +1697,7 @@ class Zoomies:
             # running and writing a sample file nobody will ever delete.
             self.metrics.stop()
         self.cfg["unload_on_exit"] = bool(self.unload_exit.get())
+        self.cfg["one_model_at_a_time"] = bool(self.one_at_a_time.get())
         state.save_config(self.cfg)
         state.save_session(self.session)
 

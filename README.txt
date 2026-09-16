@@ -258,6 +258,36 @@ THE LIVE PANEL
   the last four digits of their subsystem ID.
 
 
+KEEPING THE MACHINE CLEAN
+  Testing one model after another tends to leave memory behind: a
+  model still loaded in Ollama or the llama.cpp app, a server Zoomies
+  started, or a chat left open in a terminal. Two things deal with it.
+
+  ONE MODEL AT A TIME (next to Load, on by default)
+  Before loading, Zoomies unloads everything it can reach - its own
+  llama.cpp servers, Ollama's loaded models (including one jobbuddy
+  loaded) and the llama.cpp app's models - using the same steps as the
+  Unload button, then loads the new one. Untick it to run several
+  models side by side.
+
+  THE PROCESSES TAB
+  Lists every llama.exe and ollama.exe on the machine with its memory,
+  start time and what started it, and says in words what each one is.
+  Anything nothing accounts for is marked LEFTOVER, and the tab title
+  shows how many there are:
+
+      a llama.cpp chat or `ollama run` left open in a terminal
+      a llama.cpp server started outside Zoomies
+      a Zoomies server it lost track of
+      an Ollama model whose Ollama server is gone
+
+  "Clean up leftovers" shows the list and ends them once you agree.
+  "End selected" ends the rows you pick. Ollama's own server and tray
+  app are never ended from here, and before ending anything Zoomies
+  checks the process is still the same one it listed - Windows reuses
+  process numbers, and a stale row must never hit an unrelated program.
+
+
 STATUS
   v0    Ollama backend, manual settings, load/unload, dashboard.  DONE
   v0.5  the optimizer - recommended settings from the live docs.  DONE

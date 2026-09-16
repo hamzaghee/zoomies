@@ -1158,9 +1158,11 @@ class LlamaCppBackend(Backend):
         ])
 
     def free_port(self, session):
-        taken = {int(p) for p in self._servers(session)}
+        # Only ports actually in use count: a record left by a server that
+        # died, or was ended from Processes, must not push every later load
+        # one port further up.
         for port in range(LLAMACPP_PORT, LLAMACPP_PORT + 50):
-            if port not in taken and not state.port_open(LLAMACPP_HOST, port):
+            if not state.port_open(LLAMACPP_HOST, port):
                 return port
         return LLAMACPP_PORT
 
