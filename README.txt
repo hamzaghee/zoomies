@@ -26,6 +26,7 @@ WHERE THINGS LIVE
 
     config.json    your preferences
     session.json   what is running, and what Zoomies created
+    presets.json   measured settings per model - see PRESETS below
     scripts\       every generated script, newest 20 kept
     logs\          matching log for each script, newest 20 kept
     cache\         docs pages, model cards, and saved settings answers
@@ -200,6 +201,39 @@ APPLY OPTIMAL SETTINGS
   present (this machine has two RX 6800 XTs, about 32 GB total), not
   from a fixed number. The note under the settings says what it did and
   why. Raise it if you want.
+
+
+PRESETS
+  "Apply optimal settings" fills in what a model's authors recommend.
+  A preset fills in what was actually measured on this machine. They
+  answer different questions: the docs know the model, only a benchmark
+  knows your cards.
+
+  The Preset dropdown lists the presets saved for the selected model on
+  the selected backend, and is greyed out when there are none. Picking
+  one fills the form, and the values arrive blue like the docs ones, so
+  it is still obvious which numbers you typed yourself.
+
+  A preset records the backend it was measured on. llama.cpp flags mean
+  nothing to Ollama, so an Ollama preset is never offered for a
+  llama.cpp model or the other way round. Anything the current backend
+  cannot honour is named in the status line rather than dropped quietly.
+
+  Presets live in %LOCALAPPDATA%\Zoomies\presets.json, not in this
+  project folder, because the fastest settings depend on the hardware:
+  the same model on different cards wants different flags. Copying that
+  file to another machine copies numbers that were never true there.
+
+  Models are matched on a normalised name, so the same weights match
+  however they arrive - as an Ollama tag, a .gguf path, or a Hugging
+  Face name:
+
+      ornith:35b-q4_K_M              -> ornith-35b-q4-k-m
+      C:\models\ornith-35b-Q4_K_M.gguf -> ornith-35b-q4-k-m
+
+  The file is plain JSON and safe to edit by hand. Each entry has a
+  name, the backend it was measured on, a settings block in the same
+  shape the form uses, and a note saying where the numbers came from.
 
 
 GREYED-OUT FIELDS

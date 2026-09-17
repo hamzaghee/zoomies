@@ -38,6 +38,10 @@ LOG_DIR = os.path.join(ROOT, "logs")
 
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 SESSION_PATH = os.path.join(ROOT, "session.json")
+# Measured launch settings, one or more per model. Kept beside config.json
+# rather than in the project folder because what is fastest depends on the
+# machine: the same model on different cards wants different flags.
+PRESETS_PATH = os.path.join(ROOT, "presets.json")
 
 KEEP_FILES = 20                  # how many generated scripts / logs to retain
 
@@ -116,6 +120,69 @@ def load_session():
 
 def save_session(s):
     return write_json(SESSION_PATH, s)
+
+
+# --------------------------------------------------------------------------
+# presets
+# --------------------------------------------------------------------------
+
+def load_presets():
+    """{model id: [preset, ...]}.
+
+    A preset is a name, a settings dict in the same shape settings_dict()
+    produces, and an optional note saying where the numbers came from.
+    """
+    raw = read_json(PRESETS_PATH, {})
+    out = {}
+    for model_id, items in (raw.get("models") or {}).items():
+        good = [p for p in items
+                if isinstance(p, dict) and p.get("name")
+                and isinstance(p.get("settings"), dict)]
+        if good:
+            out[model_id] = good
+    return out
+
+
+def save_presets(models):
+    return write_json(PRESETS_PATH, {"version": 1, "models": models})
+
+
+def preset_key(text):
+    """Normalise a model handle so the same weights match however they arrive.
+
+    The same model is called different things by each backend - an Ollama tag,
+    a file path, a Hugging Face name - so presets are matched on a normalised
+    form rather than the exact string:
+
+        ornith:35b-q4_K_M                      -> ornith-35b-q4-k-m
+        C:\\models\\ornith-35b-Q4_K_M.gguf       -> ornith-35b-q4-k-m
+    """
+    name = os.path.basename(str(text or "").replace("\\", "/").rstrip("/"))
+    if name.lower().endswith(".gguf"):
+        name = name[:-5]
+    return re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-")
+
+
+def presets_for(candidates, backend_name):
+    """Presets matching any of these handles, on this backend.
+
+    A preset records which backend it was measured on: llama.cpp flags mean
+    nothing to Ollama, and applying them silently would be worse than showing
+    nothing at all.
+    """
+    table = load_presets()
+    by_key = {}
+    for model_id, items in table.items():
+        by_key.setdefault(preset_key(model_id), []).extend(items)
+    seen = set()
+    for candidate in candidates:
+        for preset in by_key.get(preset_key(candidate), []):
+            name = preset.get("name")
+            if name in seen:
+                continue
+            if preset.get("backend") in (None, "", backend_name):
+                seen.add(name)
+                yield preset
 
 
 # --------------------------------------------------------------------------

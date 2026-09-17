@@ -327,6 +327,8 @@ class Zoomies:
         self.model_box = ttk.Combobox(pick, textvariable=self.model_var,
                                       state="readonly")
         self.model_box.grid(row=2, column=1, sticky="ew", pady=3)
+        self.model_box.bind("<<ComboboxSelected>>",
+                            lambda e: self._refresh_preset_box())
 
         # ---- settings ------------------------------------------------
         box = ttk.LabelFrame(self.root, text=" Settings ")
@@ -352,6 +354,13 @@ class Zoomies:
         self.reason_box.pack(side="left")
         self.reason_box.bind("<<ComboboxSelected>>",
                              lambda e: self._reason_changed())
+        ttk.Label(bar, text="Preset").pack(side="left", padx=(14, 4))
+        self.preset_var = tk.StringVar()
+        self.preset_box = ttk.Combobox(bar, textvariable=self.preset_var,
+                                       state="readonly", width=18)
+        self.preset_box.pack(side="left")
+        self.preset_box.bind("<<ComboboxSelected>>",
+                             lambda e: self._preset_chosen())
         ttk.Button(bar, text="Clear", command=self._clear_settings).pack(
             side="left", padx=(10, 0))
         # Answers are saved permanently once found, so there has to be a way
@@ -725,6 +734,76 @@ class Zoomies:
         except tk.TclError:
             pass
 
+    def _refresh_preset_box(self):
+        """Offer the presets measured for this model on this backend."""
+        model = self.selected_model()
+        be = self.backend()
+        # The same weights reach us as an Ollama tag, a .gguf path or a
+        # Hugging Face name depending on the backend, so offer every handle
+        # this model answers to and let the matcher normalise them.
+        candidates = []
+        if model:
+            candidates = [model.id, model.gguf_path, model.label]
+        self._presets = list(state.presets_for(
+            [c for c in candidates if c], be.name)) if model else []
+        names = tuple(p["name"] for p in self._presets)
+        self.preset_box.configure(values=names)
+        self.preset_var.set("")
+        self.preset_box.state(["!disabled"] if names else ["disabled"])
+
+    def _preset_chosen(self):
+        """Fill the form from a saved preset.
+
+        Preset values arrive blue, like the docs lookup, so it stays obvious
+        which numbers you typed. A setting this backend does not support is
+        reported rather than dropped silently.
+        """
+        name = self.preset_var.get()
+        preset = next((p for p in getattr(self, "_presets", [])
+                       if p["name"] == name), None)
+        if not preset:
+            return
+        be = self.backend()
+        applied, skipped = [], []
+        for key, value in (preset.get("settings") or {}).items():
+            if key == "kv_cache":
+                if be.supports("kv_cache"):
+                    self.kv_var.set(str(value))
+                    applied.append("KV cache")
+                else:
+                    skipped.append("KV cache")
+                continue
+            if key in ("reasoning", "reasoning_style"):
+                continue                      # handled below, together
+            if key not in self.vars:
+                continue
+            if be.supports(key):
+                self._set_value(key, value, auto=True)
+                applied.append(backends.SETTING_TEXT.get(key, key))
+            else:
+                skipped.append(backends.SETTING_TEXT.get(key, key))
+
+        level = str(preset.get("settings", {}).get("reasoning") or "")
+        if level and be.supports("reasoning"):
+            if self.reasoning and level in self.reasoning["levels"]:
+                self.reason_var.set(level)
+            else:
+                self._pending_reason = level
+            applied.append("Reasoning")
+        elif level:
+            skipped.append("Reasoning")
+
+        self.source_note = "preset: %s" % name
+        self.source_lbl.configure(
+            text=preset.get("note") or ("Applied preset %s." % name))
+        if skipped:
+            self.set_status("Applied %s. %s not supported by %s."
+                            % (name, ", ".join(skipped), be.display_name),
+                            "Warn.TLabel")
+        else:
+            self.set_status("Applied preset %s (%d settings)."
+                            % (name, len(applied)))
+
     def _clear_settings(self):
         for key in self.vars:
             self._set_value(key, "", auto=False)
@@ -844,6 +923,7 @@ class Zoomies:
             self.model_var.set("")
             if err:
                 self.log("%s: %s" % (be.display_name, err), "err")
+        self._refresh_preset_box()
 
     def _browse(self):
         chosen = filedialog.askdirectory(
