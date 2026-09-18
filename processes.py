@@ -108,26 +108,9 @@ def _subcommand(cmd):
 def ollama_blob_names():
     """{"sha256-abc...": "gemma4:12b-it-q4_K_M"} from Ollama's manifests, so a
     runner - which only knows its blob file - can be named."""
-    root = os.path.join(backends.ollama_models_dir(), "manifests")
     names = {}
-    for base, _dirs, files in os.walk(root):
-        for fname in files:
-            path = os.path.join(base, fname)
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    layers = json.load(fh).get("layers") or []
-            except (OSError, ValueError, AttributeError):
-                continue
-            parts = os.path.relpath(path, root).replace("\\", "/").split("/")
-            if len(parts) < 2:
-                continue
-            tag = "%s:%s" % (parts[-2], parts[-1])
-            if parts[0] != "registry.ollama.ai" or parts[1] != "library":
-                tag = "/".join(parts[1:-1]) + ":" + parts[-1]
-            for layer in layers:
-                if layer.get("mediaType") == "application/vnd.ollama.image.model":
-                    blob = str(layer.get("digest", "")).replace(":", "-")
-                    names.setdefault(blob, tag)
+    for tag, blob, _size in backends.ollama_manifests():
+        names.setdefault(os.path.basename(blob), tag)
     return names
 
 

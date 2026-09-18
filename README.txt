@@ -46,9 +46,19 @@ THE TWO BACKENDS
     The engine underneath Ollama, run directly. Needs the llama.cpp app
     (its llama.exe) or a llama-server.exe release on this machine.
 
-    Models come from the Hugging Face cache (~\.cache\huggingface\hub),
-    where llama.cpp downloads to, plus any .gguf files in the folder you
-    pick. "Download..." fetches a new one by its Hugging Face name:
+    Models come from three places: every model Ollama has already
+    pulled, the Hugging Face cache (~\.cache\huggingface\hub) where
+    llama.cpp downloads to (including .gguf files saved loose in its top
+    folder), and any .gguf files in the folder you pick.
+    "Rescan" looks again and says how many it found.
+
+    Ollama's models are read straight out of its store. Nothing is
+    copied, converted or duplicated - the weights are one file, and
+    llama.cpp is handed the path to it - and they keep their Ollama
+    names, so the same model reads the same on either backend. That is
+    the point: it is how you compare the two on one model.
+
+    "Download..." fetches a new one by its Hugging Face name:
 
         ggml-org/Qwen3.5-0.8B-GGUF:Q8_0
 
@@ -70,6 +80,12 @@ THE TWO BACKENDS
     Zoomies does not load into the app itself: the app takes each model's
     flags from a saved presets file, so per-load settings would mean
     changing that file permanently.
+
+    So does any other llama.cpp server running on this machine, however it
+    was started. Every name under Loaded, and in History, is what the
+    server itself says it is holding, not what Zoomies remembers starting
+    - ports get reused, and a remembered name goes stale the moment one
+    is.
 
 
 THE OLLAMA TEMPORARY TAG - READ THIS ONE

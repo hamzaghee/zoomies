@@ -140,6 +140,10 @@ class LoadedModel:
     owned_by_us: bool = True
     log_path: str = ""
     is_derived: bool = False    # an Ollama "-zoomies" tag we created
+    # Stopping it means ending a process Zoomies did not start, rather than
+    # asking a manager that stays up to let the model go. Only ever on the
+    # user's say-so: see _unload_others.
+    foreign_process: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -299,13 +303,19 @@ class Backend:
     def list_loaded(self):
         return []
 
+    def model_on_port(self, port):
+        """The model a server on this port is holding, asked of the server
+        itself, or "" if this backend cannot say."""
+        return ""
+
     def fixed_kv_cache(self):
         """A KV cache type this backend imposes regardless of Zoomies, or None."""
         return None
 
-    def remember_server(self, session, plan, shell_pid, model):
+    def remember_server(self, session, plan, shell_pid, model=None):
         """Record a server Zoomies started, so it can be found and stopped
-        after a restart."""
+        after a restart. What it is holding comes from the plan; `model` is
+        only there for callers that still pass it."""
 
     def forget_server(self, session, plan):
         """Drop that record once the server is stopped."""
@@ -364,6 +374,66 @@ def find_ollama_exe():
 def ollama_models_dir():
     return os.environ.get("OLLAMA_MODELS") or os.path.join(
         os.path.expanduser("~"), ".ollama", "models")
+
+
+OLLAMA_MODEL_LAYER = "application/vnd.ollama.image.model"
+
+
+def ollama_manifests():
+    """[(name, blob_path, size_bytes)] for every model Ollama has pulled.
+
+    Read off disk rather than from /api/tags, because the point is the file:
+    the weights are one content-addressed blob, and no Ollama endpoint says
+    where it is. The layer marked .image.model is the GGUF itself; the
+    projector, template and licence layers beside it are not loadable alone.
+
+    Deliberately silent about anything unreadable - this feeds a dropdown, so
+    one odd manifest must not cost the user the rest of the list.
+    """
+    root = os.path.join(ollama_models_dir(), "manifests")
+    blob_dir = os.path.join(ollama_models_dir(), "blobs")
+    out = []
+    for base, _dirs, files in os.walk(root):
+        for fname in files:
+            path = os.path.join(base, fname)
+            parts = os.path.relpath(path, root).replace("\\", "/").split("/")
+            # <registry>/<namespace>/<model>/<tag>. Ollama leaves its own
+            # registry and the "library" namespace out of the name it shows.
+            parts = parts[1:]
+            if parts and parts[0] == "library":
+                parts = parts[1:]
+            if len(parts) < 2:
+                continue
+            name = "%s:%s" % ("/".join(parts[:-1]), parts[-1])
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    layers = (json.load(fh) or {}).get("layers") or []
+            except (OSError, ValueError, AttributeError):
+                continue
+            for layer in layers:
+                if layer.get("mediaType") != OLLAMA_MODEL_LAYER:
+                    continue
+                blob = os.path.join(
+                    blob_dir, str(layer.get("digest", "")).replace(":", "-"))
+                if os.path.isfile(blob):
+                    out.append((name, blob, int(layer.get("size") or 0)))
+                break
+    out.sort()
+    return out
+
+
+def is_gguf(path):
+    """True if this file starts with llama.cpp's magic.
+
+    Ollama's newer engine can store weights llama.cpp cannot read, under the
+    same layer type in the same blob folder. Four bytes settle it, and
+    offering a model that cannot load is worse than leaving it out.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"GGUF"
+    except OSError:
+        return False
 
 
 def derived_tag(base):
@@ -486,31 +556,12 @@ class OllamaBackend(Backend):
     def _list_from_manifests(self):
         """Fallback for when the server is not running.
 
-        Reads manifest filenames off disk. Deliberately does NOT shell out to
+        Reads the manifests off disk. Deliberately does NOT shell out to
         `ollama list` to recover metadata: that would launch the tray app.
         """
-        root = os.path.join(ollama_models_dir(), "manifests")
-        out = []
-        for base, _dirs, files in os.walk(root):
-            for fname in files:
-                rel = os.path.relpath(os.path.join(base, fname), root)
-                parts = rel.replace("\\", "/").split("/")
-                if len(parts) < 2:
-                    continue
-                name = "%s:%s" % (parts[-2], parts[-1])
-                size = 0
-                try:
-                    with open(os.path.join(base, fname), "r", encoding="utf-8") as fh:
-                        manifest = json.load(fh)
-                    for layer in manifest.get("layers", []):
-                        if str(layer.get("mediaType", "")).endswith(".model"):
-                            size = int(layer.get("size") or 0)
-                except (OSError, ValueError):
-                    pass
-                out.append(ModelRecord(
-                    backend=self.name, id=name, label=name,
-                    size_bytes=size, source="registry",
-                ))
+        out = [ModelRecord(backend=self.name, id=name, label=name,
+                           size_bytes=size, source="registry", gguf_path=blob)
+               for name, blob, size in ollama_manifests()]
         out.sort(key=lambda m: m.label.lower())
         return out
 
@@ -878,6 +929,81 @@ def hf_hub_dir():
     return os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
 
 
+_OLLAMA_NAMES = {"at": 0.0, "by_blob": {}}
+
+
+def ollama_name_for(path):
+    """The Ollama tag for one of Ollama's blob files, or "".
+
+    A llama-server started on a blob - which is how this app runs an Ollama
+    model under llama.cpp - has nothing to report but the sha256 file name.
+    Nobody can read that, and "sha256-f5f1dd89..." in History is no more use
+    than a blank. Re-read every half minute: models get pulled while the app
+    is open, and this runs on the polling thread.
+    """
+    name = os.path.basename(str(path or ""))
+    if not name.startswith("sha256-"):
+        return ""
+    now = time.time()
+    if now - _OLLAMA_NAMES["at"] > 30:
+        _OLLAMA_NAMES["by_blob"] = {os.path.basename(blob): tag
+                                    for tag, blob, _size in ollama_manifests()}
+        _OLLAMA_NAMES["at"] = now
+    return _OLLAMA_NAMES["by_blob"].get(name, "")
+
+
+def looks_like_path(value):
+    """A file, rather than a name a backend takes.
+
+    A bare forward slash cannot be the test: ggml-org/Qwen3.5-0.8B-GGUF:Q8_0
+    is what `-hf` is given, and cutting it down to its last segment would
+    lose the model.
+    """
+    value = str(value or "")
+    return bool("\\" in value or value.lower().endswith(".gguf")
+                or re.match(r"^[A-Za-z]:", value) or value.startswith("/"))
+
+
+_LIVE_SHELLS = {}
+
+
+def record_is_live(rec, ttl=5.0):
+    """Is the PowerShell that started this server still running?
+
+    What makes a remembered label safe to show. Once that shell is gone the
+    server it launched is gone too, and anything answering on that port now is
+    something else - so the record names a model that is no longer there.
+    Cached briefly: this is asked on the polling thread, and tasklist is not
+    free.
+    """
+    pid = int((rec or {}).get("shell_pid") or 0)
+    if not pid:
+        return False
+    now = time.time()
+    seen = _LIVE_SHELLS.get(pid)
+    if seen is None or now - seen[0] > ttl:
+        seen = (now, state.alive_and_named(pid, "powershell"))
+        _LIVE_SHELLS[pid] = seen
+    return seen[1]
+
+
+def props_model_name(props):
+    """What a llama-server says it is holding, from GET /props.
+
+    Its --alias when it was given one (Zoomies always passes the name the
+    user picked), otherwise the weights file it opened.
+    """
+    for key in ("model_alias", "model_path"):
+        value = str((props or {}).get(key) or "").strip()
+        if not value:
+            continue
+        if not looks_like_path(value):
+            return value
+        return (ollama_name_for(value)
+                or os.path.splitext(os.path.basename(value))[0])
+    return ""
+
+
 def seconds_from(text):
     """"30m" -> 1800, "90" -> 90, "1h" -> 3600; None if unreadable."""
     m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*([smh]?)\s*", str(text or "").lower())
@@ -944,6 +1070,11 @@ def list_devices(exe, prefix):
     return found
 
 
+# The quantisation as it is written in a file name or an Ollama tag.
+QUANT_RE = re.compile(r"(?i)(UD-[A-Z0-9_]+|IQ\d[_A-Z0-9]*|"
+                      r"Q\d[_A-Z0-9]*|MXFP4|BF16|F16|F32)")
+
+
 def scan_gguf_folder(backend, folder):
     """Loose .gguf files under a folder.
 
@@ -969,21 +1100,29 @@ def scan_gguf_folder(backend, folder):
             if shard and shard.group(1) != "00001":
                 continue
             path = os.path.join(base, fname)
-            try:
-                size = os.path.getsize(path)
-            except OSError:
+            if path in seen:
                 continue
-            if size < 50 * 1024 * 1024 or path in seen:
-                continue
-            seen.add(path)
-            quant = re.search(r"(?i)(UD-[A-Z0-9_]+|IQ\d[_A-Z0-9]*|"
-                              r"Q\d[_A-Z0-9]*|MXFP4|BF16|F16|F32)", fname)
-            out.append(ModelRecord(
-                backend=backend, id=path,
-                label=os.path.splitext(fname)[0],
-                quant=quant.group(1) if quant else "",
-                size_bytes=size, source="folder", gguf_path=path))
+            record = gguf_record(backend, path)
+            if record is not None:
+                seen.add(path)
+                out.append(record)
     return out
+
+
+def gguf_record(backend, path):
+    """One .gguf file as a model, or None if it is too small to be one."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size < 50 * 1024 * 1024:
+        return None
+    fname = os.path.basename(path)
+    quant = QUANT_RE.search(fname)
+    return ModelRecord(
+        backend=backend, id=path, label=os.path.splitext(fname)[0],
+        quant=quant.group(1) if quant else "",
+        size_bytes=size, source="folder", gguf_path=path)
 
 
 class LlamaCppBackend(Backend):
@@ -1017,12 +1156,38 @@ class LlamaCppBackend(Backend):
 
     def list_models(self, folder=None):
         models = self._from_cache()
-        seen = {os.path.normcase(m.gguf_path) for m in models}
-        for record in scan_gguf_folder(self.name, folder):
-            if os.path.normcase(record.gguf_path) not in seen:
-                models.append(record)
+        for source in (self._from_ollama(), scan_gguf_folder(self.name, folder)):
+            seen = {os.path.normcase(m.gguf_path) for m in models}
+            for record in source:
+                if os.path.normcase(record.gguf_path) not in seen:
+                    models.append(record)
         models.sort(key=lambda m: m.label.lower())
         return models
+
+    def _from_ollama(self):
+        """Models Ollama has already pulled, run straight from its blobs.
+
+        Both backends are llama.cpp reading the same GGUF, and on a machine
+        that uses Ollama its store is where the models actually are. Without
+        this the dropdown offers only what the Hugging Face cache happens to
+        hold - usually just the one file "Download..." fetched - and Rescan
+        looks broken, because there is never anything else to find. Nothing
+        is copied or converted: the blob goes to -m as it is.
+
+        The Ollama name is kept as the id, so it becomes --alias and one model
+        reads the same in Loaded and History whichever backend ran it, which
+        is the whole point of comparing the two.
+        """
+        out = []
+        for name, blob, size in ollama_manifests():
+            if not is_gguf(blob):
+                continue
+            quant = QUANT_RE.search(name)
+            out.append(ModelRecord(
+                backend=self.name, id=name, label=name,
+                quant=quant.group(1) if quant else "",
+                size_bytes=size, source="ollama", gguf_path=blob))
+        return out
 
     def _from_cache(self):
         """Models in the Hugging Face cache, named the way `-hf` takes them:
@@ -1056,6 +1221,17 @@ class LlamaCppBackend(Backend):
                         backend=self.name, id=mid, label=mid, quant=rec.quant,
                         size_bytes=rec.size_bytes, source=source,
                         gguf_path=rec.gguf_path)
+        # Files saved straight into the hub folder rather than through -hf -
+        # a browser download, say - sit loose beside the models--* entries.
+        # Only the top level: everything below it is the cache's own layout,
+        # handled above.
+        for entry in entries:
+            low = entry.lower()
+            if not low.endswith(".gguf") or "mmproj" in low:
+                continue
+            rec = gguf_record(self.name, os.path.join(hub, entry))
+            if rec is not None:
+                found.setdefault(rec.gguf_path, rec)
         return list(found.values())
 
     # -- capability matrix -------------------------------------------------
@@ -1080,57 +1256,123 @@ class LlamaCppBackend(Backend):
         return (session.get(self.name) or {}).get("servers") or {}
 
     def list_loaded(self):
-        out, ours = [], set()
+        """Every llama.cpp server on this machine, named by the server itself.
+
+        The name comes from /props, not from the record written when Zoomies
+        started it. Ports get reused - the next load takes the first free one
+        from 8080, and a run of benchmarks restarts servers all day - so the
+        remembered label is a model behind the moment that happens, and every
+        request then gets filed under the wrong name. The server always knows
+        what it actually loaded; the record is only a fallback for when it is
+        too busy to answer, and for telling ours from everyone else's.
+
+        Servers started outside Zoomies are listed too: one holding a model in
+        VRAM is exactly what the user needs to see, whoever started it.
+        """
+        records = {}
         for rec in self._servers().values():
             port = int(rec.get("port") or 0)
-            if not port or not state.port_open(LLAMACPP_HOST, port):
+            if port:
+                records[port] = rec
+        found = self._ports_now()
+        ports = sorted(set(records) | {p for p, (be, _pid) in found.items()
+                                       if be == self.name})
+
+        servers, routers = [], []
+        for port in ports:
+            rec = records.get(port)
+            if not state.port_open(LLAMACPP_HOST, port):
                 continue
-            props, err = http_json("http://%s:%d/props" % (LLAMACPP_HOST, port),
-                                   timeout=3.0)
-            if err:
+            base = "http://%s:%d" % (LLAMACPP_HOST, port)
+            props, err = http_json(base + "/props", timeout=3.0)
+            # llama-server answers /props with 503 while a slot is busy
+            # generating. That is not "unloaded": the port is open and the
+            # model is in VRAM. Dropping it here made the Loaded table empty
+            # out mid-request and History fall back to whatever the dropdown
+            # showed, filing a whole benchmark run under the wrong model.
+            if err and "503" not in err:
                 continue
-            ours.add(port)
+            if props is None:
+                # Busy, so the only name available is the remembered one, and
+                # that is worth having only if it is this server's. A record
+                # whose launcher has exited belongs to a server that is gone,
+                # and the port has since been handed to somebody else.
+                if rec is None or not record_is_live(rec):
+                    continue
+            if (props or {}).get("role") == "router":
+                routers.append((base, found.get(port, ("", 0))[1]))
+            else:
+                servers.append((port, base, props, rec))
+
+        out, app_models = [], set()
+        for base, pid in routers:
+            for item in self._router_models(base, pid):
+                app_models.add(item.label)
+                out.append(item)
+        for port, base, props, rec in servers:
+            name = props_model_name(props)
+            label = name or (rec or {}).get("label") or (rec or {}).get("model_id", "")
+            # The id is what a backend is told to act on, so a remembered one
+            # is worth more than a name read back off a file path.
+            model_id = (rec or {}).get("model_id") or name or label
+            # The router runs each model in a child server on a port of its
+            # own. The router has already reported those, and it is the router
+            # that can unload them, so a child is not listed a second time.
+            if rec is None and label in app_models:
+                continue
             settings = (props or {}).get("default_generation_settings") or {}
             out.append(LoadedModel(
-                backend=self.name, id=rec.get("model_id", ""),
-                label=rec.get("label") or rec.get("model_id", ""),
+                backend=self.name, id=model_id, label=label,
                 context=int(settings.get("n_ctx") or 0),
-                endpoint="http://%s:%d" % (LLAMACPP_HOST, port),
-                pid=int(rec.get("shell_pid") or 0), owned_by_us=True,
-                log_path=rec.get("log", "")))
-        out.extend(self._router_models(ours))
+                endpoint=base,
+                pid=(int((rec or {}).get("shell_pid") or 0)
+                     or found.get(port, ("", 0))[1]),
+                owned_by_us=rec is not None,
+                foreign_process=rec is None,
+                log_path=(rec or {}).get("log", "")))
         return out
 
-    def _router_models(self, skip):
-        """Models the llama.cpp app's router has loaded."""
+    def _ports_now(self):
+        """{port: (backend, pid)} for every llama-server, asked every 5 s."""
         import metrics                   # port discovery lives there
         now = time.time()
         if now - self._ports_at > 5:
             self._ports, self._ports_at = metrics.llama_server_ports(), now
+        return self._ports
+
+    def model_on_port(self, port):
+        """The model on one port, asked directly - for naming a request that
+        arrived before the two-second poll had seen the server at all."""
+        if not port:
+            return ""
+        props, _err = http_json("http://%s:%d/props" % (LLAMACPP_HOST, int(port)),
+                                timeout=1.0)
+        return props_model_name(props)
+
+    @staticmethod
+    def _router_models(base, pid):
+        """Models the llama.cpp app's router has loaded."""
+        listing, _err = http_json(base + "/v1/models", timeout=3.0)
         out = []
-        for port, (backend, pid) in self._ports.items():
-            if backend != self.name or port in skip:
+        for item in (listing or {}).get("data", []) or []:
+            if ((item.get("status") or {}).get("value")) != "loaded":
                 continue
-            base = "http://%s:%d" % (LLAMACPP_HOST, port)
-            props, err = http_json(base + "/props", timeout=2.0)
-            if err or (props or {}).get("role") != "router":
-                continue                 # a router's own child, or not ours to show
-            listing, err = http_json(base + "/v1/models", timeout=3.0)
-            for item in (listing or {}).get("data", []) or []:
-                if ((item.get("status") or {}).get("value")) != "loaded":
-                    continue
-                out.append(LoadedModel(
-                    backend=self.name, id=item.get("id", ""),
-                    label=item.get("id", ""), endpoint=base, pid=pid,
-                    owned_by_us=False))
+            name = item.get("id", "")
+            out.append(LoadedModel(
+                backend="llamacpp", id=name, label=name, endpoint=base,
+                pid=pid, owned_by_us=False))
         return out
 
-    def remember_server(self, session, plan, shell_pid, model):
+    def remember_server(self, session, plan, shell_pid, model=None):
+        # From the plan, not from whatever the dropdown shows by the time the
+        # server finishes coming up: a big model takes half a minute to load,
+        # and the selection can have moved on - after a Rescan, say - which
+        # left the record naming a model this server never held.
         servers = session.setdefault(self.name, {}).setdefault("servers", {})
         servers[str(plan.port)] = {
             "shell_pid": shell_pid, "port": plan.port,
             "model_id": plan.model_id,
-            "label": model.label if model else plan.model_id,
+            "label": plan.model_label or plan.model_id,
             "log": plan.log_path, "script": plan.script_path,
             "started": time.time(),
         }
@@ -1253,7 +1495,8 @@ class LlamaCppBackend(Backend):
             kind="load", backend=self.name, script_text=body,
             script_path=script_path, log_path=log_path, endpoint=base,
             host=LLAMACPP_HOST, port=port, long_lived=True, notes=notes,
-            model_id=model.id, ready_check=lambda: self._ready(port))
+            model_id=model.id, model_label=model.label,
+            ready_check=lambda: self._ready(port))
 
     def _ready(self, port):
         data, err = http_json("http://%s:%d/health" % (LLAMACPP_HOST, port),
@@ -1267,10 +1510,20 @@ class LlamaCppBackend(Backend):
             port = int(m.group(1))
         record = self._servers(session).get(str(port)) if port else None
         script_path, log_path = runner.new_paths(self.name, "stop-" + loaded.label)
+        # Only the llama.cpp app's router can unload a model while staying up.
+        # A plain server - ours, or one somebody started by hand - is stopped
+        # by ending the process holding its port, which is also the only thing
+        # that gives the VRAM back. A server that does not answer is left to
+        # the unload request: it may be a router busy with a prompt, and
+        # killing the app when it was only slow to reply is unforgivable.
+        props, err = http_json((loaded.endpoint or "") + "/props", timeout=2.0)
+        plain = not err and (props or {}).get("role") != "router"
 
-        if record:
-            shell_pid = int(record.get("shell_pid") or 0)
+        if record or (port and plain):
+            shell_pid = int((record or {}).get("shell_pid") or 0)
             notes = ["Stops the llama.cpp server on port %d." % port]
+            if not record:
+                notes.append("This server was not started by Zoomies.")
             body = "\n".join([
                 self._preamble(log_path, "stop llama.cpp", loaded.label, ""),
                 "$ErrorActionPreference = 'Continue'",
@@ -1314,7 +1567,10 @@ class LlamaCppBackend(Backend):
             kind="stop", backend=self.name, script_text=body,
             script_path=script_path, log_path=log_path,
             endpoint=loaded.endpoint, host=LLAMACPP_HOST,
-            port=port if record else 0, notes=notes)
+            # Carries the port whenever this script ends the server on it, so
+            # any record for that port is dropped afterwards rather than left
+            # to name whatever starts there next.
+            port=port if (record or plain) else 0, notes=notes)
 
     def build_download(self, repo_quant):
         """`llama download -hf org/repo:QUANT` into the shared cache."""

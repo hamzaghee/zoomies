@@ -250,7 +250,7 @@ class Metrics:
         # in a test instead of whatever the machine happens to be running.
         self.sources = sources or SOURCES
         self.port_finder = port_finder or llama_server_ports
-        self.model_namer = model_namer or (lambda backend: "")
+        self.model_namer = model_namer or (lambda backend, port=0: "")
         self.lock = threading.Lock()
         self.history = deque(maxlen=HISTORY_MAXLEN)
         self.threads = []
@@ -263,6 +263,10 @@ class Metrics:
         self.state = {
             "status": "Waiting for activity...",
             "backend": "",
+            # Settled when a request starts, not when it is filed: by filing
+            # time the server may already be stopped, or holding a different
+            # model, and the row would carry the wrong name.
+            "model": "", "port": 0,
             "n_ctx": None, "n_tokens": None,
             "prompt_tps": None, "prompt_progress": None,
             "n_gen": None, "tg": None, "tg3s": None, "ttft": None,
@@ -363,9 +367,13 @@ class Metrics:
 
             m = RE_NEW_PROMPT.search(line)
             if m:
+                # Outside the lock: naming can mean a request to the backend,
+                # and the GUI thread reads this state every 200 ms.
+                name = self._name(backend, 0)
                 with self.lock:
                     self._push_history(backend)
                     self.state.update({
+                        "model": name, "port": 0,
                         "status": "Processing prompt...", "backend": backend,
                         "n_ctx": int(m.group("n_ctx")),
                         "n_tokens": int(m.group("n_tokens")),
@@ -474,6 +482,14 @@ class Metrics:
                     and last and time.time() - last > IDLE_AFTER):
                 self._push_history(self.state.get("backend") or "")
 
+    def _name(self, backend, port):
+        """Who is answering on this port. Never raises: a backend that cannot
+        be reached costs a name, not the whole metrics thread."""
+        try:
+            return self.model_namer(backend, port) or ""
+        except Exception:                          # noqa: BLE001
+            return ""
+
     def _observe_slot(self, port, backend, slot, now, kv=None):
         """Turn one /slots sample into the same state the log parser builds.
 
@@ -488,6 +504,10 @@ class Metrics:
         task = slot.get("id_task")
         busy = bool(slot.get("is_processing"))
         track = self._tracks.get(key)
+        # Asked before the lock is taken: naming can mean a request to the
+        # backend, and the GUI thread reads this state every 200 ms.
+        starting = busy and (track is None or track["task"] != task)
+        name = self._name(backend, port) if starting else ""
 
         with self.lock:
             if not busy:
@@ -515,6 +535,7 @@ class Metrics:
                 self.state.update({"n_gen": None, "tg": None, "tg3s": None,
                                    "ttft": None, "ttft_upper": False,
                                    "prompt_tps": None,
+                                   "model": name, "port": port,
                                    "request_start": now, "filed": False,
                                    "first_gen_seen": False,
                                    "gen_avg": None, "runtime": None})
@@ -603,7 +624,9 @@ class Metrics:
         self.history.appendleft({
             "time": datetime.now().strftime("%H:%M:%S"),
             "backend": s.get("backend") or backend,
-            "model": self.model_namer(s.get("backend") or backend),
+            # Settled when the request started. Naming it here would mean
+            # asking a backend while holding the lock, and asking too late.
+            "model": s.get("model") or "",
             "ttft": s.get("ttft"), "ttft_upper": s.get("ttft_upper"),
             "tg3s": s.get("tg3s"),
             "prompt_tps": s.get("prompt_tps"),

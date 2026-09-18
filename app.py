@@ -14,6 +14,7 @@ Threading model, copied from the Ollama Monitor because it works:
 import ctypes
 import os
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -133,6 +134,11 @@ class Zoomies:
         # last known list instantly while a fresh one loads in the background.
         self.model_cache = {}
         self._model_req = 0
+        self._announce_models = False
+        self.loaded_rows = {}             # Loaded table: row id -> LoadedModel
+        # port -> the model last seen on it, so a request can still be named
+        # after the server that served it has gone.
+        self._port_names = {}
         self.current_plan = None
         self.after_id = None
         self.source_note = ""
@@ -595,6 +601,11 @@ class Zoomies:
         backend = snap.get("backend") or ""
         label = backend and (backends.get(backend).display_name
                              if backends.get(backend) else backend)
+        # The model too, not just the backend: with servers coming and going
+        # under a benchmark run, "which model is this" is the first thing
+        # anyone looking at these numbers wants to know.
+        if label and snap.get("model"):
+            label = "%s   -   %s" % (label, snap["model"])
         status = snap.get("status") or ""
         self.live_status.configure(
             text="%s%s" % (status, "   -   %s" % label if label else ""),
@@ -663,21 +674,46 @@ class Zoomies:
             cell += "  (+%s)" % metrics.fmt_int(row.get("n_gen"))
         return cell
 
-    def _live_model_name(self, backend):
-        """What to label a finished request with.
+    def _live_model_name(self, backend, port=0):
+        """What to label a request with, asked as the request starts.
 
-        Whatever that backend reports as loaded right now is the best answer
-        available - llama.cpp's timing lines carry no model name at all.
+        The port it arrived on is the only thing tying a set of timings to a
+        model - llama.cpp's timing lines carry no name at all - so that is
+        what this answers from, and the last name seen on a port is kept so a
+        request filed after its server has already been stopped is still named
+        correctly. It used to take whichever model happened to be first in the
+        loaded list, and fall back to the model dropdown when nothing was
+        loaded any more, which filed a run of different models under one name.
         """
-        try:
-            be = backends.get(backend)
-            loaded = be.list_loaded() if be else []
-            if loaded:
-                return loaded[0].label
-        except Exception:                          # noqa: BLE001
-            pass
-        model = self.selected_model()
-        return model.label if model else ""
+        with self.lock:
+            loaded = list(self.shared["loaded"])
+        for item in loaded:
+            if port and self._port_of(item.endpoint) == port:
+                self._port_names[port] = item.label
+                return item.label
+        be = backends.get(backend)
+        if port and be is not None:
+            try:
+                name = be.model_on_port(port)
+            except Exception:                      # noqa: BLE001
+                name = ""
+            if name:
+                self._port_names[port] = name
+                return name
+        remembered = self._port_names.get(port, "")
+        if remembered:
+            return remembered
+        # Ollama's runners listen on a port of their own that /api/ps never
+        # mentions, so no port can ever match there; with one model loaded
+        # there is nothing to be ambiguous about anyway. Last, because it is
+        # the only answer here that is inferred rather than asked.
+        mine = [i for i in loaded if i.backend == backend]
+        return mine[0].label if len(mine) == 1 else ""
+
+    @staticmethod
+    def _port_of(endpoint):
+        m = re.search(r":(\d+)$", endpoint or "")
+        return int(m.group(1)) if m else 0
 
     # ------------------------------------------------------------------
     # helpers
@@ -868,15 +904,18 @@ class Zoomies:
         self._refresh_reason_box()
         self._refresh_kv_box()
 
-        self._reload_models()
+        self._reload_models(announce=False)
 
-    def _reload_models(self):
+    def _reload_models(self, announce=True):
         """Refresh the model dropdown without freezing the window.
 
         This used to call list_models() on the UI thread, so every backend
         toggle stalled while a backend answered its requests. Now the last
         known list for that backend appears immediately and the real one is
         fetched on a worker, landing through the queue like everything else.
+
+        Rescan says how many it found. A scan that turns up the same list as
+        before is indistinguishable from a button that does nothing.
         """
         be = self.backend()
         folder = self.folder_var.get() if be.uses_model_folder else None
@@ -889,6 +928,9 @@ class Zoomies:
             self.model_box.configure(values=())
             self.model_var.set("Loading models...")
         self._model_req += 1
+        self._announce_models = bool(announce)
+        if announce:
+            self.set_status("Scanning for %s models..." % be.display_name)
         threading.Thread(target=self._load_models_worker,
                          args=(be, folder, key, self._model_req),
                          daemon=True).start()
@@ -909,6 +951,12 @@ class Zoomies:
         if key != (be.name, folder or "") or req != self._model_req:
             return
         self._show_models(be, models, err)
+        if self._announce_models:
+            self._announce_models = False
+            self.set_status(
+                "%s: %d model%s." % (be.display_name, len(models),
+                                     "" if len(models) == 1 else "s"),
+                "Ok.TLabel" if models else "Warn.TLabel")
 
     def _show_models(self, be, models, err=""):
         current = self.selected_model()
@@ -1328,6 +1376,14 @@ class Zoomies:
             be = backends.get(item.backend)
             if be is None:
                 continue
+            if item.foreign_process:
+                # Everything else here is unloaded by asking a manager that
+                # stays running. This one would mean ending somebody else's
+                # process, which is not something a checkbox should do behind
+                # their back - Unload, or the Processes tab, asks first.
+                emit("[zoomies] leaving %s alone: its server was started "
+                     "outside Zoomies (%s)" % (item.label, item.endpoint))
+                continue
             emit("[zoomies] one model at a time - unloading %s (%s)"
                  % (item.label, be.display_name))
             try:
@@ -1400,9 +1456,9 @@ class Zoomies:
         be = backends.get(plan.backend)
         if plan.long_lived and be is not None:
             # Enough to find this server again after a restart, and to
-            # stop the right process.
-            be.remember_server(self.session, plan, res.pid,
-                               self.selected_model())
+            # stop the right process. The plan says which model it brought
+            # up; the dropdown only says what is selected now.
+            be.remember_server(self.session, plan, res.pid)
         elif plan.kind == "stop" and be is not None:
             be.forget_server(self.session, plan)
         if plan.kind == "download":
@@ -1516,21 +1572,25 @@ class Zoomies:
         if not rows:
             self.set_status("Select a row in Loaded first.", "Warn.TLabel")
             return
-        with self.lock:
-            loaded = list(self.shared["loaded"])
         for row in rows:
-            idx = int(row)
-            if 0 <= idx < len(loaded):
-                self._unload_one(loaded[idx])
+            item = self.loaded_rows.get(row)
+            if item is not None:
+                self._unload_one(item)
 
     def _unload_all(self):
         with self.lock:
             loaded = list(self.shared["loaded"])
         if not loaded:
             return
-        if not messagebox.askyesno(
-                "Unload everything?",
-                "Unload %d model(s)?" % len(loaded), parent=self.root):
+        outside = [i.label for i in loaded if i.foreign_process]
+        question = "Unload %d model(s)?" % len(loaded)
+        if outside:
+            # The per-model question is skipped below, so this one has to
+            # carry what would otherwise have been asked about each.
+            question += ("\n\nThis ends the server holding %s, which Zoomies "
+                         "did not start." % ", ".join(outside))
+        if not messagebox.askyesno("Unload everything?", question,
+                                   parent=self.root):
             return
         for item in loaded:
             self._unload_one(item, confirm=False)
@@ -1539,11 +1599,14 @@ class Zoomies:
         be = backends.get(loaded.backend)
         if be is None:
             return
-        if confirm and not loaded.owned_by_us and not messagebox.askyesno(
-                "Not started by Zoomies",
-                "%s was not started by Zoomies.\n\nUnload it anyway?"
-                % loaded.label, parent=self.root):
-            return
+        if confirm and not loaded.owned_by_us:
+            question = "%s was not started by Zoomies.\n\n" % loaded.label
+            question += ("Ending its server is the only way to free the VRAM. "
+                         "Stop it?" if loaded.foreign_process
+                         else "Unload it anyway?")
+            if not messagebox.askyesno("Not started by Zoomies", question,
+                                       parent=self.root):
+                return
         plan = be.build_stop(loaded, self.session)
         self.current_plan = plan
         self.log("")
@@ -1676,6 +1739,10 @@ class Zoomies:
                 elif kind == "cleared":
                     if msg[2].ok:
                         self._record(msg[1], False, msg[2])
+                        # Straight away, not at the next two-second poll: the
+                        # model is gone, and a row that outlives it is the one
+                        # thing on screen still claiming otherwise.
+                        self._poll_once()
                     else:
                         self.log("could not unload before loading: %s"
                                  % (msg[2].message or "exit code %s" % msg[2].returncode),
@@ -1711,11 +1778,20 @@ class Zoomies:
             else:
                 lbl.configure(text="x " + why, style="Bad.TLabel")
 
+        # Rows are keyed by which model on which endpoint, not by position.
+        # Numbering them meant that when one model replaced another, the row
+        # that was on screen kept its place and simply changed its text - so a
+        # model that had just been unloaded looked like the new one arriving
+        # under the wrong name. Now the old row goes and a new one appears.
         existing = set(self.tree.get_children(""))
-        wanted = set()
-        for i, item in enumerate(loaded):
-            iid = str(i)
-            wanted.add(iid)
+        wanted = []
+        self.loaded_rows = {}
+        for item in loaded:
+            iid = "%s|%s|%s" % (item.backend, item.endpoint, item.label)
+            if iid in self.loaded_rows:                # same model twice over
+                continue
+            wanted.append(iid)
+            self.loaded_rows[iid] = item
             values = (
                 item.label,
                 backends.get(item.backend).display_name if backends.get(item.backend)
@@ -1731,8 +1807,10 @@ class Zoomies:
                 self.tree.item(iid, values=values, tags=(tag,))
             else:
                 self.tree.insert("", "end", iid=iid, values=values, tags=(tag,))
-        for iid in existing - wanted:
+        for iid in existing - set(wanted):
             self.tree.delete(iid)
+        for position, iid in enumerate(wanted):
+            self.tree.move(iid, "", position)
 
         if self.metrics is not None:
             self._refresh_live()
@@ -1788,7 +1866,9 @@ class Zoomies:
                 loaded = list(self.shared["loaded"])
             for item in loaded:
                 be = backends.get(item.backend)
-                if be is None:
+                # Servers somebody else started are left running: this setting
+                # is about clearing up after Zoomies, not after everyone.
+                if be is None or item.foreign_process:
                     continue
                 try:
                     runner.run_script(be.build_stop(item, self.session), timeout=90)

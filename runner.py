@@ -76,6 +76,7 @@ class LaunchPlan:
     creates_tag: str = ""           # Ollama: tag to record for later cleanup
     removes_tag: str = ""           # Ollama: tag this script deletes
     model_id: str = ""              # the model a load plan brings up, if known
+    model_label: str = ""           # ...as it is written for a person
     # Long-lived plans: returns True once the model is actually serving. A
     # listening port only means the server is up - the model loads after.
     ready_check: object = None
