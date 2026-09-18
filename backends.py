@@ -191,6 +191,27 @@ def kv_choice_value(choice):
     return value
 
 
+# llama.cpp refuses to start with one of these as the V cache unless flash
+# attention is on; as the K cache they work either way.
+KV_QUANTIZED = {"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}
+
+
+def flash_attn_off(tokens):
+    """True if these llama-server flags turn flash attention off.
+
+    The last -fa/--flash-attn wins, as it does in llama.cpp itself.
+    """
+    off = False
+    for i, token in enumerate(tokens):
+        name, eq, value = token.partition("=")
+        if name not in ("-fa", "--flash-attn"):
+            continue
+        if not eq:
+            value = tokens[i + 1] if i + 1 < len(tokens) else ""
+        off = value.strip().lower() == "off"
+    return off
+
+
 def ollama_kv_cache_type():
     """Ollama's KV cache type is fixed server-wide by OLLAMA_KV_CACHE_TYPE.
 
@@ -1194,8 +1215,13 @@ class LlamaCppBackend(Backend):
             a += ["'--sleep-idle-seconds'", runner.ps_single(idle)]
         kv_type = kv_choice_value(settings.get("kv_cache"))
         if kv_type:
-            a += ["'-ctk'", runner.ps_single(kv_type),
-                  "'-ctv'", runner.ps_single(kv_type)]
+            a += ["'-ctk'", runner.ps_single(kv_type)]
+            if kv_type in KV_QUANTIZED and flash_attn_off(extra):
+                notes.append("KV cache: K at %s, V left at f16 - a quantized V "
+                             "cache needs flash attention, and Extra flags turn "
+                             "it off (-fa off)." % kv_type)
+            else:
+                a += ["'-ctv'", runner.ps_single(kv_type)]
         kwargs = reasoning_kwargs(settings)
         if kwargs:
             # PowerShell 5.1 strips bare double quotes from native arguments;

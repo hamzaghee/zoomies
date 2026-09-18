@@ -183,6 +183,11 @@ APPLY OPTIMAL SETTINGS
   Smaller types let a longer context fit in the same VRAM, at some cost
   in quality.
 
+  llama.cpp will not start with a quantized V cache (the q and iq types)
+  while flash attention is off. If Extra flags contain -fa off, Zoomies
+  quantizes only K, leaves V at f16, and says so in the launch notes.
+  Live shows it as "K q8_0 / V f16". Use -fa on to quantize both.
+
   llama.cpp applies it when the server starts. On Ollama it is greyed out
   and shows the current value, because Ollama takes it from the
   OLLAMA_KV_CACHE_TYPE environment variable for every model at once - on
