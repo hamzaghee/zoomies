@@ -12,14 +12,16 @@ controller as tk variables, and buttons call controller methods.
 """
 
 import collections
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
 import backends
+import metrics
 import vram
 from ui_common import (ACCENT, BAD, BG, BG_FIELD, BG_PANEL, BORDER, FG, FG_DIM,
-                       OK_GREEN, WARN)
+                       FONT_MONO, OK_GREEN, WARN, human_bytes, until)
 
 # Segoe Fluent Icons ships with Windows 11 and MDL2 Assets with Windows 10;
 # both put the same glyphs at the same code points.
@@ -53,9 +55,29 @@ TONE = {"Ok.TLabel": OK_GREEN, "Warn.TLabel": WARN, "Bad.TLabel": BAD,
         "Dim.TLabel": FG_DIM}
 
 
-def short_ctx(n):
-    """65536 -> 64k, 50000 -> 49k: what the context hint has room for."""
-    return "%dk" % round(n / 1024.0) if n >= 1024 else str(n)
+def fmt_secs(seconds):
+    """33.9 s, or 2:05 past a minute."""
+    if seconds is None:
+        return None
+    if seconds < 60:
+        return "%.1f s" % seconds
+    whole = int(round(seconds))
+    return "%d:%02d" % (whole // 60, whole % 60)
+
+
+def fmt_k(n):
+    """Tokens in 1024s, the way context sizes are spoken about: 32,768 ->
+    32k, 11,200 -> 10.9k."""
+    if not n:
+        return "0"
+    k = n / 1024.0
+    if k < 1:
+        return str(n)
+    return "%dk" % round(k) if abs(k - round(k)) < 0.05 else "%.1fk" % k
+
+
+def join(*parts):
+    return " \u00b7 ".join(p for p in parts if p)
 
 
 class CompactLayout:
@@ -85,6 +107,10 @@ class CompactLayout:
         self._backend_status = {}
         self._est = None
         self._vram_labels = {}
+        self._chips_key = None            # which loaded models the chips show
+        self._picked = None               # (backend, endpoint, label) chosen
+        self._gpu_rows = []
+        self._launch_t0 = 0.0
         self._styles()
         self._build()
         self.show("setup")
@@ -103,6 +129,12 @@ class CompactLayout:
         st.configure("Bar.TFrame", background=BG_PANEL)
         st.configure("Bar.TLabel", background=BG_PANEL, foreground=FG_DIM)
         st.configure("Hint.TFrame", background=HINT_BG)
+        st.configure("Card.TFrame", background=BG_PANEL)
+        st.configure("Card.TLabel", background=BG_PANEL, foreground=FG_DIM)
+        st.configure("CardValue.TLabel", background=BG_PANEL, foreground=FG,
+                     font=("Segoe UI", 13, "bold"))
+        st.configure("Big.TLabel", background=BG_PANEL, foreground=FG,
+                     font=("Segoe UI", 20, "bold"))
         # clam draws these light grey; the classic layout keeps its own.
         st.configure("Dark.Vertical.TScrollbar", background=BG_FIELD,
                      troughcolor=BG, bordercolor=BG, arrowcolor=FG_DIM,
@@ -584,11 +616,152 @@ class CompactLayout:
         if self.replace_lbl.cget("text") != text:
             self.replace_lbl.configure(text=text)
 
+    def _card(self, parent, caption, style="CardValue.TLabel"):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=self.px(8))
+        cap = ttk.Label(card, text=caption, style="Card.TLabel")
+        cap.pack(anchor="w")
+        value = ttk.Label(card, text="-", style=style)
+        value.pack(anchor="w")
+        return card, cap, value
+
     def _build_monitor(self, f):
-        self._placeholder(f, "The monitor is still being built. What is "
-                          "running right now:")
-        self.live_lbl = self._line(f, style="Head.TLabel")
-        self.loaded_lbl = self._line(f)
+        """Three states, one shown at a time: loading (a launch is running),
+        live (something is loaded), empty (nothing is)."""
+        self.mon_loading = ttk.Frame(f)
+        self.mon_empty = ttk.Frame(f)
+        self.mon_live = ttk.Frame(f)
+        self._build_loading(self.mon_loading)
+        self._build_empty(self.mon_empty)
+        self._build_live(self.mon_live)
+        self._mon_panel = None
+        self._show_mon_panel()
+
+    def _build_empty(self, f):
+        box = ttk.Frame(f)
+        box.place(relx=0.5, rely=0.35, anchor="center")
+        ttk.Label(box, text="No model running", style="Section.TLabel").pack()
+        ttk.Label(box, text="Pick one in Setup and launch it.",
+                  style="Dim.TLabel").pack(pady=(self.px(2), self.px(10)))
+        ttk.Button(box, text="Go to Setup",
+                   command=lambda: self.show("setup", user=True)).pack()
+
+    def _build_loading(self, f):
+        app = self.app
+        pad = self.px(12)
+        head = ttk.Frame(f)
+        head.pack(fill="x", padx=pad, pady=(pad, 0))
+        self.load_title = ttk.Label(head, text="", style="Section.TLabel")
+        self.load_title.pack(side="left")
+        self.load_elapsed = ttk.Label(head, text="", style="Dim.TLabel")
+        self.load_elapsed.pack(side="right")
+        self.load_bar = ttk.Progressbar(f, mode="indeterminate",
+                                        style="Zoom.Thin.Horizontal.TProgressbar")
+        self.load_bar.pack(fill="x", padx=pad, pady=(self.px(6), 0))
+        self.load_step = ttk.Label(f, text="", style="Dim.TLabel")
+        self.load_step.pack(fill="x", padx=pad, pady=(self.px(4), 0))
+
+        buttons = ttk.Frame(f)
+        buttons.pack(side="bottom", fill="x", padx=pad, pady=pad)
+        for col in (0, 1):
+            buttons.columnconfigure(col, weight=1, uniform="lb")
+        self.cancel_btn = ttk.Button(buttons, text="Cancel",
+                                     command=self._cancel_clicked)
+        self.cancel_btn.grid(row=0, column=0, sticky="ew", padx=(0, self.px(4)))
+        ttk.Button(buttons, text="Open log", command=app._open_log).grid(
+            row=0, column=1, sticky="ew", padx=(self.px(4), 0))
+
+        ttk.Label(f, text="Output", style="Section.TLabel").pack(
+            anchor="w", padx=pad, pady=(self.px(10), self.px(2)))
+        wrap = ttk.Frame(f)
+        wrap.pack(fill="both", expand=True, padx=pad)
+        self.load_out = tk.Text(wrap, bg=BG_PANEL, fg=FG_DIM, font=FONT_MONO,
+                                relief="flat", wrap="char", height=8,
+                                highlightthickness=1, highlightbackground=BORDER)
+        self.load_out.pack(fill="both", expand=True)
+        self.load_out.tag_configure("err", foreground=BAD)
+        self.load_out.tag_configure("note", foreground=ACCENT)
+        self.load_out.configure(state="disabled")
+
+    def _build_live(self, f):
+        app = self.app
+        form = self._scrolled(f)
+        pad = self.px(12)
+
+        # which model: a chip each, and what the chosen one is
+        top = ttk.Frame(form)
+        top.pack(fill="x", padx=pad, pady=(pad, 0))
+        self.model_chips = ttk.Frame(top)
+        self.model_chips.pack(fill="x")
+        self.model_info = self._wrap(ttk.Label(top, text="", style="Dim.TLabel",
+                                               justify="left"), 24)
+        self.model_info.pack(fill="x", pady=(self.px(4), 0))
+
+        # speed
+        box = ttk.Frame(form)
+        box.pack(fill="x", padx=pad, pady=(self.px(10), 0))
+        big, self.gen_caption, self.gen_value = self._card(
+            box, "Generation", style="Big.TLabel")
+        big.pack(fill="x")
+        self.live_status = ttk.Label(big, text="", style="Card.TLabel")
+        self.live_status.place(relx=1.0, x=-self.px(2), y=0, anchor="ne")
+        pair = ttk.Frame(box)
+        pair.pack(fill="x", pady=(self.px(6), 0))
+        for col in (0, 1):
+            pair.columnconfigure(col, weight=1, uniform="cards")
+        card, _cap, self.ttft_value = self._card(pair, "TTFT")
+        card.grid(row=0, column=0, sticky="ew", padx=(0, self.px(3)))
+        card, _cap, self.prompt_value = self._card(pair, "Prompt eval")
+        card.grid(row=0, column=1, sticky="ew", padx=(self.px(3), 0))
+        head = ttk.Frame(box)
+        head.pack(fill="x", pady=(self.px(8), 0))
+        ttk.Label(head, text="Context", style="Dim.TLabel").pack(side="left")
+        self.ctx_value = ttk.Label(head, text="-", style="Dim.TLabel")
+        self.ctx_value.pack(side="right")
+        self.ctx_bar = ttk.Progressbar(box, mode="determinate", maximum=1000,
+                                       style="Zoom.Thin.Horizontal.TProgressbar")
+        self.ctx_bar.pack(fill="x")
+        ttk.Separator(form).pack(fill="x", pady=(self.px(12), 0))
+
+        # every card, not just the first: this machine has two
+        box, head = self._section(form, "GPUs")
+        self.kv_value = ttk.Label(head, text="", style="Dim.TLabel")
+        self.kv_value.pack(side="right")
+        self.gpu_box = ttk.Frame(box)
+        self.gpu_box.pack(fill="x")
+        self.spill_lbl = self._wrap(ttk.Label(box, text="", style="Dim.TLabel",
+                                              justify="left"), 24)
+        self.spill_lbl.pack(fill="x", pady=(self.px(4), 0))
+
+        # the request that finished last
+        box, head = self._section(form, "Last request")
+        self.last_when = ttk.Label(head, text="", style="Dim.TLabel")
+        self.last_when.pack(side="right")
+        grid = ttk.Frame(box)
+        grid.pack(fill="x")
+        grid.columnconfigure(1, weight=1)
+        self.last_rows = {}
+        for row, key in enumerate(("Prompt", "Generation", "First 3 s", "TTFT",
+                                   "Total")):
+            lab = ttk.Label(grid, text=key, style="Dim.TLabel")
+            val = ttk.Label(grid, text="", justify="right", anchor="e")
+            lab.grid(row=row, column=0, sticky="nw", pady=(0, self.px(2)))
+            val.grid(row=row, column=1, sticky="ne", padx=(self.px(12), 0))
+            self.last_rows[key] = (lab, val)
+        self.last_none = ttk.Label(box, text="Nothing has been asked of it yet.",
+                                   style="Off.TLabel")
+
+        # actions
+        buttons = ttk.Frame(form)
+        buttons.pack(fill="x", padx=pad, pady=(self.px(4), pad))
+        for col in (0, 1):
+            buttons.columnconfigure(col, weight=1, uniform="mb")
+        for i, (text, command) in enumerate((
+                ("Unload", app._unload_selected), ("Unload all", app._unload_all),
+                ("Open log", app._open_log), ("Copy endpoint", self._copy_endpoint))):
+            row, col = divmod(i, 2)
+            ttk.Button(buttons, text=text, command=command).grid(
+                row=row, column=col, sticky="ew", pady=(0, self.px(6)),
+                padx=(0, self.px(3)) if col == 0 else (self.px(3), 0))
 
     def _build_history(self, f):
         self._placeholder(f, "History is still being built.")
@@ -640,14 +813,59 @@ class CompactLayout:
 
     def launch_started(self):
         self._launching = True
+        self._launch_t0 = time.time()
+        plan = self.app.current_plan
+        name = (plan.model_label or plan.model_id) if plan else ""
+        self.load_title.configure(text="Loading %s" % name if name else "Loading")
+        self.load_step.configure(text="Starting...")
+        self.cancel_btn.configure(text="Cancel")
+        self.cancel_btn.state(["!disabled"])
+        self.load_out.configure(state="normal")
+        self.load_out.delete("1.0", "end")
+        self.load_out.configure(state="disabled")
+        self.load_bar.start(15)
+        self._tick_loading()
+        self._show_mon_panel()
         self.show("monitor")
         self._paint_nav()
 
     def launch_finished(self, ok):
         self._launching = False
+        self.load_bar.stop()
+        self._show_mon_panel()
         if not ok:
             self.show("setup")    # the error is shown there, beside Launch
         self._paint_nav()
+
+    def _tick_loading(self):
+        if not self._launching:
+            return
+        secs = int(time.time() - self._launch_t0)
+        self.load_elapsed.configure(text="%d:%02d" % (secs // 60, secs % 60)
+                                    if secs >= 60 else "%d s" % secs)
+        self.root.after(1000, self._tick_loading)
+
+    def _cancel_clicked(self):
+        self.cancel_btn.configure(text="Cancelling...")
+        self.cancel_btn.state(["disabled"])
+        self.app.cancel_launch()
+
+    def _show_mon_panel(self):
+        panel = (self.mon_loading if self._launching else
+                 self.mon_live if self._loaded else self.mon_empty)
+        if panel is self._mon_panel:
+            return
+        for other in (self.mon_loading, self.mon_live, self.mon_empty):
+            other.pack_forget()
+        panel.pack(fill="both", expand=True)
+        self._mon_panel = panel
+
+    def _copy_endpoint(self):
+        chosen = self.selected_loaded()
+        if chosen and chosen[0].endpoint:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(chosen[0].endpoint)
+            self.app.set_status("Copied %s" % chosen[0].endpoint, "Ok.TLabel")
 
     # ------------------------------------------------------------------
     # setup: what the controller calls
@@ -721,6 +939,18 @@ class CompactLayout:
 
     def log(self, text, tag=None):
         self.log_lines.append((text, tag))
+        if not self._launching:
+            return
+        # While loading, the Output box follows along, last 200 lines.
+        self.load_out.configure(state="normal")
+        self.load_out.insert("end", text + "\n", tag or ())
+        extra = int(self.load_out.index("end-1c").split(".")[0]) - 200
+        if extra > 0:
+            self.load_out.delete("1.0", "%d.0" % (extra + 1))
+        self.load_out.see("end")
+        self.load_out.configure(state="disabled")
+        if text.startswith("[zoomies] "):
+            self.load_step.configure(text=text[len("[zoomies] "):])
 
     # ---- VRAM estimate ---------------------------------------------------
 
@@ -789,7 +1019,7 @@ class CompactLayout:
         if est.max_ctx and est.max_ctx != est.ctx:
             self.hint_lbl.configure(
                 text=("Room for %s context" if est.max_ctx > est.ctx
-                      else "Fits up to %s context") % short_ctx(est.max_ctx))
+                      else "Fits up to %s context") % fmt_k(est.max_ctx))
             self.hint.pack(fill="x", pady=(self.px(6), 0), before=self.vram_more)
         else:
             self.hint.pack_forget()
@@ -803,34 +1033,198 @@ class CompactLayout:
             self._backend_status = dict(status)
             self._paint_backends()
 
+    @staticmethod
+    def _key(item):
+        return (item.backend, item.endpoint, item.label)
+
+    @staticmethod
+    def _set(lbl, text, **kw):
+        """Configure only on change: this runs five times a second."""
+        if lbl.cget("text") != text or kw:
+            lbl.configure(text=text, **kw)
+
     def show_loaded(self, loaded):
         changed = bool(loaded) != bool(self._loaded)
-        self._loaded = list(loaded)
-        text = "\n".join("%s  -  %s" % (i.label, i.endpoint.replace("http://", ""))
-                         for i in loaded) or "Nothing loaded."
-        if self.loaded_lbl.cget("text") != text:
-            self.loaded_lbl.configure(text=text)
+        # Keyed like the classic table, so the same model twice is one chip.
+        seen, items = set(), []
+        for item in loaded:
+            if self._key(item) not in seen:
+                seen.add(self._key(item))
+                items.append(item)
+        self._loaded = items
+        keys = tuple(self._key(i) for i in items)
+        if keys != self._chips_key:
+            self._chips_key = keys
+            if self._picked not in keys:
+                self._picked = keys[0] if keys else None
+            for child in self.model_chips.winfo_children():
+                child.destroy()
+            for item in items:
+                chip = self._toggle(self.model_chips, item.label,
+                                    lambda k=self._key(item): self._pick_model(k))
+                chip.pack(side="left", padx=(0, self.px(6)), pady=(0, self.px(4)))
+                chip.key = self._key(item)
+            self._paint_model_chips()
+        self._show_model_info()
+        self._show_mon_panel()
         if changed:
             self._paint_nav()
         self._paint_replace()
 
+    def _pick_model(self, key):
+        self._picked = key
+        self._paint_model_chips()
+        self._show_model_info()
+
+    def _paint_model_chips(self):
+        for chip in self.model_chips.winfo_children():
+            self._paint_toggle(chip, getattr(chip, "key", None) == self._picked)
+
+    def _show_model_info(self):
+        chosen = self.selected_loaded()
+        if not chosen:
+            self._set(self.model_info, "")
+            return
+        item = chosen[0]
+        be = backends.get(item.backend)
+        port = item.endpoint.rsplit(":", 1)[-1] if item.endpoint else ""
+        self._set(self.model_info, join(
+            be.display_name if be else item.backend,
+            ":" + port if port else "",
+            "pid %s" % item.pid if item.pid else "",
+            human_bytes(item.vram_bytes) if item.vram_bytes else "",
+            "%s ctx" % fmt_k(item.context) if item.context else "",
+            "until %s" % until(item.expires) if item.expires else "",
+            "" if item.owned_by_us else "not started by Zoomies"))
+
     def selected_loaded(self):
-        return self._loaded[:1]
+        return [i for i in self._loaded if self._key(i) == self._picked][:1]
 
     def show_live(self, snap):
         status = snap.get("status") or ""
-        model = snap.get("model") or ""
-        text = "%s%s" % (status, "  -  %s" % model if model else "")
-        if self.live_lbl.cget("text") != text:
-            self.live_lbl.configure(text=text)
         tps = snap.get("tg") if status == "Generating..." else None
         if tps != self._generating_tps:
             self._generating_tps = tps
             self._paint_nav()
+        history = snap.get("history") or []
+        self._show_speed(snap, status, history)
+        self._show_gpus(snap)
+        self._show_last(history[0] if history else None)
         count = len(snap.get("history") or [])
         text = "%d recent request%s." % (count, "" if count == 1 else "s")
         if self.history_lbl.cget("text") != text:
             self.history_lbl.configure(text=text)
+
+    def _show_speed(self, snap, status, history):
+        model = snap.get("model") or ""
+        if status == "Generating...":
+            value, caption = snap.get("tg"), "Generation \u00b7 now"
+        else:
+            value = snap.get("gen_avg")
+            if value is None and history:
+                value = history[0].get("gen_avg")
+            caption = "Generation \u00b7 last request"
+        self._set(self.gen_value, metrics.fmt(value, " t/s"))
+        self._set(self.gen_caption, join(caption, model))
+        if status == "Processing prompt..." and snap.get("prompt_progress"):
+            status = "Prompt %d%%" % round(100 * snap["prompt_progress"])
+        self._set(self.live_status, status.rstrip("."),
+                  foreground=OK_GREEN if status == "Generating..." else FG_DIM)
+        self._set(self.ttft_value, metrics.fmt_ttft(snap.get("ttft"),
+                                                    snap.get("ttft_upper")))
+        self._set(self.prompt_value, metrics.fmt(snap.get("prompt_tps"), " t/s"))
+        used, total = snap.get("n_tokens"), snap.get("n_ctx")
+        if used and total:
+            self.ctx_bar.configure(value=min(1000, int(1000.0 * used / total)))
+            self._set(self.ctx_value, "%s / %s" % (fmt_k(used), fmt_k(total)))
+        else:
+            self.ctx_bar.configure(value=0)
+            self._set(self.ctx_value, "-")
+        self._set(self.kv_value, "KV %s" % snap["kv"] if snap.get("kv") else "")
+
+    def _show_gpus(self, snap):
+        gpus = snap.get("gpus") or []
+        if len(gpus) != len(self._gpu_rows):
+            for child in self.gpu_box.winfo_children():
+                child.destroy()
+            self._gpu_rows = []
+            for _gpu in gpus:
+                head = ttk.Frame(self.gpu_box)
+                head.pack(fill="x", pady=(self.px(4), 0))
+                name = ttk.Label(head, text="", style="Dim.TLabel")
+                name.pack(side="left")
+                mem = ttk.Label(head, text="", style="Dim.TLabel")
+                mem.pack(side="right")
+                bar = ttk.Progressbar(self.gpu_box, mode="determinate",
+                                      maximum=1000,
+                                      style="Zoom.Thin.Horizontal.TProgressbar")
+                bar.pack(fill="x")
+                self._gpu_rows.append((name, mem, bar))
+        for gpu, (name, mem, bar) in zip(gpus, self._gpu_rows):
+            pct, used = gpu.get("pct"), gpu.get("used")
+            self._set(name, join(gpu["name"], "" if pct is None
+                                 else "%.0f%% busy" % pct))
+            if used is None:
+                self._set(mem, "-")
+                bar.configure(value=0)
+            else:
+                self._set(mem, "%s / %.0f GB" % (vram.gb(used),
+                                                 gpu["vram"] / float(vram.GB)))
+                bar.configure(value=min(1000, int(1000.0 * used
+                                                  / max(1, gpu["vram"]))))
+        spills = snap.get("spills") or []
+        if spills:
+            text = "Spilling into system RAM: " + ", ".join(
+                "%.1f GB (pid %d)" % (sp["shared"] / float(vram.GB), sp["pid"])
+                for sp in spills)
+            self._set(self.spill_lbl, text, style="Bad.TLabel")
+        elif snap.get("gpu_error"):
+            self._set(self.spill_lbl, "GPU: %s" % snap["gpu_error"],
+                      style="Bad.TLabel")
+        elif gpus:
+            self._set(self.spill_lbl, "No spill into system RAM",
+                      style="Off.TLabel")
+
+    def _show_last(self, row):
+        if row is None:
+            if not self.last_none.winfo_manager():
+                self.last_none.pack(anchor="w")
+            self._set(self.last_when, "")
+            for lab, val in self.last_rows.values():
+                lab.grid_remove()
+                val.grid_remove()
+            return
+        self.last_none.pack_forget()
+        self._set(self.last_when, join(row.get("time"), row.get("model")))
+        cached = row.get("prompt_cached")
+        prompt = join(
+            "%s tok" % metrics.fmt_int(row["prompt_n"]) if row.get("prompt_n") else "",
+            "+%s cached" % metrics.fmt_int(cached) if cached else "",
+            fmt_secs(row.get("prompt_s")),
+            metrics.fmt(row.get("prompt_tps"), " t/s")
+            if row.get("prompt_tps") is not None else "")
+        gen = join(
+            "%s tok" % metrics.fmt_int(row["n_gen"]) if row.get("n_gen") else "",
+            fmt_secs(row.get("gen_s")),
+            metrics.fmt(row.get("gen_avg"), " t/s")
+            if row.get("gen_avg") is not None else "")
+        values = {
+            "Prompt": prompt,
+            "Generation": gen,
+            "First 3 s": metrics.fmt(row.get("tg3s"), " t/s")
+            if row.get("tg3s") is not None else "",
+            "TTFT": metrics.fmt_ttft(row.get("ttft"), row.get("ttft_upper"))
+            if row.get("ttft") is not None else "",
+            "Total": fmt_secs(row.get("runtime")) or "",
+        }
+        for key, (lab, val) in self.last_rows.items():
+            if values[key]:
+                self._set(val, values[key])
+                lab.grid()
+                val.grid()
+            else:
+                lab.grid_remove()
+                val.grid_remove()
 
     def show_procs(self, items):
         if items is None:

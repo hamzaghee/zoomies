@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.parse
 import webbrowser
@@ -53,6 +54,8 @@ LAYOUTS = {
 
 # What a layout switch carries to the next process, deleted once read.
 HANDOFF_PATH = os.path.join(state.ROOT, "handoff.json")
+
+CANCELLED = "cancelled"          # RunResult.message of a load stopped by Cancel
 
 POLL_SECONDS = 2.0
 REFRESH_MS = 200
@@ -95,6 +98,22 @@ def window_dpi(widget):
         return float(dpi or 96)
     except (AttributeError, OSError):
         return 96.0
+
+
+class Either:
+    """Set when either of two Events is: shutdown, or a load's Cancel."""
+
+    def __init__(self, a, b):
+        self.a, self.b = a, b
+
+    def is_set(self):
+        return self.a.is_set() or self.b.is_set()
+
+    def wait(self, timeout):
+        end = time.time() + timeout
+        while not self.is_set() and time.time() < end:
+            time.sleep(0.1)
+        return self.is_set()
 
 
 def work_area():
@@ -155,6 +174,8 @@ class Zoomies:
         self._restarting = False
         self._unload_now = False          # "Unload all and exit" was chosen
         self._first_poll_seen = False
+        self._cancel = None               # Event for the load in progress
+        self._launch_pid = 0              # its PowerShell, once running
 
         self.shutdown = threading.Event()
         self.lock = threading.Lock()
@@ -1427,20 +1448,69 @@ class Zoomies:
         self.log("")
         self.log("=== %s ===" % os.path.basename(plan.script_path), "note")
         self.view.launch_started()
+        self._cancel = threading.Event()
+        self._launch_pid = 0
         threading.Thread(target=self._run_worker,
-                         args=(plan, tag_existed, clear_first), daemon=True).start()
+                         args=(plan, tag_existed, clear_first, self._cancel),
+                         daemon=True).start()
 
-    def _run_worker(self, plan, pre_existing, clear_first=False):
+    def _run_worker(self, plan, pre_existing, clear_first=False, cancel=None):
+        """cancel: an Event the Cancel button sets - loads only. Downloads
+        and unloads run to the end."""
         emit = lambda ln: self.out_queue.put(("line", ln))
+        cancel = cancel or threading.Event()
         if clear_first:
             self._unload_others(emit)
         if callable(pre_existing):
             pre_existing = pre_existing()
-        if plan.long_lived:
-            res = self._spawn_server(plan, emit)
+        if cancel.is_set():
+            res = runner.RunResult(False, -1, message=CANCELLED)
+        elif plan.long_lived:
+            res = self._spawn_server(plan, emit, cancel)
         else:
-            res = runner.run_script(plan, on_line=emit)
+            res = runner.run_script(
+                plan, on_line=emit,
+                on_start=lambda pid: self._launch_started_pid(pid, plan, cancel))
+        if cancel.is_set() and not res.ok:
+            res = runner.RunResult(False, res.returncode, res.pid, res.lines,
+                                   CANCELLED)
         self.out_queue.put(("done", plan, pre_existing, res))
+
+    def _launch_started_pid(self, pid, plan, cancel):
+        """The script behind a load is running. Called on the worker."""
+        self._launch_pid = pid
+        if cancel.is_set():              # Cancel came before there was a pid
+            self._end_launch(pid, plan)
+
+    def cancel_launch(self):
+        """Stop a load part-way: the Cancel button while Loading."""
+        cancel, plan = self._cancel, self.current_plan
+        if cancel is None or cancel.is_set() or plan is None:
+            return
+        cancel.set()
+        self.set_status("Cancelling...", "Warn.TLabel")
+        self.log("[zoomies] cancelling the load", "note")
+        pid = self._launch_pid
+        if pid:
+            threading.Thread(target=self._end_launch, args=(pid, plan),
+                             daemon=True).start()
+
+    def _end_launch(self, pid, plan):
+        """End the script a load is running. For llama.cpp that is the whole
+        tree - the server runs as the script's child - exactly as Unload
+        stops it. For Ollama only the script itself: it may have started
+        Ollama's own server, which must keep running."""
+        if not state.alive_and_named(pid, "powershell"):
+            return                        # already finished, or pid reused
+        cmd = ["taskkill", "/F", "/PID", str(pid)]
+        if plan.long_lived:
+            cmd.insert(1, "/T")
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=30,
+                           creationflags=runner.CREATE_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.out_queue.put(("line", "[zoomies] could not stop pid %d: %s"
+                                % (pid, exc)))
 
     def _unload_others(self, emit):
         """One model at a time: unload everything reachable before loading.
@@ -1477,7 +1547,7 @@ class Zoomies:
                 continue
             self.out_queue.put(("cleared", stop, res))
 
-    def _spawn_server(self, plan, emit):
+    def _spawn_server(self, plan, emit, cancel):
         """Start a server that is meant to outlive the script.
 
         Waiting for it to exit would block forever, so the script is spawned
@@ -1488,13 +1558,17 @@ class Zoomies:
         started = runner.spawn_script(plan)
         if not started.ok:
             return started
+        self._launch_started_pid(started.pid, plan, cancel)
+        stop = Either(self.shutdown, cancel)
         threading.Thread(
             target=runner.tail_log,
             args=(plan.log_path, emit, self.shutdown),
             daemon=True).start()
         emit("[zoomies] waiting for %s:%d ..." % (plan.host, plan.port))
         up = state.wait_for_port(plan.host, plan.port, timeout=900,
-                                 cancel=self.shutdown)
+                                 cancel=stop)
+        if cancel.is_set():
+            return runner.RunResult(False, -1, started.pid, [], CANCELLED)
         if not up:
             return runner.RunResult(
                 False, -1, started.pid, [],
@@ -1502,7 +1576,7 @@ class Zoomies:
         emit("[zoomies] %s is serving on port %d" % (plan.backend, plan.port))
         if plan.ready_check is not None:
             emit("[zoomies] waiting for the model to finish loading ...")
-            while not self.shutdown.is_set():
+            while not stop.is_set():
                 if plan.ready_check():
                     emit("[zoomies] model loaded")
                     break
@@ -1513,15 +1587,33 @@ class Zoomies:
                         False, -1, started.pid, [],
                         "%s exited before the model loaded - see the log above"
                         % plan.backend)
-                self.shutdown.wait(2.0)
+                stop.wait(2.0)
+        if cancel.is_set():
+            return runner.RunResult(False, -1, started.pid, [], CANCELLED)
         return runner.RunResult(True, 0, started.pid)
 
     def _run_done(self, plan, pre_existing, res):
         self.busy = False
         self.view.set_launch_enabled(True)
+        if plan.kind == "load":
+            self._cancel = None
         if res.ok:
             self._record(plan, pre_existing, res)
             self.set_status("Done.", "Ok.TLabel")
+        elif res.message == CANCELLED:
+            self.set_status("Cancelled.", "Warn.TLabel")
+            self.log("[zoomies] load cancelled", "note")
+            if plan.creates_tag:
+                # The script may have got as far as creating its temporary
+                # tag. Recorded, it is cleaned up like any other; a tag that
+                # never got made is forgotten at the next start.
+                backends.record_created_tag(
+                    self.session, plan.creates_tag,
+                    plan.creates_tag[:-len(state.TAG_SUFFIX)], pre_existing)
+                state.save_session(self.session)
+            if not plan.long_lived:
+                self.log("[zoomies] Ollama may still finish loading it in the "
+                         "background; unload it if it shows up.", "note")
         else:
             detail = res.message or "exit code %s" % res.returncode
             self.set_status("Failed - %s" % detail, "Bad.TLabel")

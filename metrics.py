@@ -287,6 +287,10 @@ class Metrics:
             "last_update": None, "request_start": None,
             "first_gen_seen": False, "filed": False,
             "gen_avg": None, "runtime": None, "kv": None,
+            # For "last request": prompt tokens actually evaluated, those
+            # served from the cache, and how long each phase took.
+            "prompt_n": None, "prompt_cached": None, "prompt_total": None,
+            "prompt_s": None, "gen_s": None,
             "gpus": [], "gpu_error": "", "gpu_procs": {}, "spills": [],
         }
 
@@ -396,6 +400,9 @@ class Metrics:
                         "request_start": now, "first_gen_seen": False,
                         "last_update": now, "filed": False,
                         "gen_avg": None, "runtime": None, "gen0": None,
+                        "prompt_total": int(m.group("n_tokens")),
+                        "prompt_n": None, "prompt_cached": None,
+                        "prompt_s": None, "gen_s": None,
                     })
                 continue
 
@@ -420,8 +427,14 @@ class Metrics:
 
             m = RE_PROMPT_EVAL.search(line)
             if m:
+                n = int(m.group("n"))
                 with self.lock:
                     self.state["prompt_tps"] = float(m.group("tps"))
+                    self.state["prompt_n"] = n
+                    self.state["prompt_s"] = float(m.group("ms")) / 1000.0
+                    total = self.state.get("prompt_total")
+                    self.state["prompt_cached"] = (max(0, total - n)
+                                                   if total else None)
                     self.state["last_update"] = now
                 continue
 
@@ -429,6 +442,7 @@ class Metrics:
             if m:
                 with self.lock:          # exact run average, first to last token
                     self.state["gen_avg"] = float(m.group("tps"))
+                    self.state["gen_s"] = float(m.group("ms")) / 1000.0
                     self.state["last_update"] = now
                 continue
 
@@ -552,7 +566,10 @@ class Metrics:
                                    "model": name, "port": port,
                                    "request_start": now, "filed": False,
                                    "first_gen_seen": False,
-                                   "gen_avg": None, "runtime": None})
+                                   "gen_avg": None, "runtime": None,
+                                   "prompt_n": None, "prompt_cached": None,
+                                   "prompt_total": None, "prompt_s": None,
+                                   "gen_s": None})
 
             processed = int(slot.get("n_prompt_tokens_processed") or 0)
             n_prompt = int(slot.get("n_prompt_tokens") or 0)
@@ -600,6 +617,14 @@ class Metrics:
                     # start, and any number would be made up.
                     update["first_gen_seen"] = True
                     track["t_first"], track["d_first"] = now, decoded
+                    # The prompt is done: what it cost. Tokens the cache
+                    # already held were never evaluated.
+                    update["prompt_total"] = prompt_total
+                    update["prompt_n"] = processed or None
+                    update["prompt_cached"] = (max(0, prompt_total - processed)
+                                               if processed else None)
+                    if "ttft" in update and not update.get("ttft_upper"):
+                        update["prompt_s"] = update["ttft"]
                 # Current rate: since the previous sample, stalls included.
                 if track["t_prev"] is not None and now > track["t_prev"]:
                     update["tg"] = (decoded - track["d_prev"]) / (now - track["t_prev"])
@@ -612,6 +637,7 @@ class Metrics:
                 if track["t_last"] > track["t_first"]:
                     update["gen_avg"] = ((track["d_last"] - track["d_first"])
                                          / (track["t_last"] - track["t_first"]))
+                    update["gen_s"] = track["t_last"] - track["t_first"]
                 # Runtime only if the request was watched from its start.
                 if track["p0"] is not None:
                     update["runtime"] = track["t_last"] - track["start"]
@@ -648,6 +674,8 @@ class Metrics:
             "kv": s.get("kv"),
             "n_gen": s.get("n_gen"), "n_tokens": s.get("n_tokens"),
             "n_ctx": s.get("n_ctx"),
+            "prompt_n": s.get("prompt_n"), "prompt_cached": s.get("prompt_cached"),
+            "prompt_s": s.get("prompt_s"), "gen_s": s.get("gen_s"),
         })
 
     # -- GPU ---------------------------------------------------------------

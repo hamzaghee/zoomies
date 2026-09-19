@@ -145,12 +145,15 @@ def write_script(plan):
     return plan.script_path
 
 
-def run_script(plan, on_line=None, timeout=600):
+def run_script(plan, on_line=None, timeout=600, on_start=None):
     """Run a short-lived script to completion and collect its output.
 
     stderr is folded into stdout because the generated scripts already send
     every PowerShell stream to the log; what comes back on the pipe is a
     convenience for the GUI, not the record of truth.
+
+    on_start(pid) is called once PowerShell is running, so the caller can
+    end it early (Cancel).
     """
     write_script(plan)
     lines = []
@@ -164,6 +167,8 @@ def run_script(plan, on_line=None, timeout=600):
         )
     except OSError as exc:
         return RunResult(False, -1, message="Could not start PowerShell: %s" % exc)
+    if on_start:
+        on_start(proc.pid)
 
     try:
         for raw in proc.stdout:
