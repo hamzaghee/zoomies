@@ -127,10 +127,17 @@ THE OLLAMA TEMPORARY TAG - READ THIS ONE
   time.
 
 
-APPLY OPTIMAL SETTINGS
-  Click it and Zoomies looks up that model's recommended settings and
-  fills them in. The line underneath says exactly where each number came
-  from, so you can always check it.
+FILL FROM DOCS
+  Picking a model fills in its recommended settings straight away - the
+  "Fill from docs" button does the same on demand. The line underneath
+  says exactly where each number came from, so you can always check it.
+
+  A new pick clears what the previous model's docs or preset filled in,
+  so its numbers never sit under the new model's name; anything you
+  typed yourself stays. When nothing is found, the status line says so,
+  and pressing "Fill from docs" offers the list of pages to choose from.
+  The button is greyed out while a preset is active, because picking the
+  preset already filled in everything the docs have (see PRESETS).
 
   WHERE IT LOOKS, BEST FIRST
     1. The Unsloth documentation page for that model.
@@ -163,13 +170,15 @@ APPLY OPTIMAL SETTINGS
   WORKED OUT ONCE, THEN KEPT
   The answer for a model family is saved to
       %LOCALAPPDATA%\Zoomies\cache\resolved.json
-  and never expires. After that, clicking Apply - or switching modes -
-  is instant and needs no internet at all. Press "Re-read docs" when you
+  and never expires. After that, picking the model, "Fill from docs" or
+  switching modes is instant and needs no internet at all - only the
+  first pick of a new family goes online. Press "Re-read docs" when you
   want Zoomies to go and look again, which is the only thing that
   overwrites a saved answer.
 
   Blue numbers came from a source. Numbers you type turn white, and
-  Zoomies asks before Apply overwrites anything you changed yourself.
+  Zoomies asks before "Fill from docs" overwrites anything you changed
+  yourself.
   Switching Mode or Reasoning updates the other numbers but keeps yours.
 
   The Mode dropdown appears when a model documents more than one set of
@@ -245,6 +254,40 @@ APPLY OPTIMAL SETTINGS
   this machine that is q8_0. The value actually in use shows in the Live
   panel and in History either way.
 
+  VRAM
+  Under the settings, Zoomies estimates what a llama.cpp load will need
+  on each card before you load it, and updates as you change Context,
+  KV cache, Parallel or Extra flags:
+
+      RX 6800 XT (1DA2) 3.7 + 9.5 = 13.2 / 16 GB  ->  fits - 2.8 GB spare
+
+  That is: other apps + this model = total, per card, because layers
+  are split across the cards and one can overflow while the total fits.
+  Green fits, amber leaves less than 0.5 GB spare, red will spill.
+  "Use largest context" fills in the biggest context that still leaves
+  0.5 GB free on every card.
+
+  It is worked out from the model file's header - layer sizes, which
+  layers keep a KV cache (every 4th on Qwen3.5/3.6/3.8, a few on
+  Nemotron, a sliding window on Gemma 4, Muse Glimmer and Laguna), the
+  KV cache type, batch size and flash attention - so it is instant and
+  never touches the cards. Checked against loads measured on this
+  machine, it is within about 0.25 GB per card. Flash attention off is
+  the least certain part: its scratch memory grows with context.
+
+  The sliders are what everything else already holds on each card. They
+  follow Windows' own counters (the model loaded now is left out when
+  "One model at a time" will unload it) until you drag one; "Read usage
+  now" puts them all back on the measured value.
+
+  SPILL ALERT
+  When a card runs out, Windows does not fail the load - it quietly puts
+  the rest in system RAM and the model runs several times slower. Zoomies
+  watches every llama.cpp and Ollama server's memory, and when more than
+  0.75 GB of it sits in system RAM it says so: a popup, a line in the
+  Output pane, and "SPILLING INTO SYSTEM RAM" in red on the Live panel's
+  GPU line, which also shows each card's memory in use.
+
   IT WILL LEAVE THE BOXES EMPTY RATHER THAN GUESS. If no source has
   settings for your model you get an empty form, a list of Unsloth pages
   to pick from, and a "Search the web" button - not a near-match. A wrong
@@ -260,15 +303,27 @@ APPLY OPTIMAL SETTINGS
 
 
 PRESETS
-  "Apply optimal settings" fills in what a model's authors recommend.
+  "Fill from docs" fills in what a model's authors recommend.
   A preset fills in what was actually measured on this machine. They
   answer different questions: the docs know the model, only a benchmark
   knows your cards.
 
   The Preset dropdown lists the presets saved for the selected model on
-  the selected backend, and is greyed out when there are none. Picking
-  one fills the form, and the values arrive blue like the docs ones, so
-  it is still obvious which numbers you typed yourself.
+  the selected backend, and is greyed out when there are none.
+
+  Picking one gives you both: the docs' numbers underneath, the
+  preset's on top. A preset usually holds the load settings - context,
+  layers, KV cache, flags, reasoning - and no sampling numbers, so the
+  docs fill in temperature, top P and the rest, and wherever both have
+  a value the preset wins, because it was measured on this machine. The
+  note under the settings says which fields came from where.
+
+  The preset stays in charge until you pick another model or press
+  Clear: switching Mode or Reasoning re-reads the docs and puts the
+  preset's values back on top, so its measured context is never
+  replaced by the docs' one. A preset that
+  switches reasoning off gets the docs' Instruct numbers. Values arrive
+  blue either way, and anything you typed yourself (white) is kept.
 
   A preset records the backend it was measured on. llama.cpp flags mean
   nothing to Ollama, so an Ollama preset is never offered for a

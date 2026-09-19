@@ -29,6 +29,7 @@ import processes
 import reasoning
 import runner
 import state
+import vram
 
 try:
     import optimizer
@@ -153,6 +154,19 @@ class Zoomies:
         self._kv_choice = backends.KV_CACHE_START     # remembered across toggles
         self._reasoning_is_variant = False
         self.opt_result = None
+        self._vram_rows = {}              # luid -> (DoubleVar, value label)
+        self._vram_manual = set()         # sliders the user has moved
+        self._vram_req = 0
+        self._vram_after = None
+        self._vram_est = None
+        self._vram_adapters = vram.adapters()
+        self._spill_alerted = set()       # pids already alerted
+        self._vram_seen = None            # the counter sample last followed
+        self._filling = False             # see _set_value
+        self._active_preset = None        # the preset under the docs values
+        self._preset_fresh = False        # its docs lookup has not landed yet
+        self._looking_up = False          # a docs lookup is running
+        self._auto_lookup = False         # started by picking a model
 
         self.metrics = None
         self._build_style()
@@ -347,7 +361,7 @@ class Zoomies:
 
         bar = ttk.Frame(box)
         bar.pack(fill="x", padx=8, pady=(6, 2))
-        self.apply_btn = ttk.Button(bar, text="Apply optimal settings",
+        self.apply_btn = ttk.Button(bar, text="Fill from docs",
                                     command=self._apply_optimal)
         self.apply_btn.pack(side="left")
         if optimizer is None:
@@ -440,6 +454,7 @@ class Zoomies:
         self.notes_lbl = ttk.Label(box, text="", style="Warn.TLabel",
                                    wraplength=self.px(940), justify="left")
         self.notes_lbl.pack(fill="x", padx=8, pady=(2, 6))
+        self._build_vram(box)
 
         act = ttk.Frame(box)
         act.pack(fill="x", padx=8, pady=(0, 8))
@@ -452,6 +467,9 @@ class Zoomies:
             value=self.cfg.get("one_model_at_a_time", True))
         ttk.Checkbutton(act, text="One model at a time",
                         variable=self.one_at_a_time).pack(side="left", padx=(12, 0))
+        # With it on, the model loaded now is unloaded first, so its VRAM
+        # stops counting as "in use by other apps".
+        self.one_at_a_time.trace_add("write", lambda *a: self._vram_follow_live(True))
         self.status_lbl = ttk.Label(act, text="", style="Dim.TLabel")
         self.status_lbl.pack(side="left", padx=(16, 0))
 
@@ -641,13 +659,21 @@ class Zoomies:
         if gpus:
             parts = []
             for gpu in gpus:
-                pct = gpu.get("pct")
-                parts.append("%s %s" % (gpu["name"],
-                                        "-" if pct is None else "%.0f%%" % pct))
-            self.live_gpu.configure(text="   ".join(parts), style="Dim.TLabel")
+                pct, used = gpu.get("pct"), gpu.get("used")
+                parts.append("%s %s%s" % (
+                    gpu["name"], "-" if pct is None else "%.0f%%" % pct,
+                    "" if used is None else "  %s/%.0f GB" % (
+                        vram.gb(used), gpu["vram"] / float(vram.GB))))
+            spilling = bool(snap.get("spills"))
+            if spilling:
+                parts.append("SPILLING INTO SYSTEM RAM")
+            self.live_gpu.configure(text="   ".join(parts),
+                                    style="Bad.TLabel" if spilling else "Dim.TLabel")
         elif snap.get("gpu_error"):
             self.live_gpu.configure(text="GPU: %s" % snap["gpu_error"],
                                     style="Bad.TLabel")
+        self._check_spills(snap)
+        self._vram_follow_live()
 
         rows = snap.get("history") or []
         existing = set(self.hist_tree.get_children(""))
@@ -758,6 +784,8 @@ class Zoomies:
         return out
 
     def _mark_dirty(self, key):
+        if self._filling:
+            return                  # Zoomies is filling it in, not you
         self.dirty[key] = True
         try:
             self.entries[key].configure(foreground=FG)
@@ -767,11 +795,13 @@ class Zoomies:
     def _set_value(self, key, value, auto=True):
         """Auto-filled values render in accent blue so it is obvious at a
         glance which numbers came from the docs and which you typed."""
-        var = self.vars[key]
-        for mode, cbname in var.trace_info():      # detach so setting the value
-            var.trace_remove(mode, cbname)         # does not mark it dirty
-        var.set("" if value is None else str(value))
-        var.trace_add("write", lambda *a, k=key: self._mark_dirty(k))
+        # Flagged rather than detaching the trace: other watchers (the VRAM
+        # estimate) still need to hear about the change.
+        self._filling = True
+        try:
+            self.vars[key].set("" if value is None else str(value))
+        finally:
+            self._filling = False
         self.dirty[key] = not auto
         try:
             self.entries[key].configure(foreground=ACCENT if auto else FG)
@@ -796,11 +826,14 @@ class Zoomies:
         self.preset_box.state(["!disabled"] if names else ["disabled"])
 
     def _preset_chosen(self):
-        """Fill the form from a saved preset.
+        """Fill the form from a saved preset, with the docs underneath.
 
-        Preset values arrive blue, like the docs lookup, so it stays obvious
-        which numbers you typed. A setting this backend does not support is
-        reported rather than dropped silently.
+        A preset holds what was measured here - context, layers, flags - and
+        usually no sampling numbers; the docs hold the sampling numbers. So
+        the preset goes in straight away, the docs answer is read (cached,
+        so normally instant) and fills every field the preset leaves empty,
+        and the preset wins wherever both have a value. Values arrive blue
+        either way, so it stays obvious which numbers you typed.
         """
         name = self.preset_var.get()
         preset = next((p for p in getattr(self, "_presets", [])
@@ -808,25 +841,9 @@ class Zoomies:
         if not preset:
             return
         be = self.backend()
-        applied, skipped = [], []
-        for key, value in (preset.get("settings") or {}).items():
-            if key == "kv_cache":
-                if be.supports("kv_cache"):
-                    self.kv_var.set(str(value))
-                    applied.append("KV cache")
-                else:
-                    skipped.append("KV cache")
-                continue
-            if key in ("reasoning", "reasoning_style"):
-                continue                      # handled below, together
-            if key not in self.vars:
-                continue
-            if be.supports(key):
-                self._set_value(key, value, auto=True)
-                applied.append(backends.SETTING_TEXT.get(key, key))
-            else:
-                skipped.append(backends.SETTING_TEXT.get(key, key))
-
+        self._active_preset = preset
+        self._refresh_apply_btn()
+        applied, skipped = self._apply_preset_values(preset, force=True)
         level = str(preset.get("settings", {}).get("reasoning") or "")
         if level and be.supports("reasoning"):
             # Settled once the template is read for the preset's Extra flags,
@@ -837,8 +854,7 @@ class Zoomies:
             skipped.append("Reasoning")
 
         self.source_note = "preset: %s" % name
-        self.source_lbl.configure(
-            text=preset.get("note") or ("Applied preset %s." % name))
+        self.source_lbl.configure(text=self._preset_text(preset))
         self._refresh_reasoning()
         if skipped:
             self.set_status("Applied %s. %s not supported by %s."
@@ -847,6 +863,40 @@ class Zoomies:
         else:
             self.set_status("Applied preset %s (%d settings)."
                             % (name, len(applied)))
+        model = self.selected_model()
+        if optimizer is not None and model is not None:
+            self._preset_fresh = True
+            self._start_lookup(model, keep_edits=True)
+
+    def _apply_preset_values(self, preset, force=False):
+        """Put a preset's fields into the form. force: over values you typed
+        too - picking a preset is asking for its numbers. A docs re-read
+        passes False, so it never undoes a value you typed."""
+        be = self.backend()
+        applied, skipped = [], []
+        for key, value in (preset.get("settings") or {}).items():
+            if key == "kv_cache":
+                if be.supports("kv_cache"):
+                    self.kv_var.set(str(value))
+                    applied.append("KV cache")
+                else:
+                    skipped.append("KV cache")
+                continue
+            if key not in self.vars:
+                continue                      # reasoning is handled apart
+            if not force and self.dirty.get(key) and self.vars[key].get().strip():
+                continue
+            if be.supports(key):
+                self._set_value(key, value, auto=True)
+                applied.append(backends.SETTING_TEXT.get(key, key))
+            else:
+                skipped.append(backends.SETTING_TEXT.get(key, key))
+        return applied, skipped
+
+    @staticmethod
+    def _preset_text(preset):
+        return "Preset %s: %s" % (preset["name"], preset.get("note")
+                                  or "measured on this machine.")
 
     def _clear_settings(self):
         for key in self.vars:
@@ -859,6 +909,9 @@ class Zoomies:
         self.mode_keys = {}
         self.opt_result = None
         self.source_note = ""
+        self._active_preset = None
+        self._refresh_apply_btn()
+        self.preset_var.set("")
         self._pending_reason = None
         self._reasoning_is_variant = False
         self.reason_var.set("")
@@ -911,6 +964,7 @@ class Zoomies:
         self.notes_lbl.configure(text=msg)
         self._refresh_reason_box()
         self._refresh_kv_box()
+        self._schedule_vram()
 
         self._reload_models(announce=False)
 
@@ -979,7 +1033,13 @@ class Zoomies:
             self.model_var.set("")
             if err:
                 self.log("%s: %s" % (be.display_name, err), "err")
-        self._model_selected()
+        # A rescan that lands on the same model is not a new pick: keep the
+        # form, and any preset in it.
+        now = self.selected_model()
+        same = current is not None and now is not None and \
+            (current.backend, current.id) == (now.backend, now.id)
+        if not same:
+            self._model_selected()
 
     def _browse(self):
         chosen = filedialog.askdirectory(
@@ -1065,34 +1125,72 @@ class Zoomies:
             return
         self.set_status("Re-reading the docs..." if force
                         else "Looking up settings...")
-        self.apply_btn.state(["disabled"])
-        threading.Thread(target=self._apply_worker, args=(model, force),
-                         daemon=True).start()
+        self._start_lookup(model, force=force)
 
-    def _apply_worker(self, model, force=False):
+    def _start_lookup(self, model, force=False, keep_edits=False):
+        self._looking_up = True
+        self._refresh_apply_btn()
+        threading.Thread(target=self._apply_worker,
+                         args=(model, force, keep_edits), daemon=True).start()
+
+    def _refresh_apply_btn(self):
+        """Greyed out while a lookup runs, and while a preset is active -
+        picking the preset already filled everything the docs have."""
+        usable = optimizer is not None and not self._looking_up             and self._active_preset is None
+        self.apply_btn.state(["!disabled"] if usable else ["disabled"])
+
+    def _apply_worker(self, model, force=False, keep_edits=False):
+        """keep_edits: set when a preset asked for the docs, which must fill
+        in around what you typed rather than over it. Apply itself already
+        asked before replacing typed values, so it may."""
+        preset = self._active_preset
+        level = str(((preset or {}).get("settings") or {}).get("reasoning") or "")
         try:
             result = optimizer.recommend(model, self.cfg,
                                          force_refresh=force)
+            # A preset that switches thinking off wants the docs' Instruct
+            # numbers, not the Thinking ones the model defaults to.
+            if level in ("off", "none") and "instruct" in result.modes                     and result.mode != "instruct":
+                result = optimizer.recommend(model, self.cfg, mode="instruct")
         except Exception as exc:                      # noqa: BLE001
             result = optimizer.Result(error=str(exc))
-        # Apply already asked before replacing typed values, so it may.
-        self.out_queue.put(("optimal", model, result, False))
+        self.out_queue.put(("optimal", model, result, keep_edits))
 
     def _apply_result(self, model, result, keep_edits=False):
         """keep_edits: a Mode or Reasoning change re-reads the docs for new
         sampling numbers, but must not touch what you typed - it used to put
         the docs' context back over a context you had just raised."""
-        self.apply_btn.state(["!disabled"])
+        self._looking_up = False
+        self._refresh_apply_btn()
+        auto, self._auto_lookup = self._auto_lookup, False
+        current = self.selected_model()
+        if current is None or current.id != model.id:
+            return                        # a different model is picked now
         be = self.backend()
         self.opt_result = result
+        preset = self._active_preset
 
         if not result.settings:
+            if preset:
+                # The preset stands on its own; no page picker for a
+                # question nobody asked.
+                self.source_lbl.configure(text="%s\nNo docs settings found "
+                                          "to fill in the rest." %
+                                          self._preset_text(preset))
+                return
             self.source_lbl.configure(text=result.error or
                                       "Nothing usable found on that page.")
-            self.set_status("No settings found - type them in, or pick a page.",
-                            "Warn.TLabel")
             self._reasoning_is_variant = False
             self._refresh_reason_box()
+            if auto:
+                # Nobody asked yet, so no dialog: say so, and leave the
+                # page picker to an actual press of the button.
+                self.set_status("No docs settings for this model - type them "
+                                "in, or press Fill from docs to pick a page.",
+                                "Warn.TLabel")
+                return
+            self.set_status("No settings found - type them in, or pick a page.",
+                            "Warn.TLabel")
             if result.candidates:
                 self._offer_page_picker(model, result.candidates)
             return
@@ -1116,6 +1214,18 @@ class Zoomies:
         if result.mode:
             self.mode_var.set(result.mode_labels.get(result.mode, result.mode))
 
+        # The preset goes back on top: it was measured on this machine, the
+        # docs were not. Its reasoning level too, when it has one.
+        from_preset = []
+        if preset:
+            from_preset, _ = self._apply_preset_values(preset)
+            level = str((preset.get("settings") or {}).get("reasoning") or "")
+            # Its level too - but not after you changed Mode or Reasoning
+            # yourself, which is what a keep_edits re-read otherwise means.
+            if level and (self._preset_fresh or not keep_edits):
+                self._pending_reason = level
+            self._preset_fresh = False
+
         # The levels come from the chat template, not the docs; the docs only
         # say whether a model with no switch has a separate Reasoning build.
         self._reasoning_is_variant = any(
@@ -1123,10 +1233,23 @@ class Zoomies:
             for label in result.mode_labels.values())
         self._refresh_reasoning()
 
-        self.source_note = result.source_line()
-        self.source_lbl.configure(text=result.describe())
-        msg = "Applied %d setting%s." % (len(applied),
-                                         "" if len(applied) == 1 else "s")
+        if preset:
+            texts = [backends.SETTING_TEXT.get(k, k) for k in applied
+                     if backends.SETTING_TEXT.get(k, k) not in from_preset]
+            self.source_note = "preset: %s; %s" % (preset["name"],
+                                                   result.source_line())
+            self.source_lbl.configure(text="%s\nFrom %s: %s. The preset's "
+                                      "own values win where both have one." % (
+                                          self._preset_text(preset),
+                                          result.source_line(),
+                                          ", ".join(texts) or "nothing new"))
+            msg = "Applied preset %s (%d settings) and %d from the docs." % (
+                preset["name"], len(from_preset), len(texts))
+        else:
+            self.source_note = result.source_line()
+            self.source_lbl.configure(text=result.describe())
+            msg = "Applied %d setting%s." % (len(applied),
+                                             "" if len(applied) == 1 else "s")
         if skipped:
             msg += "  %s cannot use: %s." % (be.display_name, ", ".join(skipped))
         self.set_status(msg, "Ok.TLabel")
@@ -1134,11 +1257,29 @@ class Zoomies:
             self.log("Not applied: " + hint, "note")
 
     def _model_selected(self):
+        """A new model fills the form from its docs straight away, so the
+        previous model's numbers never sit under the new one's name. The
+        answer is saved per family (cache\resolved.json), so only the first
+        pick of a new family goes online. Values you typed are kept."""
+        self._active_preset = None
+        self._refresh_apply_btn()
+        # What the last model's docs or preset filled in (blue) goes; what
+        # you typed (white) stays.
+        for key, var in self.vars.items():
+            if not (self.dirty.get(key) and var.get().strip()):
+                self._set_value(key, "", auto=True)
+        self.source_lbl.configure(text="")
+        self.source_note = ""
         self.reason_var.set("")
         self._pending_reason = None
         self._reasoning_is_variant = False
         self._refresh_preset_box()
         self._refresh_reasoning(force=True)
+        self._schedule_vram()
+        model = self.selected_model()
+        if optimizer is not None and model is not None:
+            self._auto_lookup = True
+            self._start_lookup(model, keep_edits=True)
 
     def _refresh_reasoning(self, force=False):
         """Read the chosen model's chat template for its reasoning levels.
@@ -1231,6 +1372,228 @@ class Zoomies:
         if self.reason_var.get() not in spec.levels:
             self.reason_var.set(spec.default)
         self.reason_box.state(["!disabled"])
+
+    # ------------------------------------------------------------------
+    # VRAM estimate
+    # ------------------------------------------------------------------
+
+    def _build_vram(self, box):
+        """What the load will need per card, before loading it.
+
+        Worked out from the .gguf header (vram.py), so it never touches a
+        GPU. The sliders are what everything else already holds on each
+        card; they follow Windows' own counters until you move one.
+        """
+        frame = ttk.Frame(box)
+        frame.pack(fill="x", padx=8, pady=(0, 6))
+        head = ttk.Frame(frame)
+        head.pack(fill="x")
+        ttk.Label(head, text="VRAM", style="Dim.TLabel").pack(side="left")
+        self.vram_est_lbl = ttk.Label(head, text="", style="Dim.TLabel",
+                                  wraplength=self.px(640), justify="left")
+        self.vram_est_lbl.pack(side="left", padx=(8, 0))
+        self.vram_fit_btn = ttk.Button(head, text="Use largest context",
+                                       command=self._use_max_ctx)
+        self.vram_fit_btn.pack(side="right")
+        ttk.Button(head, text="Read usage now",
+                   command=lambda: self._vram_follow_live(True)).pack(
+            side="right", padx=(0, 6))
+        self.vram_cards = ttk.Frame(frame)
+        self.vram_cards.pack(fill="x", pady=(2, 0))
+        self.vram_notes = ttk.Label(frame, text="", style="Dim.TLabel",
+                                    wraplength=self.px(940), justify="left")
+        self.vram_notes.pack(fill="x")
+        for key in ("context_length", "gpu_layers", "parallel", "extra_flags"):
+            self.vars[key].trace_add("write", lambda *a: self._schedule_vram())
+        self.kv_var.trace_add("write", lambda *a: self._schedule_vram())
+
+    def _schedule_vram(self):
+        """Re-estimate shortly after the last change, not on every key."""
+        if self._vram_after:
+            self.root.after_cancel(self._vram_after)
+        self._vram_after = self.root.after(250, self._estimate_vram)
+
+    def _estimate_vram(self):
+        self._vram_after = None
+        model, be = self.selected_model(), self.backend()
+        if model is None or be.name != "llamacpp":
+            self._vram_req += 1
+            self._sync_vram_rows([])
+            self.vram_est_lbl.configure(
+                text="" if model is None else
+                "estimated for llama.cpp only - Ollama places layers itself",
+                style="Dim.TLabel")
+            self.vram_fit_btn.state(["disabled"])
+            self.vram_notes.configure(text="")
+            return
+        settings = self.settings_dict()
+        cards = vram.cards_for(reasoning.split_flags(settings.get("extra_flags")),
+                               self._vram_adapters)
+        self._sync_vram_rows(cards)
+        other = {luid: int(var.get() * vram.GB)
+                 for luid, (var, _lbl) in self._vram_rows.items()}
+        self._vram_req += 1
+        req, found = self._vram_req, self._vram_adapters
+        threading.Thread(
+            target=lambda: self.out_queue.put(
+                ("vram", req, vram.estimate(model, settings, other, found))),
+            daemon=True).start()
+
+    def _sync_vram_rows(self, cards):
+        """One slider per card the launch will use."""
+        if [c.luid for c in cards] == list(self._vram_rows):
+            return
+        for child in self.vram_cards.winfo_children():
+            child.destroy()
+        self._vram_rows = {}
+        live = self._live_other()
+        for row, card in enumerate(cards):
+            gb = card.total / float(vram.GB)
+            ttk.Label(self.vram_cards, text="%s - in use by other apps"
+                      % card.name, style="Dim.TLabel").grid(
+                row=row, column=0, sticky="w")
+            var = tk.DoubleVar(value=round(live.get(card.luid, 0) / vram.GB, 1))
+            ttk.Scale(self.vram_cards, from_=0, to=gb, variable=var,
+                      length=self.px(220),
+                      command=lambda v, l=card.luid: self._vram_slid(l)).grid(
+                row=row, column=1, padx=8)
+            lbl = ttk.Label(self.vram_cards, text="", style="Dim.TLabel")
+            lbl.grid(row=row, column=2, sticky="w")
+            self._vram_rows[card.luid] = (var, lbl)
+            self._vram_label(card.luid)
+
+    def _vram_label(self, luid):
+        var, lbl = self._vram_rows[luid]
+        lbl.configure(text="%.1f GB%s" % (
+            var.get(), "  (set by you)" if luid in self._vram_manual
+            else "  (measured)"))
+
+    def _vram_slid(self, luid):
+        self._vram_manual.add(luid)
+        self._vram_label(luid)
+        self._schedule_vram()
+
+    def _live_other(self):
+        """{luid: bytes} each card holds now, less any model server that
+        "One model at a time" would unload before this load."""
+        snap = self.metrics.snapshot() if self.metrics else {}
+        used = {g["luid"]: g["used"] for g in snap.get("gpus") or []
+                if g.get("used") is not None}
+        if used and self.one_at_a_time.get():
+            for pid, mem in (snap.get("gpu_procs") or {}).items():
+                if mem["dedicated"] < 256 * 1024 ** 2 or \
+                        not metrics.model_server(pid):
+                    continue
+                for luid, n in mem.get("by_card", {}).items():
+                    if luid in used:
+                        used[luid] = max(0, used[luid] - n)
+        return used
+
+    def _vram_follow_live(self, reset=False):
+        """Keep untouched sliders on the measured value. reset: take the
+        measured value for every slider, including ones you moved."""
+        if reset:
+            self._vram_manual.clear()
+        elif self.metrics is not None:
+            # Counters arrive every few seconds; the panel refreshes faster.
+            sample = self.metrics.snapshot().get("gpu_procs")
+            if sample is self._vram_seen:
+                return
+            self._vram_seen = sample
+        live = self._live_other()
+        changed = False
+        for luid, (var, _lbl) in self._vram_rows.items():
+            if luid in self._vram_manual or luid not in live:
+                continue
+            value = round(live[luid] / vram.GB, 1)
+            if abs(value - var.get()) >= 0.1 or reset:
+                var.set(value)
+                self._vram_label(luid)
+                changed = True
+        if changed:
+            self._schedule_vram()
+
+    def _vram_ready(self, req, est):
+        if req != self._vram_req:
+            return                        # the form changed since
+        self._vram_est = est
+        if est.problem:
+            self.vram_est_lbl.configure(text=est.problem, style="Dim.TLabel")
+            self.vram_fit_btn.state(["disabled"])
+            self.vram_notes.configure(text="")
+            return
+        parts = ["%s %s + %s = %s / %.0f GB" % (
+            c.name, vram.gb(c.other), vram.gb(c.model), vram.gb(c.used),
+            c.total / float(vram.GB)) for c in est.cards]
+        worst = min(est.cards, key=lambda c: c.spare)
+        if not est.fits:
+            verdict = "will spill about %s GB into system RAM on %s" % (
+                vram.gb(-worst.spare), worst.name)
+            style = "Bad.TLabel"
+        elif est.tight:
+            verdict = "tight - %s GB spare on %s" % (vram.gb(worst.spare),
+                                                     worst.name)
+            style = "Warn.TLabel"
+        else:
+            verdict = "fits - %s GB spare" % vram.gb(worst.spare)
+            style = "Ok.TLabel"
+        self.vram_est_lbl.configure(text="%s   ->   %s" % ("   |   ".join(parts),
+                                                       verdict), style=style)
+        if est.max_ctx and est.max_ctx != est.ctx:
+            self.vram_fit_btn.configure(text="Use largest context (%s)"
+                                        % format(est.max_ctx, ","))
+            self.vram_fit_btn.state(["!disabled"])
+        else:
+            self.vram_fit_btn.configure(text="Use largest context")
+            self.vram_fit_btn.state(["disabled"])
+        notes = ["Other apps + this model = total. Accurate to about 0.25 GB "
+                 "per card; keeps %s GB free per card for \"largest context\"."
+                 % vram.gb(est.margin)] + est.notes
+        self.vram_notes.configure(text="  ".join(notes))
+
+    def _use_max_ctx(self):
+        est = self._vram_est
+        if est and est.max_ctx:
+            self.vars["context_length"].set(str(est.max_ctx))
+
+    def _check_spills(self, snap):
+        """Alert once per server when part of a model lands in system RAM.
+
+        Windows does not fail a load that does not fit; it backs the rest
+        with shared memory and the model just runs slowly, so without this
+        nothing on screen would say why.
+        """
+        live_pids = set(snap.get("gpu_procs") or {})
+        if live_pids:                     # not after a failed sample
+            self._spill_alerted &= live_pids
+        for spill in snap.get("spills") or []:
+            if spill["pid"] in self._spill_alerted:
+                continue
+            self._spill_alerted.add(spill["pid"])
+            name = next((m.label for m in self.loaded_rows.values()
+                         if m.pid == spill["pid"]), "") or \
+                os.path.basename(spill["image"])
+            text = ("%s is spilling: %.1f GB of its memory is in system RAM "
+                    "(%.1f GB on the cards), so prompts and generation will be "
+                    "much slower. Lower Context, pick a smaller KV cache type, "
+                    "or close whatever else is using the cards."
+                    % (name, spill["shared"] / float(vram.GB),
+                       spill["dedicated"] / float(vram.GB)))
+            self.log("[zoomies] " + text, "err")
+            self.set_status("%s is spilling into system RAM." % name, "Bad.TLabel")
+            self._alert("Model spilling into system RAM", text)
+
+    def _alert(self, title, text):
+        """A small window that does not block the rest of the app."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG)
+        win.transient(self.root)
+        ttk.Label(win, text=text, style="Bad.TLabel", wraplength=self.px(460),
+                  justify="left").pack(padx=14, pady=(14, 8))
+        ttk.Button(win, text="OK", command=win.destroy).pack(pady=(0, 12))
+        win.lift()
+        self.root.bell()
 
     def _refresh_kv_box(self):
         """Selectable where the backend applies it per load (llama.cpp); on
@@ -1882,6 +2245,8 @@ class Zoomies:
                     self._reasoning_ready(msg[1], msg[2])
                 elif kind == "opencode":
                     self._opencode_planned(msg[1], msg[2])
+                elif kind == "vram":
+                    self._vram_ready(msg[1], msg[2])
                 elif kind == "models":
                     self._models_ready(msg[1], msg[2], msg[3], msg[4])
         except queue.Empty:

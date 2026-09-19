@@ -32,10 +32,9 @@ import os
 import re
 import shlex
 import struct
-import threading
 from dataclasses import dataclass, field
 
-import state
+import gguf
 
 # How llama.cpp treats a template it has not been told anything about: with
 # --reasoning left on "auto" and --jinja, it passes enable_thinking=true to
@@ -97,11 +96,6 @@ class Spec:
 # finding the template
 # --------------------------------------------------------------------------
 
-_cache_lock = threading.Lock()
-_templates = {}
-TEMPLATE_CACHE = os.path.join(state.CACHE_DIR, "templates.json")
-
-
 def _flag_value(tokens, names):
     for i, tok in enumerate(tokens):
         head, eq, tail = tok.partition("=")
@@ -134,110 +128,18 @@ def template_for(model, extra_flags=""):
     if _flag_value(tokens, _INLINE_FLAGS) is not None:
         return None, ("Extra flags choose a built-in llama.cpp template "
                       "(--chat-template), which Zoomies cannot read.")
-    gguf = getattr(model, "gguf_path", "") or ""
-    if not gguf:
+    model_file = getattr(model, "gguf_path", "") or ""
+    if not model_file:
         return None, "No .gguf file to read the chat template from."
     try:
-        text = gguf_chat_template(gguf)
+        text = gguf.read(model_file).chat_template
     except (OSError, ValueError, struct.error) as exc:
-        return None, "Could not read %s: %s" % (os.path.basename(gguf), exc)
+        return None, "Could not read %s: %s" % (os.path.basename(model_file), exc)
     if not text:
         return None, ("%s has no chat template inside it, and Extra flags do "
                       "not name one (--chat-template-file)."
-                      % os.path.basename(gguf))
-    return text, "chat template inside %s" % os.path.basename(gguf)
-
-
-def gguf_chat_template(path):
-    """tokenizer.chat_template from a .gguf header, or "" if it has none.
-
-    Cached by path, size and modified time, on disk too: the key sits after
-    the vocabulary, so finding it means stepping over a few hundred thousand
-    strings, and the opencode sync reads every model at once.
-    """
-    st = os.stat(path)
-    key = "%s|%d|%d" % (os.path.normcase(path), st.st_size, int(st.st_mtime))
-    with _cache_lock:
-        if not _templates:
-            _templates.update(state.read_json(TEMPLATE_CACHE, {}) or {})
-        if key in _templates:
-            return _templates[key]
-    text = _read_gguf_template(path)
-    with _cache_lock:
-        _templates[key] = text
-        state.write_json(TEMPLATE_CACHE, _templates)
-    return text
-
-
-_SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
-_STRING, _ARRAY = 8, 9
-
-
-def _read_gguf_template(path):
-    with open(path, "rb") as f:
-        if f.read(4) != b"GGUF":
-            raise ValueError("not a GGUF file")
-        version, = struct.unpack("<I", f.read(4))
-        if version < 2:
-            raise ValueError("GGUF version %d is too old" % version)
-        _tensors, n_kv = struct.unpack("<QQ", f.read(16))
-        buf = _Reader(f)
-        for _ in range(n_kv):
-            key = buf.string().decode("utf-8", "replace")
-            kind = buf.u32()
-            if key == "tokenizer.chat_template" and kind == _STRING:
-                return buf.string().decode("utf-8", "replace")
-            buf.skip_value(kind)
-    return ""
-
-
-class _Reader:
-    """Reads a GGUF header through a large buffer - skipping a vocabulary one
-    f.read() per token is what makes the naive version slow."""
-
-    CHUNK = 1 << 22
-
-    def __init__(self, f):
-        self.f, self.buf, self.pos = f, b"", 0
-
-    def _need(self, n):
-        if self.pos + n > len(self.buf):
-            self.buf = self.buf[self.pos:] + self.f.read(max(n, self.CHUNK))
-            self.pos = 0
-            if n > len(self.buf):
-                raise ValueError("GGUF header ends early")
-
-    def take(self, n):
-        self._need(n)
-        out = self.buf[self.pos:self.pos + n]
-        self.pos += n
-        return out
-
-    def u32(self):
-        return struct.unpack("<I", self.take(4))[0]
-
-    def u64(self):
-        return struct.unpack("<Q", self.take(8))[0]
-
-    def string(self):
-        return self.take(self.u64())
-
-    def skip_value(self, kind):
-        if kind == _STRING:
-            self.take(self.u64())
-        elif kind == _ARRAY:
-            item, count = self.u32(), self.u64()
-            if item == _STRING:
-                for _ in range(count):
-                    self.take(self.u64())
-            elif item in _SCALAR:
-                self.take(_SCALAR[item] * count)
-            else:
-                raise ValueError("unsupported GGUF array type %d" % item)
-        elif kind in _SCALAR:
-            self.take(_SCALAR[kind])
-        else:
-            raise ValueError("unsupported GGUF value type %d" % kind)
+                      % os.path.basename(model_file))
+    return text, "chat template inside %s" % os.path.basename(model_file)
 
 
 # --------------------------------------------------------------------------

@@ -9,7 +9,10 @@ server.log, with the `slot print_timing:` lines llama.cpp writes, is the
 fallback when no server can be reached.
 
 GPU utilisation comes from Windows' own "GPU Engine" counters - the same
-source Task Manager reads - joined to real adapter names through DXGI.
+source Task Manager reads - joined to real adapter names through DXGI. The
+same typeperf call reads VRAM use per card and per process, which is how a
+model spilling into system RAM is noticed: Windows does not fail an
+allocation that does not fit, it quietly backs it with shared memory.
 """
 
 import csv
@@ -75,6 +78,17 @@ RE_TOTAL = re.compile(r"total time =\s*(?P<ms>[\d.]+) ms")
 RE_KV = re.compile(r"llama_kv_cache:.*?K \((?P<k>[^)]+)\).*?V \((?P<v>[^)]+)\)")
 
 LUID_RE = re.compile(r"luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)")
+PID_RE = re.compile(r"pid_(\d+)_")
+GPU_COUNTERS = (r"\GPU Engine(*)\Utilization Percentage",
+                r"\GPU Adapter Memory(*)\Dedicated Usage",
+                r"\GPU Process Memory(*)\Dedicated Usage",
+                r"\GPU Process Memory(*)\Shared Usage")
+# A model server is "spilling" when this much of its memory sits in shared
+# system RAM. A healthy llama.cpp server on Vulkan keeps some there for
+# staging - measured on Qwen3.8 at 64k: 0.13 GB idle, 0.36 GB mid-request -
+# so the line sits well above that.
+SPILL_BYTES = 768 * 1024 ** 2
+SPILL_MIN_DEDICATED = 2 * 1024 ** 3    # only processes that hold a model
 
 GPU_POLL_SECONDS = 2
 SLOTS_POLL_SECONDS = 0.5      # how often each llama-server is asked
@@ -273,7 +287,7 @@ class Metrics:
             "last_update": None, "request_start": None,
             "first_gen_seen": False, "filed": False,
             "gen_avg": None, "runtime": None, "kv": None,
-            "gpus": [], "gpu_error": "",
+            "gpus": [], "gpu_error": "", "gpu_procs": {}, "spills": [],
         }
 
     # -- lifecycle ---------------------------------------------------------
@@ -673,7 +687,11 @@ class Metrics:
                 pass        # held by another instance, or already gone
 
     def sample_gpu(self):
-        """{luid: max utilisation percent}.
+        """({luid: max utilisation percent}, memory, error).
+
+        memory is {"used": {luid: bytes}, "procs": {pid: {"dedicated": n,
+        "shared": n, "by_card": {luid: n}}}}: VRAM in use per card, and per
+        process, summed over its cards and split by card.
 
         Windows reports one value per engine per process; Task Manager shows
         the highest per adapter rather than the sum, and so do we - summing
@@ -686,15 +704,15 @@ class Metrics:
         samples is always blank and only the second is usable.
         """
         if self.shutdown.is_set():
-            return {}, ""
+            return {}, {}, ""
         tmp_path = os.path.join(
             tempfile.gettempdir(),
             "%s%s.csv" % (GPU_SAMPLE_PREFIX, uuid.uuid4().hex))
         with self._sampler_lock:
             self._our_samples.add(tmp_path)
         try:
-            cmd = ["typeperf", r"\GPU Engine(*)\Utilization Percentage",
-                   "-sc", "2", "-f", "CSV", "-o", tmp_path]
+            cmd = ["typeperf"] + list(GPU_COUNTERS) + [
+                "-sc", "2", "-f", "CSV", "-o", tmp_path]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE, text=True,
                                     creationflags=CREATE_NO_WINDOW)
@@ -707,19 +725,19 @@ class Metrics:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.communicate()
-                return {}, "typeperf timed out"
+                return {}, {}, "typeperf timed out"
             finally:
                 with self._sampler_lock:
                     self._sampler = None
             if proc.returncode != 0:
-                return {}, (errors or "").strip()[:120] or "typeperf failed"
+                return {}, {}, (errors or "").strip()[:120] or "typeperf failed"
 
             with open(tmp_path, "r", encoding="utf-8", errors="ignore") as fh:
                 rows = [r for r in csv.reader(io.StringIO(fh.read())) if r]
             if len(rows) < 3:                 # header plus two samples
-                return {}, "no counter data"
+                return {}, {}, "no counter data"
             headers, values = rows[0], rows[-1]
-            per_luid = {}
+            per_luid, used, procs = {}, {}, {}
             for header, value in zip(headers, values):
                 m = LUID_RE.search(header)
                 if not m:
@@ -728,13 +746,26 @@ class Metrics:
                 # formats LUIDs in upper-case hex
                 luid = (m.group(1) + "_" + m.group(2)).upper()
                 try:
-                    pct = float(value)
+                    number = float(value)
                 except ValueError:
                     continue
-                per_luid[luid] = max(per_luid.get(luid, 0.0), pct)
-            return per_luid, ""
+                if "GPU Engine" in header:
+                    per_luid[luid] = max(per_luid.get(luid, 0.0), number)
+                elif "GPU Adapter Memory" in header:
+                    used[luid] = int(number)
+                elif "GPU Process Memory" in header:
+                    pid = PID_RE.search(header)
+                    if pid:
+                        entry = procs.setdefault(int(pid.group(1)), {
+                            "dedicated": 0, "shared": 0, "by_card": {}})
+                        if header.endswith("Shared Usage"):
+                            entry["shared"] += int(number)
+                        else:
+                            entry["dedicated"] += int(number)
+                            entry["by_card"][luid] = int(number)
+            return per_luid, {"used": used, "procs": procs}, ""
         except OSError as exc:
-            return {}, str(exc)[:120]
+            return {}, {}, str(exc)[:120]
         finally:
             # Only stop tracking it once it is actually gone - otherwise a
             # file we failed to delete is forgotten and never retried.
@@ -751,7 +782,7 @@ class Metrics:
                 adapters = [a for a in state.enumerate_adapters()
                             if not a["is_software"] and a["vram"] >= 1 << 30]
                 refreshed = now
-            usage, err = self.sample_gpu()
+            usage, memory, err = self.sample_gpu()
             # A driver reinstall or TDR leaves a stale entry for a card that
             # is still installed: same hardware key, a new LUID, and no
             # counters behind it. Keep the one that is actually reporting.
@@ -763,11 +794,37 @@ class Metrics:
                     "luid": adapter["luid"],
                     "vram": adapter["vram"],
                     "pct": usage.get(adapter["luid"]),
+                    "used": (memory.get("used") or {}).get(adapter["luid"]),
                 })
+            procs = memory.get("procs") or {}
+            spilled = spills(procs)
             with self.lock:
                 self.state["gpus"] = rows
                 self.state["gpu_error"] = err
+                self.state["gpu_procs"] = procs
+                self.state["spills"] = spilled
             self.shutdown.wait(GPU_POLL_SECONDS)
+
+
+def model_server(pid):
+    """The exe path if pid is a llama.cpp or Ollama process, else ''."""
+    image = process_image(pid)
+    return image if os.path.basename(image).lower().startswith(
+        ("llama", "ollama")) else ""
+
+
+def spills(procs):
+    """[{"pid", "image", "dedicated", "shared"}] for model servers with part
+    of their memory pushed into system RAM."""
+    out = []
+    for pid, mem in procs.items():
+        if mem["shared"] < SPILL_BYTES or mem["dedicated"] < SPILL_MIN_DEDICATED:
+            continue
+        image = model_server(pid)
+        if image:
+            out.append({"pid": pid, "image": image,
+                        "dedicated": mem["dedicated"], "shared": mem["shared"]})
+    return out
 
 
 # --------------------------------------------------------------------------
