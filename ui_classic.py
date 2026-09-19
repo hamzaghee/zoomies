@@ -482,8 +482,9 @@ class ClassicLayout:
         if lbl is not None:
             lbl.configure(text=text)
 
-    def show_vram_estimate(self, est, text, style, notes):
-        """est: the vram.Estimate behind text, or None when there is none."""
+    def show_vram_estimate(self, est, text, style, notes, verdict=None):
+        """est: the vram.Estimate behind text, or None when there is none.
+        verdict: just the fits / tight / spills part of text."""
         self.vram_est_lbl.configure(text=text, style=style)
         self.vram_notes.configure(text=notes)
         if est is not None and est.max_ctx and est.max_ctx != est.ctx:

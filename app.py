@@ -1150,7 +1150,7 @@ class Zoomies:
                  % vram.gb(est.margin)] + est.notes
         self.view.show_vram_estimate(
             est, "%s   ->   %s" % ("   |   ".join(parts), verdict), style,
-            "  ".join(notes))
+            "  ".join(notes), verdict=verdict)
 
     def _use_max_ctx(self):
         est = self._vram_est
