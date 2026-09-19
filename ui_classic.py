@@ -33,6 +33,7 @@ class ClassicLayout:
         self.entries, self.labels = {}, {}
         self.loaded_rows = {}             # Loaded table: row id -> LoadedModel
         self.procs = []
+        self._hist_key = None             # what the History table shows now
         self._vram_labels = {}            # luid -> value label beside its slider
         self._build()
 
@@ -609,6 +610,13 @@ class ClassicLayout:
         self._show_history(snap.get("history") or [])
 
     def _show_history(self, rows):
+        # 200 rows rewritten five times a second is work for nothing: the
+        # table only changes when a request is filed.
+        key = (len(rows), rows[0].get("time") if rows else "",
+               rows[0].get("model") if rows else "")
+        if key == self._hist_key:
+            return
+        self._hist_key = key
         existing = set(self.hist_tree.get_children(""))
         wanted = set()
         for i, row in enumerate(rows):

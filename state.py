@@ -42,6 +42,10 @@ SESSION_PATH = os.path.join(ROOT, "session.json")
 # rather than in the project folder because what is fastest depends on the
 # machine: the same model on different cards wants different flags.
 PRESETS_PATH = os.path.join(ROOT, "presets.json")
+# Finished requests, newest first. Kept so the numbers you measured this
+# morning are still there tomorrow - the metrics themselves only live as
+# long as the process that watched them.
+HISTORY_PATH = os.path.join(ROOT, "history.json")
 
 KEEP_FILES = 20                  # how many generated scripts / logs to retain
 
@@ -145,6 +149,18 @@ def load_presets():
 
 def save_presets(models):
     return write_json(PRESETS_PATH, {"version": 1, "models": models})
+
+
+def load_history(limit=None):
+    """Past requests, newest first. Never raises: a corrupt file costs the
+    history, not the app."""
+    rows = [r for r in (read_json(HISTORY_PATH, {}).get("rows") or [])
+            if isinstance(r, dict)]
+    return rows[:limit] if limit else rows
+
+
+def save_history(rows):
+    return write_json(HISTORY_PATH, {"version": 1, "rows": list(rows)})
 
 
 def preset_key(text):

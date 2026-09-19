@@ -12,10 +12,12 @@ controller as tk variables, and buttons call controller methods.
 """
 
 import collections
+import csv
+import datetime
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 import backends
 import metrics
@@ -76,8 +78,69 @@ def fmt_k(n):
     return "%dk" % round(k) if abs(k - round(k)) < 0.05 else "%.1fk" % k
 
 
+def fmt_tps(value):
+    """38.2 t/s, but 1,149 t/s - a decimal on a prompt-eval rate is noise,
+    and the line it sits on is narrow."""
+    if value is None:
+        return ""
+    return ("%s t/s" % format(int(round(value)), ",") if value >= 100
+            else "%.1f t/s" % value)
+
+
 def join(*parts):
     return " \u00b7 ".join(p for p in parts if p)
+
+
+def day_label(date):
+    """Today / Yesterday / 12 Sep, for the group rows in History."""
+    if not date:
+        return "Earlier"
+    try:
+        when = datetime.date.fromisoformat(date)
+    except ValueError:
+        return date
+    days = (datetime.date.today() - when).days
+    if days == 0:
+        return "Today"
+    if days == 1:
+        return "Yesterday"
+    return when.strftime("%d %b").lstrip("0")
+
+
+def short_model(row):
+    """qwen3.8:27b-q4_K_M on llama.cpp -> qwen3.8:27b-q4_K_M \u00b7 lcpp."""
+    short = {"llamacpp": "lcpp", "ollama": "oll"}
+    backend = row.get("backend") or ""
+    return join(row.get("model") or "-", short.get(backend, backend))
+
+
+def detail_lines(row):
+    """What the row hides until it is opened. Context is not repeated - it
+    is already in the row itself."""
+    out = []
+    if row.get("ttft") is not None:
+        out.append("TTFT " + metrics.fmt_ttft(row.get("ttft"),
+                                              row.get("ttft_upper")))
+    prompt = join("%s tok" % metrics.fmt_int(row["prompt_n"])
+                  if row.get("prompt_n") else "",
+                  "+%s cached" % metrics.fmt_int(row["prompt_cached"])
+                  if row.get("prompt_cached") else "",
+                  fmt_tps(row.get("prompt_tps")))
+    if prompt:
+        out.append("Prompt " + prompt)
+    output = join("%s tok" % metrics.fmt_int(row["n_gen"])
+                  if row.get("n_gen") else "",
+                  fmt_secs(row.get("gen_s")) or fmt_secs(row.get("runtime")))
+    if output:
+        out.append("Output " + output)
+    if row.get("kv"):
+        out.append("KV " + str(row["kv"]))
+    return out
+
+
+CSV_FIELDS = ("date", "time", "model", "backend", "gen_avg", "prompt_tps",
+              "ttft", "runtime", "n_gen", "n_tokens", "n_ctx", "kv",
+              "prompt_n", "prompt_cached", "prompt_s", "gen_s")
 
 
 class CompactLayout:
@@ -111,6 +174,9 @@ class CompactLayout:
         self._picked = None               # (backend, endpoint, label) chosen
         self._gpu_rows = []
         self._launch_t0 = 0.0
+        self._hist_filter = None          # a model name, or None for all
+        self._hist_key = None             # what the table currently shows
+        self._hist_rows = []              # the rows behind it, filtered
         self._styles()
         self._build()
         self.show("setup")
@@ -135,6 +201,16 @@ class CompactLayout:
                      font=("Segoe UI", 13, "bold"))
         st.configure("Big.TLabel", background=BG_PANEL, foreground=FG,
                      font=("Segoe UI", 20, "bold"))
+        # Smaller than the classic table: this one is read at a glance in a
+        # narrow window, and more rows on screen beats bigger type.
+        st.configure("Compact.Treeview", background=BG, fieldbackground=BG,
+                     foreground=FG, bordercolor=BORDER, borderwidth=0,
+                     font=("Segoe UI", 8), rowheight=self.px(19))
+        st.configure("Compact.Treeview.Heading", background=BG,
+                     foreground=FG_DIM, font=("Segoe UI", 8), relief="flat")
+        st.map("Compact.Treeview.Heading", background=[("active", BG)])
+        st.layout("Compact.Treeview", [("Compact.Treeview.treearea",
+                                        {"sticky": "nswe"})])
         # clam draws these light grey; the classic layout keeps its own.
         st.configure("Dark.Vertical.TScrollbar", background=BG_FIELD,
                      troughcolor=BG, bordercolor=BG, arrowcolor=FG_DIM,
@@ -764,8 +840,48 @@ class CompactLayout:
                 padx=(0, self.px(3)) if col == 0 else (self.px(3), 0))
 
     def _build_history(self, f):
-        self._placeholder(f, "History is still being built.")
-        self.history_lbl = self._line(f)
+        pad = self.px(12)
+        top = ttk.Frame(f)
+        top.pack(fill="x", padx=pad, pady=(self.px(8), 0))
+        self.hist_chips = ttk.Frame(top)
+        self.hist_chips.pack(fill="x")
+        self.hist_summary = ttk.Label(top, text="", style="Dim.TLabel")
+        self.hist_summary.pack(anchor="w", pady=(self.px(4), self.px(6)))
+
+        bar = ttk.Frame(f)
+        bar.pack(side="bottom", fill="x", padx=pad, pady=(self.px(6), pad))
+        for col in (0, 1):
+            bar.columnconfigure(col, weight=1, uniform="hb")
+        ttk.Button(bar, text="Export CSV", command=self._export_history).grid(
+            row=0, column=0, sticky="ew", padx=(0, self.px(4)))
+        ttk.Button(bar, text="Clear", command=self._clear_history).grid(
+            row=0, column=1, sticky="ew", padx=(self.px(4), 0))
+
+        wrap = ttk.Frame(f)
+        wrap.pack(fill="both", expand=True, padx=pad)
+        scroll = ttk.Scrollbar(wrap, orient="vertical",
+                               style="Dark.Vertical.TScrollbar")
+        scroll.pack(side="right", fill="y")
+        # The tree column carries time and model together: at this width one
+        # wide column reads better than two narrow ones, and it leaves room
+        # for a row's details to sit underneath it, indented.
+        self.hist_tree = ttk.Treeview(wrap, columns=("gen", "ctx"),
+                                      show="tree headings",
+                                      style="Compact.Treeview",
+                                      yscrollcommand=scroll.set)
+        self.hist_tree.heading("#0", text="Time \u00b7 model", anchor="w")
+        self.hist_tree.heading("gen", text="Gen", anchor="e")
+        self.hist_tree.heading("ctx", text="Ctx", anchor="e")
+        self.hist_tree.column("#0", width=self.px(150), minwidth=self.px(90),
+                              stretch=True)
+        self.hist_tree.column("gen", width=self.px(54), minwidth=self.px(40),
+                              stretch=False, anchor="e")
+        self.hist_tree.column("ctx", width=self.px(46), minwidth=self.px(36),
+                              stretch=False, anchor="e")
+        self.hist_tree.tag_configure("group", foreground=FG_DIM)
+        self.hist_tree.tag_configure("detail", foreground=FG_DIM)
+        self.hist_tree.pack(side="left", fill="both", expand=True)
+        scroll.configure(command=self.hist_tree.yview)
 
     def _build_procs(self, f):
         self._placeholder(f, "The process list is still being built. The "
@@ -1110,10 +1226,7 @@ class CompactLayout:
         self._show_speed(snap, status, history)
         self._show_gpus(snap)
         self._show_last(history[0] if history else None)
-        count = len(snap.get("history") or [])
-        text = "%d recent request%s." % (count, "" if count == 1 else "s")
-        if self.history_lbl.cget("text") != text:
-            self.history_lbl.configure(text=text)
+        self._show_history(history)
 
     def _show_speed(self, snap, status, history):
         model = snap.get("model") or ""
@@ -1124,7 +1237,7 @@ class CompactLayout:
             if value is None and history:
                 value = history[0].get("gen_avg")
             caption = "Generation \u00b7 last request"
-        self._set(self.gen_value, metrics.fmt(value, " t/s"))
+        self._set(self.gen_value, fmt_tps(value) or "-")
         self._set(self.gen_caption, join(caption, model))
         if status == "Processing prompt..." and snap.get("prompt_progress"):
             status = "Prompt %d%%" % round(100 * snap["prompt_progress"])
@@ -1132,7 +1245,7 @@ class CompactLayout:
                   foreground=OK_GREEN if status == "Generating..." else FG_DIM)
         self._set(self.ttft_value, metrics.fmt_ttft(snap.get("ttft"),
                                                     snap.get("ttft_upper")))
-        self._set(self.prompt_value, metrics.fmt(snap.get("prompt_tps"), " t/s"))
+        self._set(self.prompt_value, fmt_tps(snap.get("prompt_tps")) or "-")
         used, total = snap.get("n_tokens"), snap.get("n_ctx")
         if used and total:
             self.ctx_bar.configure(value=min(1000, int(1000.0 * used / total)))
@@ -1201,18 +1314,15 @@ class CompactLayout:
             "%s tok" % metrics.fmt_int(row["prompt_n"]) if row.get("prompt_n") else "",
             "+%s cached" % metrics.fmt_int(cached) if cached else "",
             fmt_secs(row.get("prompt_s")),
-            metrics.fmt(row.get("prompt_tps"), " t/s")
-            if row.get("prompt_tps") is not None else "")
+            fmt_tps(row.get("prompt_tps")))
         gen = join(
             "%s tok" % metrics.fmt_int(row["n_gen"]) if row.get("n_gen") else "",
             fmt_secs(row.get("gen_s")),
-            metrics.fmt(row.get("gen_avg"), " t/s")
-            if row.get("gen_avg") is not None else "")
+            fmt_tps(row.get("gen_avg")))
         values = {
             "Prompt": prompt,
             "Generation": gen,
-            "First 3 s": metrics.fmt(row.get("tg3s"), " t/s")
-            if row.get("tg3s") is not None else "",
+            "First 3 s": fmt_tps(row.get("tg3s")),
             "TTFT": metrics.fmt_ttft(row.get("ttft"), row.get("ttft_upper"))
             if row.get("ttft") is not None else "",
             "Total": fmt_secs(row.get("runtime")) or "",
@@ -1225,6 +1335,112 @@ class CompactLayout:
             else:
                 lab.grid_remove()
                 val.grid_remove()
+
+    # ---- history ---------------------------------------------------------
+
+    def _show_history(self, rows):
+        """Rebuild only when the rows or the filter actually changed: this
+        is called five times a second."""
+        key = (len(rows), rows[0].get("time") if rows else "",
+               rows[0].get("model") if rows else "", self._hist_filter)
+        if key == self._hist_key:
+            return
+        self._hist_key = key
+        self._paint_hist_chips(rows)
+        kept = [r for r in rows if self._hist_filter in (None, r.get("model"))]
+        self._hist_rows = kept
+        speeds = [r["gen_avg"] for r in kept if r.get("gen_avg")]
+        self.hist_summary.configure(text=join(
+            "%d of %d kept" % (len(kept), len(rows)) if len(kept) != len(rows)
+            else "%d request%s" % (len(rows), "" if len(rows) == 1 else "s"),
+            "avg %.1f t/s" % (sum(speeds) / len(speeds)) if speeds else ""))
+
+        self.hist_tree.delete(*self.hist_tree.get_children(""))
+        if not kept:
+            self.hist_tree.insert("", "end", text="Nothing recorded yet",
+                                  tags=("group",))
+            return
+        day = None
+        for i, row in enumerate(kept):
+            if row.get("date") != day:
+                day = row.get("date")
+                self.hist_tree.insert("", "end", text=day_label(day),
+                                      tags=("group",))
+            node = self.hist_tree.insert(
+                "", "end", iid="r%d" % i, tags=("row",),
+                text=join(row.get("time", "")[:5], short_model(row)),
+                values=(metrics.fmt(row.get("gen_avg")),
+                        fmt_k(row.get("n_tokens"))))
+            for text in detail_lines(row):
+                self.hist_tree.insert(node, "end", text=text, tags=("detail",))
+
+    def _paint_hist_chips(self, rows):
+        names, seen = [], set()
+        for row in rows:                     # newest first, so is the order
+            name = row.get("model")
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        wanted = ["All"] + names[:5]
+        if [c.cget("text") for c in self.hist_chips.winfo_children()] != wanted:
+            for child in self.hist_chips.winfo_children():
+                child.destroy()
+            for name in wanted:
+                chip = self._toggle(self.hist_chips, name,
+                                    lambda n=name: self._filter_history(n))
+                chip.pack(side="left", padx=(0, self.px(4)), pady=(0, self.px(4)))
+        for chip in self.hist_chips.winfo_children():
+            self._paint_toggle(chip, chip.cget("text")
+                               == (self._hist_filter or "All"))
+
+    def _filter_history(self, name):
+        self._hist_filter = None if name == "All" else name
+        self._hist_key = None                # force a rebuild
+        self._show_history(self._all_history())
+
+    def _all_history(self):
+        return (self.app.metrics.snapshot().get("history") or []) \
+            if self.app.metrics else []
+
+    def _export_history(self):
+        rows = self._hist_rows
+        if not rows:
+            self.app.set_status("Nothing to export.", "Warn.TLabel")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Export history",
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+            initialfile="zoomies-history-%s.csv"
+            % datetime.date.today().isoformat())
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS,
+                                        extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+        except OSError as exc:
+            self.app.set_status("Could not write it: %s" % exc, "Bad.TLabel")
+            return
+        self.app.set_status("Exported %d request%s." % (
+            len(rows), "" if len(rows) == 1 else "s"), "Ok.TLabel")
+
+    def _clear_history(self):
+        if not self.app.metrics:
+            return
+        if not messagebox.askyesno(
+                "Clear history?",
+                "Forget all %d recorded request%s? The models and their "
+                "settings are not touched." % (
+                    len(self._all_history()),
+                    "" if len(self._all_history()) == 1 else "s"),
+                parent=self.root):
+            return
+        self.app.metrics.clear_history()
+        self._hist_key = None
+        self._show_history([])
 
     def show_procs(self, items):
         if items is None:

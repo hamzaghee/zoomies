@@ -96,7 +96,8 @@ SLOTS_POLL_BUSY = 0.2         # ...while a request is running
 PORT_REFRESH_SECONDS = 5.0    # how often to look for new llama-server ports
 SLOTS_FRESH = 3.0             # slots data this recent outranks log lines
 GPU_SAMPLE_PREFIX = "zoomies_gpu_"
-HISTORY_MAXLEN = 25
+HISTORY_MAXLEN = 200           # kept in history.json, so restarts keep them
+HISTORY_SAVE_SECONDS = 5.0     # at most this often, and once more on stop
 IDLE_AFTER = 5.0            # seconds of quiet before "Idle" is shown
 
 
@@ -266,7 +267,10 @@ class Metrics:
         self.port_finder = port_finder or llama_server_ports
         self.model_namer = model_namer or (lambda backend, port=0: "")
         self.lock = threading.Lock()
-        self.history = deque(maxlen=HISTORY_MAXLEN)
+        self.history = deque(state.load_history(HISTORY_MAXLEN),
+                             maxlen=HISTORY_MAXLEN)
+        self._history_dirty = False
+        self._history_saved = 0.0
         self.threads = []
         self._sampler_lock = threading.Lock()
         self._sampler = None
@@ -313,6 +317,7 @@ class Metrics:
 
     def stop(self):
         self.shutdown.set()
+        self.save_history(force=True)
         self._kill_sampler()
         for t in self.threads:
             t.join(timeout=2)
@@ -320,6 +325,27 @@ class Metrics:
         if self._our_samples:        # a handle that was still closing
             time.sleep(0.4)
             self.cleanup()
+
+    def save_history(self, force=False):
+        """Write history.json, at most every few seconds. Called from the
+        slots loop and once more on the way out, never with the lock held:
+        a file write must not stall a request being timed."""
+        now = time.time()
+        with self.lock:
+            if not self._history_dirty or (
+                    not force and now - self._history_saved < HISTORY_SAVE_SECONDS):
+                return
+            rows = list(self.history)
+            self._history_dirty = False
+            self._history_saved = now
+        state.save_history(rows)
+
+    def clear_history(self):
+        with self.lock:
+            self.history.clear()
+            self._history_dirty = True
+            self._history_saved = 0.0
+        self.save_history(force=True)
 
     def snapshot(self):
         with self.lock:
@@ -492,6 +518,7 @@ class Metrics:
                 for slot in fetch_slots(port):
                     self._observe_slot(port, backend, slot, time.time(), kv=kv)
             self._reap_idle()
+            self.save_history()
             # Poll faster while a request runs, so short ones are timed closely.
             self.shutdown.wait(SLOTS_POLL_BUSY if self._tracks else SLOTS_POLL_SECONDS)
 
@@ -661,8 +688,13 @@ class Metrics:
         if s.get("n_gen") is None or s.get("filed"):
             return                      # nothing generated, or already filed
         s["filed"] = True
+        self._history_dirty = True
+        now = datetime.now()
         self.history.appendleft({
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": now.strftime("%H:%M:%S"),
+            # Kept apart from the time so History can group by day without
+            # parsing anything, and so a restart knows which day a row is.
+            "date": now.strftime("%Y-%m-%d"),
             "backend": s.get("backend") or backend,
             # Settled when the request started. Naming it here would mean
             # asking a backend while holding the lock, and asking too late.
