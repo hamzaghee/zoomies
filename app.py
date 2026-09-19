@@ -11,10 +11,12 @@ Threading model, copied from the Ollama Monitor because it works:
     so shutdown is immediate rather than up to one poll interval late.
 """
 
+import argparse
 import ctypes
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -29,7 +31,9 @@ import processes
 import reasoning
 import runner
 import state
+import ui_classic
 import vram
+from ui_common import BG, BG_PANEL, BORDER, FG, FONT, FONT_MONO, apply_style
 
 try:
     import optimizer
@@ -38,30 +42,17 @@ except ImportError:          # the optimizer phase has not landed yet
 
 APP_TITLE = "Zoomies"
 
-# Same palette as the Ollama Monitor, so the two tools look like siblings.
-BG = "#1e1e1e"
-BG_PANEL = "#252526"
-BG_FIELD = "#2d2d30"
-FG = "#e0e0e0"
-FG_DIM = "#9a9a9a"
-ACCENT = "#4fc1ff"
-BORDER = "#3a3d41"
-OK_GREEN = "#6ac47a"
-WARN = "#e0b050"
-BAD = "#e06c75"
+# Every layout draws the same controller. The name is what config.json and
+# --layout use; the first entry is the default.
+LAYOUTS = {
+    "classic": ui_classic.ClassicLayout,
+}
 
-FONT = ("Segoe UI", 9)
-FONT_BOLD = ("Segoe UI", 9, "bold")
-FONT_MONO = ("Consolas", 9)
+# What a layout switch carries to the next process, deleted once read.
+HANDOFF_PATH = os.path.join(state.ROOT, "handoff.json")
 
 POLL_SECONDS = 2.0
 REFRESH_MS = 200
-
-
-def human_bytes(n):
-    if not n:
-        return "-"
-    return "%.1f GB" % (n / 1024.0 ** 3)
 
 
 def enable_dpi_awareness():
@@ -121,10 +112,16 @@ def dark_titlebar(root):
 
 
 class Zoomies:
-    def __init__(self, root):
+    def __init__(self, root, layout=None):
         self.root = root
         self.cfg = state.load_config()
         self.session = state.load_session()
+        if layout in LAYOUTS:
+            self.cfg["layout"] = layout           # asked for by name: keep it
+        else:
+            layout = self.cfg.get("layout")
+        self.layout_name = layout if layout in LAYOUTS else next(iter(LAYOUTS))
+        self._restarting = False
 
         self.shutdown = threading.Event()
         self.lock = threading.Lock()
@@ -138,7 +135,8 @@ class Zoomies:
         self.model_cache = {}
         self._model_req = 0
         self._announce_models = False
-        self.loaded_rows = {}             # Loaded table: row id -> LoadedModel
+        self._model_index = -1            # into self.models; -1 when none
+        self.loaded_items = []            # LoadedModels as last shown
         # port -> the model last seen on it, so a request can still be named
         # after the server that served it has gone.
         self._port_names = {}
@@ -154,7 +152,7 @@ class Zoomies:
         self._kv_choice = backends.KV_CACHE_START     # remembered across toggles
         self._reasoning_is_variant = False
         self.opt_result = None
-        self._vram_rows = {}              # luid -> (DoubleVar, value label)
+        self._vram_rows = {}              # luid -> DoubleVar, GB used by others
         self._vram_manual = set()         # sliders the user has moved
         self._vram_req = 0
         self._vram_after = None
@@ -168,9 +166,15 @@ class Zoomies:
         self._looking_up = False          # a docs lookup is running
         self._auto_lookup = False         # started by picking a model
 
+        self.procs = []
+        self._procs_busy = False
+
         self.metrics = None
-        self._build_style()
-        self._build_widgets()
+        layout_cls = LAYOUTS[self.layout_name]
+        self._build_style(layout_cls)
+        self._build_vars()
+        self.view = layout_cls(self)
+        self._wire()
 
         state.ensure_dirs()
         state.sweep_old_files(state.SCRIPT_DIR)
@@ -198,7 +202,7 @@ class Zoomies:
         """Design sizes are written for a 100% display; multiply for this one."""
         return int(round(n * self.scale))
 
-    def _build_style(self):
+    def _build_style(self, layout_cls):
         self.root.title(APP_TITLE)
         self.root.configure(bg=BG)
 
@@ -209,7 +213,8 @@ class Zoomies:
         # physical size. Raw pixel measurements still need px() by hand.
         self.root.tk.call("tk", "scaling", dpi / 72.0)
 
-        want_w, want_h = self.px(980), self.px(800)
+        want_w, want_h = (self.px(n) for n in layout_cls.size)
+        min_w, min_h = (self.px(n) for n in layout_cls.min_size)
         max_w = int(self.root.winfo_screenwidth() * 0.92)
         max_h = int(self.root.winfo_screenheight() * 0.92)
         width, height = min(want_w, max_w), min(want_h, max_h)
@@ -217,496 +222,106 @@ class Zoomies:
             width, height,
             max(0, (self.root.winfo_screenwidth() - width) // 2),
             max(0, (self.root.winfo_screenheight() - height) // 3)))
-        self.root.minsize(min(self.px(780), max_w), min(self.px(560), max_h))
+        self.root.minsize(min(min_w, max_w), min(min_h, max_h))
         dark_titlebar(self.root)
+        apply_style(self.root, self.px)
 
-        st = ttk.Style()
-        st.theme_use("clam")        # the only built-in theme that lets us
-                                    # recolour everything on Windows
-        st.configure(".", background=BG, foreground=FG, font=FONT,
-                     fieldbackground=BG_FIELD, bordercolor=BORDER)
-        st.configure("TFrame", background=BG)
-        st.configure("Panel.TFrame", background=BG_PANEL)
-        st.configure("TLabel", background=BG, foreground=FG)
-        st.configure("Dim.TLabel", background=BG, foreground=FG_DIM)
-        st.configure("Head.TLabel", background=BG, foreground=ACCENT,
-                     font=FONT_BOLD)
-        st.configure("Off.TLabel", background=BG, foreground="#5a5a5a")
-        st.configure("Warn.TLabel", background=BG, foreground=WARN)
-        st.configure("Bad.TLabel", background=BG, foreground=BAD)
-        st.configure("Ok.TLabel", background=BG, foreground=OK_GREEN)
-        st.configure("TButton", background=BG_FIELD, foreground=FG,
-                     bordercolor=BORDER, focuscolor=BG, padding=(10, 4))
-        st.map("TButton",
-               background=[("active", "#3e3e42"), ("disabled", "#2a2a2a")],
-               foreground=[("disabled", "#666666")])
-        st.configure("Go.TButton", background="#0e639c", foreground="#ffffff",
-                     font=FONT_BOLD, padding=(16, 6))
-        st.map("Go.TButton",
-               background=[("active", "#1177bb"), ("disabled", "#2a2a2a")],
-               foreground=[("disabled", "#666666")])
-        st.configure("TRadiobutton", background=BG, foreground=FG)
-        st.map("TRadiobutton", background=[("active", BG)],
-               foreground=[("disabled", "#666666")])
-        st.configure("TCheckbutton", background=BG, foreground=FG)
-        st.map("TCheckbutton", background=[("active", BG)])
-        st.configure("TEntry", fieldbackground=BG_FIELD, foreground=FG,
-                     insertcolor=FG, bordercolor=BORDER, padding=(4, 2))
-        st.map("TEntry",
-               fieldbackground=[("disabled", "#242427")],
-               foreground=[("disabled", "#5a5a5a")],
-               bordercolor=[("disabled", "#303034")])
-        st.configure("TCombobox", fieldbackground=BG_FIELD, background=BG_FIELD,
-                     foreground=FG, arrowcolor=FG, bordercolor=BORDER)
-        st.map("TCombobox", fieldbackground=[("readonly", BG_FIELD)],
-               foreground=[("disabled", "#666666")])
-        st.configure("Treeview", background=BG_PANEL, fieldbackground=BG_PANEL,
-                     foreground=FG, bordercolor=BORDER,
-                     rowheight=self.px(22))
-        st.configure("Treeview.Heading", background=BG_FIELD, foreground=ACCENT,
-                     font=FONT_BOLD)
-        st.map("Treeview", background=[("selected", "#094771")],
-               foreground=[("selected", "#ffffff")])
-        st.configure("TLabelframe", background=BG, bordercolor=BORDER)
-        st.configure("TLabelframe.Label", background=BG, foreground=ACCENT,
-                     font=FONT_BOLD)
-        st.configure("TSeparator", background=BORDER)
-        st.configure("Zoom.Horizontal.TProgressbar",
-                     background=ACCENT, troughcolor=BG_FIELD,
-                     bordercolor=BORDER, lightcolor=ACCENT,
-                     darkcolor=ACCENT, thickness=self.px(12))
-        st.configure("TNotebook", background=BG, bordercolor=BORDER,
-                     tabmargins=(2, 4, 2, 0))
-        st.configure("TNotebook.Tab", background=BG_FIELD,
-                     foreground=FG_DIM, padding=(14, 5))
-        st.map("TNotebook.Tab",
-               background=[("selected", BG_PANEL)],
-               foreground=[("selected", ACCENT)])
-
-        self.root.option_add("*TCombobox*Listbox.background", BG_FIELD)
-        self.root.option_add("*TCombobox*Listbox.foreground", FG)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", "#094771")
-
-    def _build_widgets(self):
-        pad = {"padx": 8, "pady": 3}
-
-        # ---- top bar -------------------------------------------------
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(top, text="Zoomies", style="Head.TLabel",
-                  font=("Segoe UI", 12, "bold")).pack(side="left")
+    def _build_vars(self):
+        """Everything the form holds, owned here rather than by a layout, so
+        the logic reads the same values whichever layout draws them."""
         self.on_top = tk.BooleanVar(value=self.cfg.get("always_on_top", False))
-        ttk.Checkbutton(top, text="Always on top", variable=self.on_top,
-                        command=self._toggle_top).pack(side="right")
         self.unload_exit = tk.BooleanVar(value=self.cfg.get("unload_on_exit", False))
-        ttk.Checkbutton(top, text="Unload on exit",
-                        variable=self.unload_exit).pack(side="right", padx=(0, 12))
-        ttk.Button(top, text="Sync opencode...",
-                   command=self._sync_opencode).pack(side="right", padx=(0, 12))
+        self.one_at_a_time = tk.BooleanVar(
+            value=self.cfg.get("one_model_at_a_time", True))
 
-        # ---- backend + model ----------------------------------------
-        pick = ttk.Frame(self.root)
-        pick.pack(fill="x", **pad)
-        pick.columnconfigure(1, weight=1)
-
-        ttk.Label(pick, text="Backend").grid(row=0, column=0, sticky="w")
-        row = ttk.Frame(pick)
-        row.grid(row=0, column=1, sticky="ew")
         last = self.cfg.get("last_backend", "ollama")
         if last not in backends.REGISTRY:       # e.g. the removed Unsloth backend
             last = "ollama"
         self.backend_var = tk.StringVar(value=last)
-        self.backend_status = {}
-        for name in ("ollama", "llamacpp"):
-            be = backends.get(name)
-            rb = ttk.Radiobutton(
-                row, text=(be.display_name if be else name.title()),
-                value=name, variable=self.backend_var,
-                command=self._on_backend_change)
-            rb.pack(side="left", padx=(0, 14))
-            if be is None:
-                rb.state(["disabled"])
-            lbl = ttk.Label(row, text="", style="Dim.TLabel")
-            lbl.pack(side="left", padx=(0, 18))
-            self.backend_status[name] = lbl
-
-        ttk.Label(pick, text="Folder").grid(row=1, column=0, sticky="w", pady=3)
-        frow = ttk.Frame(pick)
-        frow.grid(row=1, column=1, sticky="ew", pady=3)
-        frow.columnconfigure(0, weight=1)
         self.folder_var = tk.StringVar()
-        self.folder_entry = ttk.Entry(frow, textvariable=self.folder_var)
-        self.folder_entry.grid(row=0, column=0, sticky="ew")
-        self.browse_btn = ttk.Button(frow, text="Browse...", command=self._browse)
-        self.browse_btn.grid(row=0, column=1, padx=(6, 0))
-        ttk.Button(frow, text="Open", command=self._open_folder).grid(
-            row=0, column=2, padx=(6, 0))
-        ttk.Button(frow, text="Rescan", command=self._reload_models).grid(
-            row=0, column=3, padx=(6, 0))
-        self.download_btn = ttk.Button(frow, text="Download...",
-                                       command=self._download)
-        self.download_btn.grid(row=0, column=4, padx=(6, 0))
-
-        ttk.Label(pick, text="Model").grid(row=2, column=0, sticky="w", pady=3)
         self.model_var = tk.StringVar()
-        self.model_box = ttk.Combobox(pick, textvariable=self.model_var,
-                                      state="readonly")
-        self.model_box.grid(row=2, column=1, sticky="ew", pady=3)
-        self.model_box.bind("<<ComboboxSelected>>",
-                            lambda e: self._model_selected())
-
-        # ---- settings ------------------------------------------------
-        box = ttk.LabelFrame(self.root, text=" Settings ")
-        box.pack(fill="x", padx=8, pady=(8, 3))
-
-        bar = ttk.Frame(box)
-        bar.pack(fill="x", padx=8, pady=(6, 2))
-        self.apply_btn = ttk.Button(bar, text="Fill from docs",
-                                    command=self._apply_optimal)
-        self.apply_btn.pack(side="left")
-        if optimizer is None:
-            self.apply_btn.state(["disabled"])
-        ttk.Label(bar, text="Mode").pack(side="left", padx=(14, 4))
         self.mode_var = tk.StringVar()
-        self.mode_box = ttk.Combobox(bar, textvariable=self.mode_var,
-                                     state="readonly", width=22)
-        self.mode_box.pack(side="left")
-        self.mode_box.bind("<<ComboboxSelected>>", lambda e: self._mode_changed())
-        ttk.Label(bar, text="Reasoning").pack(side="left", padx=(14, 4))
         self.reason_var = tk.StringVar()
-        self.reason_box = ttk.Combobox(bar, textvariable=self.reason_var,
-                                       state="readonly", width=14)
-        self.reason_box.pack(side="left")
-        self.reason_box.bind("<<ComboboxSelected>>",
-                             lambda e: self._reason_changed())
-        ttk.Label(bar, text="Preset").pack(side="left", padx=(14, 4))
         self.preset_var = tk.StringVar()
-        self.preset_box = ttk.Combobox(bar, textvariable=self.preset_var,
-                                       state="readonly", width=18)
-        self.preset_box.pack(side="left")
-        self.preset_box.bind("<<ComboboxSelected>>",
-                             lambda e: self._preset_chosen())
-        ttk.Button(bar, text="Clear", command=self._clear_settings).pack(
-            side="left", padx=(10, 0))
-        # Answers are saved permanently once found, so there has to be a way
-        # to go back and look again when the docs change.
-        ttk.Button(bar, text="Re-read docs",
-                   command=lambda: self._apply_optimal(force=True)).pack(
-            side="left", padx=(6, 0))
+        self.kv_var = tk.StringVar(value=backends.KV_CACHE_START)
 
-        grid = ttk.Frame(box)
-        grid.pack(fill="x", padx=8, pady=4)
-        self.vars, self.entries, self.labels, self.dirty = {}, {}, {}, {}
-
-        # Four label/entry column pairs. The entry columns share one uniform
-        # group so every field is exactly the same width - without that, grid
-        # hands the leftovers to whichever column has the longest label and
-        # the row comes out ragged.
-        for col in range(4):
-            grid.columnconfigure(col * 2, weight=0)
-            grid.columnconfigure(col * 2 + 1, weight=1, uniform="field")
-
-        def make_field(key, row, col, span=1):
-            lab = ttk.Label(grid, text=backends.SETTING_TEXT[key],
-                            style="Dim.TLabel", anchor="e")
-            lab.grid(row=row, column=col * 2, sticky="e", padx=(0, 6), pady=3)
+        self.vars, self.dirty = {}, {}
+        keys = [k for row in backends.SETTING_ROWS for k in row if k]
+        for key in keys + list(backends.SETTING_WIDE):
             var = tk.StringVar()
-            # Small minimum width: the columns stretch to fill the window
-            # anyway, and the default 20 characters made the grid wider
-            # than the window at its minimum size.
-            ent = ttk.Entry(grid, textvariable=var, justify="left", width=8)
-            ent.grid(row=row, column=col * 2 + 1, sticky="ew",
-                     padx=(0, self.px(18)), pady=3,
-                     columnspan=(span * 2 - 1) if span > 1 else 1)
             var.trace_add("write", lambda *a, k=key: self._mark_dirty(k))
-            self.vars[key], self.entries[key], self.labels[key] = var, ent, lab
+            self.vars[key] = var
             self.dirty[key] = False
 
-        row = 0
-        for row, keys in enumerate(backends.SETTING_ROWS):
-            for col, key in enumerate(keys):
-                if key:
-                    make_field(key, row, col)
-        # KV cache takes the free cell beside Parallel: it is a load-time
-        # setting like its neighbours, and the top bar has no room left.
-        kv_row = len(backends.SETTING_ROWS) - 1
-        self.kv_label = ttk.Label(grid, text="KV cache", style="Dim.TLabel",
-                                  anchor="e")
-        self.kv_label.grid(row=kv_row, column=6, sticky="e", padx=(0, 6), pady=3)
-        self.kv_var = tk.StringVar(value=backends.KV_CACHE_START)
-        self.kv_box = ttk.Combobox(grid, textvariable=self.kv_var,
-                                   state="readonly", width=8,
-                                   values=backends.KV_CACHE_CHOICES)
-        self.kv_box.grid(row=kv_row, column=7, sticky="ew",
-                         padx=(0, self.px(18)), pady=3)
-        self.kv_box.bind("<<ComboboxSelected>>", lambda e: self._kv_changed())
-
-        for key in backends.SETTING_WIDE:
-            row += 1
-            make_field(key, row, 0, span=4)
-        # --chat-template-file changes which template sets the levels.
-        self.entries["extra_flags"].bind(
-            "<FocusOut>", lambda e: self._refresh_reasoning())
-
-        self.source_lbl = ttk.Label(box, text="", style="Dim.TLabel",
-                                    wraplength=self.px(940), justify="left")
-        self.source_lbl.pack(fill="x", padx=8, pady=(2, 0))
-        self.notes_lbl = ttk.Label(box, text="", style="Warn.TLabel",
-                                   wraplength=self.px(940), justify="left")
-        self.notes_lbl.pack(fill="x", padx=8, pady=(2, 6))
-        self._build_vram(box)
-
-        act = ttk.Frame(box)
-        act.pack(fill="x", padx=8, pady=(0, 8))
-        self.load_btn = ttk.Button(act, text="Load model", style="Go.TButton",
-                                   command=self._load)
-        self.load_btn.pack(side="left")
-        ttk.Button(act, text="Preview script",
-                   command=self._preview).pack(side="left", padx=(8, 0))
-        self.one_at_a_time = tk.BooleanVar(
-            value=self.cfg.get("one_model_at_a_time", True))
-        ttk.Checkbutton(act, text="One model at a time",
-                        variable=self.one_at_a_time).pack(side="left", padx=(12, 0))
+    def _wire(self):
+        """Hooks that need both the variables and a layout to report to."""
+        for key in ("context_length", "gpu_layers", "parallel", "extra_flags"):
+            self.vars[key].trace_add("write", lambda *a: self._schedule_vram())
+        self.kv_var.trace_add("write", lambda *a: self._schedule_vram())
         # With it on, the model loaded now is unloaded first, so its VRAM
         # stops counting as "in use by other apps".
         self.one_at_a_time.trace_add("write", lambda *a: self._vram_follow_live(True))
-        self.status_lbl = ttk.Label(act, text="", style="Dim.TLabel")
-        self.status_lbl.pack(side="left", padx=(16, 0))
 
-        # ---- loaded --------------------------------------------------
-        lbox = ttk.LabelFrame(self.root, text=" Loaded ")
-        lbox.pack(fill="x", padx=8, pady=3)
-        cols = ("model", "backend", "vram", "context", "endpoint", "pid", "until")
-        widths = (300, 90, 80, 80, 150, 60, 80)
-        self.tree = ttk.Treeview(lbox, columns=cols, show="headings", height=3)
-        for col, w in zip(cols, widths):
-            self.tree.heading(col, text=col.title())
-            self.tree.column(col, width=self.px(w), minwidth=self.px(40),
-                             anchor="w" if col in ("model", "endpoint") else "center")
-        self.tree.pack(fill="x", padx=8, pady=(6, 2))
-        self.tree.tag_configure("foreign", foreground=FG_DIM)
-        self.tree.tag_configure("ours", foreground=FG)
-        self.tree.bind("<Double-1>", lambda e: self._unload_selected())
+        handoff = self._read_handoff()
+        if handoff.get("backend") in backends.REGISTRY:
+            self.backend_var.set(handoff["backend"])
+        if handoff.get("kv"):
+            self._kv_choice = handoff["kv"]
+        self._handoff_model = handoff.get("model_id") or ""
+        # Typed values go in as typed (white, kept across a model change);
+        # docs and preset values are simply looked up again.
+        for key, value in (handoff.get("typed") or {}).items():
+            if key in self.vars:
+                self.vars[key].set(value)
 
-        lbar = ttk.Frame(lbox)
-        lbar.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(lbar, text="Unload selected",
-                   command=self._unload_selected).pack(side="left")
-        ttk.Button(lbar, text="Unload all",
-                   command=self._unload_all).pack(side="left", padx=(8, 0))
-        ttk.Button(lbar, text="Temporary tags...",
-                   command=self._manage_tags).pack(side="left", padx=(8, 0))
-        self.vram_lbl = ttk.Label(lbar, text="", style="Dim.TLabel")
-        self.vram_lbl.pack(side="right")
-
-        self._build_live(self.root)
-
+        self._refresh_apply_btn()
         self._on_backend_change(initial=True)
         self._toggle_top()
 
-    def _build_live(self, parent):
-        """Compact live-metrics strip plus a tabbed History/Output pane.
+    # ------------------------------------------------------------------
+    # layouts
+    # ------------------------------------------------------------------
 
-        Tabs rather than three stacked panes: the window is already tall, and
-        History and Output are rarely both wanted at once.
+    def other_layouts(self):
+        return [name for name in LAYOUTS if name != self.layout_name]
+
+    def switch_layout(self, name):
+        """Reopen Zoomies in another layout.
+
+        A restart rather than rebuilding the window in place: the worker
+        threads write to the panels as they run, and swapping every widget
+        under them is far riskier than a second of start-up. Loaded models
+        keep running - they always outlive the window - and whatever you
+        typed into the form is handed to the new process.
         """
-        box = ttk.LabelFrame(parent, text=" Live ")
-        box.pack(fill="both", expand=True, padx=8, pady=3)
-
-        top = ttk.Frame(box)
-        top.pack(fill="x", padx=8, pady=(6, 2))
-        self.live_status = ttk.Label(top, text="Waiting for activity...",
-                                     style="Head.TLabel")
-        self.live_status.pack(side="left")
-        self.live_gpu = ttk.Label(top, text="", style="Dim.TLabel")
-        self.live_gpu.pack(side="right")
-
-        row = ttk.Frame(box)
-        row.pack(fill="x", padx=8, pady=(0, 2))
-        self.live_stats = {}
-        for key, label in (("prompt", "Prompt eval (avg)"), ("ttft", "TTFT"),
-                           ("gen", "Generation"), ("tokens", "Generated"),
-                           ("kv", "KV cache")):
-            cell = ttk.Frame(row)
-            cell.pack(side="left", padx=(0, self.px(22)))
-            ttk.Label(cell, text=label, style="Dim.TLabel").pack(anchor="w")
-            value = ttk.Label(cell, text="-", style="TLabel",
-                              font=("Consolas", 11, "bold"))
-            value.pack(anchor="w")
-            self.live_stats[key] = value
-
-        ctx = ttk.Frame(box)
-        ctx.pack(fill="x", padx=8, pady=(2, 6))
-        ttk.Label(ctx, text="Context", style="Dim.TLabel",
-                  width=9).pack(side="left")
-        self.ctx_bar = ttk.Progressbar(ctx, mode="determinate", maximum=1000,
-                                       style="Zoom.Horizontal.TProgressbar")
-        self.ctx_bar.pack(side="left", fill="x", expand=True)
-        self.ctx_label = ttk.Label(ctx, text="-", style="Dim.TLabel")
-        self.ctx_label.pack(side="left", padx=(8, 0))
-
-        tabs = ttk.Notebook(box)
-        tabs.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.tabs = tabs
-
-        hist = ttk.Frame(tabs)
-        tabs.add(hist, text="  History  ")
-        cols = ("time", "backend", "model", "ttft", "prompt", "gen",
-                "runtime", "tokens", "kv")
-        widths = (65, 75, 185, 60, 95, 90, 65, 245, 70)
-        headings = {"time": "Time", "backend": "Backend", "model": "Model",
-                    "ttft": "TTFT", "prompt": "Prompt t/s (avg)",
-                    "gen": "Gen t/s (avg)", "runtime": "Runtime",
-                    "tokens": "Tokens (context used)", "kv": "KV"}
-        self.hist_tree = ttk.Treeview(hist, columns=cols, show="headings",
-                                      height=7)
-        for col, w in zip(cols, widths):
-            self.hist_tree.heading(col, text=headings[col])
-            self.hist_tree.column(col, width=self.px(w), minwidth=self.px(40),
-                                  anchor="w" if col in ("model", "tokens")
-                                  else "center")
-        self.hist_tree.pack(fill="both", expand=True)
-
-        out = ttk.Frame(tabs)
-        tabs.add(out, text="  Output  ")
-        bar = ttk.Frame(out)
-        bar.pack(fill="x", pady=(4, 2))
-        ttk.Button(bar, text="Open log", command=self._open_log).pack(side="right")
-        ttk.Button(bar, text="Open folder",
-                   command=self._open_scripts).pack(side="right", padx=(0, 6))
-        wrap = ttk.Frame(out)
-        wrap.pack(fill="both", expand=True)
-        self.out = tk.Text(wrap, height=6, bg=BG_PANEL, fg=FG, font=FONT_MONO,
-                           relief="flat", wrap="none", insertbackground=FG,
-                           highlightthickness=1, highlightbackground=BORDER)
-        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.out.yview)
-        self.out.configure(yscrollcommand=sb.set, state="disabled")
-        self.out.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.out.tag_configure("err", foreground=BAD)
-        self.out.tag_configure("note", foreground=ACCENT)
-
-        # Every llama.cpp / Ollama process, including ones no API reports -
-        # a terminal chat, a server whose launcher exited - so a slow machine
-        # can be explained and cleaned up without Task Manager.
-        pw = ttk.Frame(tabs)
-        tabs.add(pw, text="  Processes  ")
-        self.procs_tab = pw
-        pbar = ttk.Frame(pw)
-        pbar.pack(fill="x", pady=(4, 2))
-        ttk.Button(pbar, text="Refresh",
-                   command=self._refresh_processes).pack(side="left")
-        ttk.Button(pbar, text="Clean up leftovers",
-                   command=self._clean_leftovers).pack(side="left", padx=(8, 0))
-        ttk.Button(pbar, text="End selected",
-                   command=self._end_selected).pack(side="left", padx=(8, 0))
-        self.procs_lbl = ttk.Label(pbar, text="", style="Dim.TLabel")
-        self.procs_lbl.pack(side="left", padx=(16, 0))
-        cols = ("what", "ram", "pid", "started", "parent")
-        widths = (560, 75, 65, 95, 120)
-        headings = {"what": "What it is", "ram": "RAM", "pid": "PID",
-                    "started": "Started", "parent": "Started by"}
-        self.proc_tree = ttk.Treeview(pw, columns=cols, show="headings", height=7)
-        for col, w in zip(cols, widths):
-            self.proc_tree.heading(col, text=headings[col])
-            self.proc_tree.column(col, width=self.px(w), minwidth=self.px(40),
-                                  anchor="w" if col in ("what", "parent") else "center")
-        self.proc_tree.pack(fill="both", expand=True)
-        self.proc_tree.tag_configure("leftover", foreground=WARN)
-        self.proc_tree.tag_configure("protected", foreground=FG_DIM)
-        self.procs = []
-        self._procs_busy = False
-        tabs.bind("<<NotebookTabChanged>>",
-                  lambda e: self._refresh_processes()
-                  if tabs.select() == str(pw) else None)
-        self.tabs = tabs
-
-    def _refresh_live(self):
-        snap = self.metrics.snapshot()
-
-        backend = snap.get("backend") or ""
-        label = backend and (backends.get(backend).display_name
-                             if backends.get(backend) else backend)
-        # The model too, not just the backend: with servers coming and going
-        # under a benchmark run, "which model is this" is the first thing
-        # anyone looking at these numbers wants to know.
-        if label and snap.get("model"):
-            label = "%s   -   %s" % (label, snap["model"])
-        status = snap.get("status") or ""
-        self.live_status.configure(
-            text="%s%s" % (status, "   -   %s" % label if label else ""),
-            style="Ok.TLabel" if status == "Generating..." else "Head.TLabel")
-
-        self.live_stats["prompt"].configure(
-            text=metrics.fmt(snap.get("prompt_tps"), " t/s"))
-        self.live_stats["ttft"].configure(
-            text=metrics.fmt_ttft(snap.get("ttft"), snap.get("ttft_upper")))
-        self.live_stats["gen"].configure(text=metrics.fmt(snap.get("tg"), " t/s"))
-        self.live_stats["tokens"].configure(
-            text=metrics.fmt_int(snap.get("n_gen")))
-        self.live_stats["kv"].configure(text=snap.get("kv") or "-")
-
-        used, total = snap.get("n_tokens"), snap.get("n_ctx")
-        if used and total:
-            self.ctx_bar.configure(value=min(1000, int(1000.0 * used / total)))
-            self.ctx_label.configure(text="%s / %s" % (format(used, ","),
-                                                       format(total, ",")))
-        else:
-            self.ctx_bar.configure(value=0)
-            self.ctx_label.configure(text="-")
-
-        gpus = snap.get("gpus") or []
-        if gpus:
-            parts = []
-            for gpu in gpus:
-                pct, used = gpu.get("pct"), gpu.get("used")
-                parts.append("%s %s%s" % (
-                    gpu["name"], "-" if pct is None else "%.0f%%" % pct,
-                    "" if used is None else "  %s/%.0f GB" % (
-                        vram.gb(used), gpu["vram"] / float(vram.GB))))
-            spilling = bool(snap.get("spills"))
-            if spilling:
-                parts.append("SPILLING INTO SYSTEM RAM")
-            self.live_gpu.configure(text="   ".join(parts),
-                                    style="Bad.TLabel" if spilling else "Dim.TLabel")
-        elif snap.get("gpu_error"):
-            self.live_gpu.configure(text="GPU: %s" % snap["gpu_error"],
-                                    style="Bad.TLabel")
-        self._check_spills(snap)
-        self._vram_follow_live()
-
-        rows = snap.get("history") or []
-        existing = set(self.hist_tree.get_children(""))
-        wanted = set()
-        for i, row in enumerate(rows):
-            iid = "h%d" % i
-            wanted.add(iid)
-            be = backends.get(row.get("backend") or "")
-            values = (
-                row.get("time", ""),
-                be.display_name if be else (row.get("backend") or "-"),
-                row.get("model") or "-",
-                metrics.fmt_ttft(row.get("ttft"), row.get("ttft_upper")),
-                metrics.fmt(row.get("prompt_tps")),
-                metrics.fmt(row.get("gen_avg")),
-                metrics.fmt_mmss(row.get("runtime")),
-                self._token_cell(row),
-                row.get("kv") or "-",
-            )
-            if iid in existing:
-                self.hist_tree.item(iid, values=values)
-            else:
-                self.hist_tree.insert("", "end", iid=iid, values=values)
-        for iid in existing - wanted:
-            self.hist_tree.delete(iid)
+        if name not in LAYOUTS or name == self.layout_name:
+            return
+        if self.busy and not messagebox.askyesno(
+                "Switch layout?",
+                "Something is still loading or unloading. Its output would "
+                "stop showing here, though the load itself carries on.\n\n"
+                "Switch anyway?", parent=self.root):
+            return
+        self.cfg["layout"] = name
+        model = self.selected_model()
+        state.write_json(HANDOFF_PATH, {
+            "backend": self.backend_var.get(),
+            "model_id": model.id if model else "",
+            "kv": self._kv_choice,
+            "typed": {k: v.get() for k, v in self.vars.items()
+                      if self.dirty.get(k) and v.get().strip()},
+        })
+        self._restarting = True
+        self._on_close()
 
     @staticmethod
-    def _token_cell(row):
-        """Context used as a bar, with the tokens this request generated."""
-        cell = metrics.bar_text(row.get("n_tokens"), row.get("n_ctx"))
-        if cell != "-" and row.get("n_gen"):
-            cell += "  (+%s)" % metrics.fmt_int(row.get("n_gen"))
-        return cell
+    def _read_handoff():
+        data = state.read_json(HANDOFF_PATH, {})
+        try:
+            os.remove(HANDOFF_PATH)
+        except OSError:
+            pass
+        return data
 
     def _live_model_name(self, backend, port=0):
         """What to label a request with, asked as the request starts.
@@ -757,19 +372,23 @@ class Zoomies:
         return backends.get(self.backend_var.get()) or backends.get("ollama")
 
     def selected_model(self):
-        idx = self.model_box.current()
+        idx = self._model_index
         if idx < 0 or idx >= len(self.models):
             return None
         return self.models[idx]
 
+    def model_picked(self, index):
+        """A layout reports a model chosen from its list."""
+        if not 0 <= index < len(self.models):
+            return
+        self._model_index = index
+        self._model_selected()
+
     def log(self, text, tag=None):
-        self.out.configure(state="normal")
-        self.out.insert("end", text + "\n", tag or ())
-        self.out.see("end")
-        self.out.configure(state="disabled")
+        self.view.log(text, tag)
 
     def set_status(self, text, style="Dim.TLabel"):
-        self.status_lbl.configure(text=text, style=style)
+        self.view.set_status(text, style)
 
     def settings_dict(self):
         out = {k: v.get().strip() for k, v in self.vars.items()}
@@ -787,10 +406,7 @@ class Zoomies:
         if self._filling:
             return                  # Zoomies is filling it in, not you
         self.dirty[key] = True
-        try:
-            self.entries[key].configure(foreground=FG)
-        except tk.TclError:
-            pass
+        self.view.set_field_auto(key, False)
 
     def _set_value(self, key, value, auto=True):
         """Auto-filled values render in accent blue so it is obvious at a
@@ -803,10 +419,7 @@ class Zoomies:
         finally:
             self._filling = False
         self.dirty[key] = not auto
-        try:
-            self.entries[key].configure(foreground=ACCENT if auto else FG)
-        except tk.TclError:
-            pass
+        self.view.set_field_auto(key, auto)
 
     def _refresh_preset_box(self):
         """Offer the presets measured for this model on this backend."""
@@ -821,9 +434,8 @@ class Zoomies:
         self._presets = list(state.presets_for(
             [c for c in candidates if c], be.name)) if model else []
         names = tuple(p["name"] for p in self._presets)
-        self.preset_box.configure(values=names)
+        self.view.show_presets(names)
         self.preset_var.set("")
-        self.preset_box.state(["!disabled"] if names else ["disabled"])
 
     def _preset_chosen(self):
         """Fill the form from a saved preset, with the docs underneath.
@@ -854,7 +466,7 @@ class Zoomies:
             skipped.append("Reasoning")
 
         self.source_note = "preset: %s" % name
-        self.source_lbl.configure(text=self._preset_text(preset))
+        self.view.set_source(self._preset_text(preset))
         self._refresh_reasoning()
         if skipped:
             self.set_status("Applied %s. %s not supported by %s."
@@ -902,9 +514,9 @@ class Zoomies:
         for key in self.vars:
             self._set_value(key, "", auto=False)
             self.dirty[key] = False
-        self.source_lbl.configure(text="")
-        self.notes_lbl.configure(text="")
-        self.mode_box.configure(values=())
+        self.view.set_source("")
+        self.view.set_notes("")
+        self.view.show_modes(())
         self.mode_var.set("")
         self.mode_keys = {}
         self.opt_result = None
@@ -926,26 +538,16 @@ class Zoomies:
         self.cfg["last_backend"] = be.name
 
         if be.uses_model_folder:
-            self.folder_entry.state(["!disabled"])
-            self.browse_btn.state(["!disabled"])
             self.folder_var.set(self.cfg.get(self._folder_key(be))
                                 or be.default_folder or "")
         else:
             self.folder_var.set("%s   (%s manages these)"
                                 % (be.default_folder, be.display_name))
-            self.folder_entry.state(["disabled"])
-            self.browse_btn.state(["disabled"])
         can_download = getattr(be, "can_download", lambda: False)()
-        self.download_btn.state(["!disabled"] if can_download else ["disabled"])
+        self.view.set_folder_state(be.uses_model_folder, can_download)
 
-        for key, ent in self.entries.items():
-            reason = be.supports(key)
-            if reason:
-                ent.state(["!disabled"])
-                self.labels[key].configure(style="Dim.TLabel")
-            else:
-                ent.state(["disabled"])
-                self.labels[key].configure(style="Off.TLabel")
+        for key in self.vars:
+            self.view.set_field_supported(key, bool(be.supports(key)))
 
         unsupported = [lab for key, lab in backends.SETTING_LABELS
                        if not be.supports(key)]
@@ -961,7 +563,7 @@ class Zoomies:
         if fixed_kv and not be.supports("kv_cache"):
             msg += (" KV cache is fixed at %s by OLLAMA_KV_CACHE_TYPE for "
                     "every model." % fixed_kv)
-        self.notes_lbl.configure(text=msg)
+        self.view.set_notes(msg)
         self._refresh_reason_box()
         self._refresh_kv_box()
         self._schedule_vram()
@@ -987,7 +589,8 @@ class Zoomies:
             self._show_models(be, cached)
         else:
             self.models = []
-            self.model_box.configure(values=())
+            self._model_index = -1
+            self.view.show_models(())
             self.model_var.set("Loading models...")
         self._model_req += 1
         self._announce_models = bool(announce)
@@ -1022,14 +625,18 @@ class Zoomies:
 
     def _show_models(self, be, models, err=""):
         current = self.selected_model()
-        want = current.id if current else self.cfg.get("last_model", "")
+        want = current.id if current else (self._handoff_model or
+                                           self.cfg.get("last_model", ""))
         self.models = list(models)
         labels = [m.describe() for m in self.models]
-        self.model_box.configure(values=labels)
+        self.view.show_models(labels)
         chosen = next((i for i, m in enumerate(self.models) if m.id == want), 0)
         if labels:
-            self.model_box.current(chosen)
+            self._handoff_model = ""      # it has found its model; done
+            self._model_index = chosen
+            self.model_var.set(labels[chosen])
         else:
+            self._model_index = -1
             self.model_var.set("")
             if err:
                 self.log("%s: %s" % (be.display_name, err), "err")
@@ -1074,7 +681,7 @@ class Zoomies:
         plan = be.build_download(name)
         self.current_plan = plan
         self.busy = True
-        self.load_btn.state(["disabled"])
+        self.view.set_launch_enabled(False)
         self.set_status("Downloading %s..." % name)
         self.log("")
         self.log("=== %s ===" % os.path.basename(plan.script_path), "note")
@@ -1137,7 +744,7 @@ class Zoomies:
         """Greyed out while a lookup runs, and while a preset is active -
         picking the preset already filled everything the docs have."""
         usable = optimizer is not None and not self._looking_up             and self._active_preset is None
-        self.apply_btn.state(["!disabled"] if usable else ["disabled"])
+        self.view.set_apply_enabled(usable)
 
     def _apply_worker(self, model, force=False, keep_edits=False):
         """keep_edits: set when a preset asked for the docs, which must fill
@@ -1174,12 +781,12 @@ class Zoomies:
             if preset:
                 # The preset stands on its own; no page picker for a
                 # question nobody asked.
-                self.source_lbl.configure(text="%s\nNo docs settings found "
-                                          "to fill in the rest." %
-                                          self._preset_text(preset))
+                self.view.set_source("%s\nNo docs settings found "
+                                     "to fill in the rest." %
+                                     self._preset_text(preset))
                 return
-            self.source_lbl.configure(text=result.error or
-                                      "Nothing usable found on that page.")
+            self.view.set_source(result.error or
+                                 "Nothing usable found on that page.")
             self._reasoning_is_variant = False
             self._refresh_reason_box()
             if auto:
@@ -1210,7 +817,7 @@ class Zoomies:
         # The dropdown shows the readable label; the lookup maps it back to
         # the internal key so flipping modes re-reads the right column.
         self.mode_keys = {result.mode_labels.get(k, k): k for k in result.modes}
-        self.mode_box.configure(values=tuple(self.mode_keys))
+        self.view.show_modes(tuple(self.mode_keys))
         if result.mode:
             self.mode_var.set(result.mode_labels.get(result.mode, result.mode))
 
@@ -1238,16 +845,16 @@ class Zoomies:
                      if backends.SETTING_TEXT.get(k, k) not in from_preset]
             self.source_note = "preset: %s; %s" % (preset["name"],
                                                    result.source_line())
-            self.source_lbl.configure(text="%s\nFrom %s: %s. The preset's "
-                                      "own values win where both have one." % (
-                                          self._preset_text(preset),
-                                          result.source_line(),
-                                          ", ".join(texts) or "nothing new"))
+            self.view.set_source("%s\nFrom %s: %s. The preset's "
+                                 "own values win where both have one." % (
+                                     self._preset_text(preset),
+                                     result.source_line(),
+                                     ", ".join(texts) or "nothing new"))
             msg = "Applied preset %s (%d settings) and %d from the docs." % (
                 preset["name"], len(from_preset), len(texts))
         else:
             self.source_note = result.source_line()
-            self.source_lbl.configure(text=result.describe())
+            self.view.set_source(result.describe())
             msg = "Applied %d setting%s." % (len(applied),
                                              "" if len(applied) == 1 else "s")
         if skipped:
@@ -1268,7 +875,7 @@ class Zoomies:
         for key, var in self.vars.items():
             if not (self.dirty.get(key) and var.get().strip()):
                 self._set_value(key, "", auto=True)
-        self.source_lbl.configure(text="")
+        self.view.set_source("")
         self.source_note = ""
         self.reason_var.set("")
         self._pending_reason = None
@@ -1354,7 +961,7 @@ class Zoomies:
         be = self.backend()
         spec = self.reasoning
         if not spec or not spec.usable:
-            self.reason_box.configure(values=())
+            self.view.show_reasoning((), False)
             if not be.supports("reasoning") or self.selected_model() is None:
                 text = ""
             elif spec is None:
@@ -1366,46 +973,19 @@ class Zoomies:
             else:
                 text = "always on" if spec.thinks else "none"
             self.reason_var.set(text)
-            self.reason_box.state(["disabled"])
             return
-        self.reason_box.configure(values=spec.levels)
+        self.view.show_reasoning(spec.levels, True)
         if self.reason_var.get() not in spec.levels:
             self.reason_var.set(spec.default)
-        self.reason_box.state(["!disabled"])
 
     # ------------------------------------------------------------------
     # VRAM estimate
     # ------------------------------------------------------------------
 
-    def _build_vram(self, box):
-        """What the load will need per card, before loading it.
-
-        Worked out from the .gguf header (vram.py), so it never touches a
-        GPU. The sliders are what everything else already holds on each
-        card; they follow Windows' own counters until you move one.
-        """
-        frame = ttk.Frame(box)
-        frame.pack(fill="x", padx=8, pady=(0, 6))
-        head = ttk.Frame(frame)
-        head.pack(fill="x")
-        ttk.Label(head, text="VRAM", style="Dim.TLabel").pack(side="left")
-        self.vram_est_lbl = ttk.Label(head, text="", style="Dim.TLabel",
-                                  wraplength=self.px(640), justify="left")
-        self.vram_est_lbl.pack(side="left", padx=(8, 0))
-        self.vram_fit_btn = ttk.Button(head, text="Use largest context",
-                                       command=self._use_max_ctx)
-        self.vram_fit_btn.pack(side="right")
-        ttk.Button(head, text="Read usage now",
-                   command=lambda: self._vram_follow_live(True)).pack(
-            side="right", padx=(0, 6))
-        self.vram_cards = ttk.Frame(frame)
-        self.vram_cards.pack(fill="x", pady=(2, 0))
-        self.vram_notes = ttk.Label(frame, text="", style="Dim.TLabel",
-                                    wraplength=self.px(940), justify="left")
-        self.vram_notes.pack(fill="x")
-        for key in ("context_length", "gpu_layers", "parallel", "extra_flags"):
-            self.vars[key].trace_add("write", lambda *a: self._schedule_vram())
-        self.kv_var.trace_add("write", lambda *a: self._schedule_vram())
+    # What the load will need per card, before loading it. Worked out from
+    # the .gguf header (vram.py), so it never touches a GPU. Each card also
+    # has a value for what everything else already holds on it; those follow
+    # Windows' own counters until you move one.
 
     def _schedule_vram(self):
         """Re-estimate shortly after the last change, not on every key."""
@@ -1419,19 +999,17 @@ class Zoomies:
         if model is None or be.name != "llamacpp":
             self._vram_req += 1
             self._sync_vram_rows([])
-            self.vram_est_lbl.configure(
-                text="" if model is None else
+            self.view.show_vram_estimate(
+                None, "" if model is None else
                 "estimated for llama.cpp only - Ollama places layers itself",
-                style="Dim.TLabel")
-            self.vram_fit_btn.state(["disabled"])
-            self.vram_notes.configure(text="")
+                "Dim.TLabel", "")
             return
         settings = self.settings_dict()
         cards = vram.cards_for(reasoning.split_flags(settings.get("extra_flags")),
                                self._vram_adapters)
         self._sync_vram_rows(cards)
         other = {luid: int(var.get() * vram.GB)
-                 for luid, (var, _lbl) in self._vram_rows.items()}
+                 for luid, var in self._vram_rows.items()}
         self._vram_req += 1
         req, found = self._vram_req, self._vram_adapters
         threading.Thread(
@@ -1440,33 +1018,21 @@ class Zoomies:
             daemon=True).start()
 
     def _sync_vram_rows(self, cards):
-        """One slider per card the launch will use."""
+        """One value per card the launch will use."""
         if [c.luid for c in cards] == list(self._vram_rows):
             return
-        for child in self.vram_cards.winfo_children():
-            child.destroy()
-        self._vram_rows = {}
         live = self._live_other()
-        for row, card in enumerate(cards):
-            gb = card.total / float(vram.GB)
-            ttk.Label(self.vram_cards, text="%s - in use by other apps"
-                      % card.name, style="Dim.TLabel").grid(
-                row=row, column=0, sticky="w")
-            var = tk.DoubleVar(value=round(live.get(card.luid, 0) / vram.GB, 1))
-            ttk.Scale(self.vram_cards, from_=0, to=gb, variable=var,
-                      length=self.px(220),
-                      command=lambda v, l=card.luid: self._vram_slid(l)).grid(
-                row=row, column=1, padx=8)
-            lbl = ttk.Label(self.vram_cards, text="", style="Dim.TLabel")
-            lbl.grid(row=row, column=2, sticky="w")
-            self._vram_rows[card.luid] = (var, lbl)
+        self._vram_rows = {
+            card.luid: tk.DoubleVar(value=round(live.get(card.luid, 0) / vram.GB, 1))
+            for card in cards}
+        self.view.show_vram_cards(cards, self._vram_rows, self._vram_slid)
+        for card in cards:
             self._vram_label(card.luid)
 
     def _vram_label(self, luid):
-        var, lbl = self._vram_rows[luid]
-        lbl.configure(text="%.1f GB%s" % (
-            var.get(), "  (set by you)" if luid in self._vram_manual
-            else "  (measured)"))
+        self.view.set_vram_card_text(luid, "%.1f GB%s" % (
+            self._vram_rows[luid].get(), "  (set by you)"
+            if luid in self._vram_manual else "  (measured)"))
 
     def _vram_slid(self, luid):
         self._vram_manual.add(luid)
@@ -1502,7 +1068,7 @@ class Zoomies:
             self._vram_seen = sample
         live = self._live_other()
         changed = False
-        for luid, (var, _lbl) in self._vram_rows.items():
+        for luid, var in self._vram_rows.items():
             if luid in self._vram_manual or luid not in live:
                 continue
             value = round(live[luid] / vram.GB, 1)
@@ -1518,9 +1084,7 @@ class Zoomies:
             return                        # the form changed since
         self._vram_est = est
         if est.problem:
-            self.vram_est_lbl.configure(text=est.problem, style="Dim.TLabel")
-            self.vram_fit_btn.state(["disabled"])
-            self.vram_notes.configure(text="")
+            self.view.show_vram_estimate(None, est.problem, "Dim.TLabel", "")
             return
         parts = ["%s %s + %s = %s / %.0f GB" % (
             c.name, vram.gb(c.other), vram.gb(c.model), vram.gb(c.used),
@@ -1537,19 +1101,12 @@ class Zoomies:
         else:
             verdict = "fits - %s GB spare" % vram.gb(worst.spare)
             style = "Ok.TLabel"
-        self.vram_est_lbl.configure(text="%s   ->   %s" % ("   |   ".join(parts),
-                                                       verdict), style=style)
-        if est.max_ctx and est.max_ctx != est.ctx:
-            self.vram_fit_btn.configure(text="Use largest context (%s)"
-                                        % format(est.max_ctx, ","))
-            self.vram_fit_btn.state(["!disabled"])
-        else:
-            self.vram_fit_btn.configure(text="Use largest context")
-            self.vram_fit_btn.state(["disabled"])
         notes = ["Other apps + this model = total. Accurate to about 0.25 GB "
                  "per card; keeps %s GB free per card for \"largest context\"."
                  % vram.gb(est.margin)] + est.notes
-        self.vram_notes.configure(text="  ".join(notes))
+        self.view.show_vram_estimate(
+            est, "%s   ->   %s" % ("   |   ".join(parts), verdict), style,
+            "  ".join(notes))
 
     def _use_max_ctx(self):
         est = self._vram_est
@@ -1570,7 +1127,7 @@ class Zoomies:
             if spill["pid"] in self._spill_alerted:
                 continue
             self._spill_alerted.add(spill["pid"])
-            name = next((m.label for m in self.loaded_rows.values()
+            name = next((m.label for m in self.loaded_items
                          if m.pid == spill["pid"]), "") or \
                 os.path.basename(spill["image"])
             text = ("%s is spilling: %.1f GB of its memory is in system RAM "
@@ -1601,16 +1158,12 @@ class Zoomies:
         takes it from an environment variable, not from a load request."""
         be = self.backend()
         if be.supports("kv_cache"):
-            self.kv_box.configure(values=backends.KV_CACHE_CHOICES)
+            self.view.show_kv(backends.KV_CACHE_CHOICES, True)
             self.kv_var.set(self._kv_choice)
-            self.kv_box.state(["!disabled"])
-            self.kv_label.configure(style="Dim.TLabel")
         else:
             fixed = be.fixed_kv_cache()
-            self.kv_box.configure(values=())
+            self.view.show_kv((), False)
             self.kv_var.set("%s (fixed)" % fixed if fixed else "")
-            self.kv_box.state(["disabled"])
-            self.kv_label.configure(style="Off.TLabel")
 
     def _kv_changed(self):
         if backends.kv_choice_value(self.kv_var.get()) or \
@@ -1810,7 +1363,7 @@ class Zoomies:
             return
         self.current_plan = plan
         if plan.notes:
-            self.notes_lbl.configure(text="  ".join(plan.notes))
+            self.view.set_notes("  ".join(plan.notes))
         model = self.selected_model()
         self.cfg["last_model"] = model.id if model else ""
 
@@ -1825,7 +1378,7 @@ class Zoomies:
             return bool(pre) and plan.creates_tag in pre
 
         self.busy = True
-        self.load_btn.state(["disabled"])
+        self.view.set_launch_enabled(False)
         self.set_status("Loading...")
         self.log("")
         self.log("=== %s ===" % os.path.basename(plan.script_path), "note")
@@ -1920,7 +1473,7 @@ class Zoomies:
 
     def _run_done(self, plan, pre_existing, res):
         self.busy = False
-        self.load_btn.state(["!disabled"])
+        self.view.set_launch_enabled(True)
         if res.ok:
             self._record(plan, pre_existing, res)
             self.set_status("Done.", "Ok.TLabel")
@@ -1977,31 +1530,9 @@ class Zoomies:
 
     def _procs_ready(self, items):
         self._procs_busy = False
-        if items is None:
-            self.procs_lbl.configure(text="Could not read the process list.",
-                                     style="Bad.TLabel")
-            return
-        self.procs = items
-        self.proc_tree.delete(*self.proc_tree.get_children(""))
-        for i, p in enumerate(items):
-            started = p.started[5:16].replace("T", " ") if p.started else "-"
-            tag = "leftover" if p.leftover else ("protected" if p.protected else "")
-            self.proc_tree.insert("", "end", iid=str(i), tags=(tag,) if tag else (),
-                                  values=(("LEFTOVER   " if p.leftover else "") + p.what,
-                                          processes.fmt_ram(p.ram), p.pid, started,
-                                          p.parent or "(exited)"))
-        left = [p for p in items if p.leftover]
-        text = "%d processes using %s" % (len(items),
-                                          processes.fmt_ram(sum(p.ram for p in items)))
-        if left:
-            text += "  -  %d leftover%s using %s" % (
-                len(left), "" if len(left) == 1 else "s",
-                processes.fmt_ram(sum(p.ram for p in left)))
-        self.procs_lbl.configure(text=text,
-                                 style="Warn.TLabel" if left else "Dim.TLabel")
-        self.tabs.tab(self.procs_tab, text=(
-            "  Processes (%d leftover%s)  " % (len(left), "" if len(left) == 1 else "s")
-            if left else "  Processes  "))
+        if items is not None:
+            self.procs = items
+        self.view.show_procs(items)
 
     def _describe_procs(self, chosen):
         return "\n".join("  %s  (%s, pid %d)" % (p.what, processes.fmt_ram(p.ram), p.pid)
@@ -2020,8 +1551,7 @@ class Zoomies:
         self._end_procs(left)
 
     def _end_selected(self):
-        chosen = [self.procs[int(r)] for r in self.proc_tree.selection()
-                  if 0 <= int(r) < len(self.procs)]
+        chosen = self.view.selected_procs()
         if not chosen:
             self.set_status("Select a row in Processes first.", "Warn.TLabel")
             return
@@ -2053,14 +1583,12 @@ class Zoomies:
         threading.Thread(target=work, daemon=True).start()
 
     def _unload_selected(self):
-        rows = self.tree.selection()
-        if not rows:
+        chosen = self.view.selected_loaded()
+        if not chosen:
             self.set_status("Select a row in Loaded first.", "Warn.TLabel")
             return
-        for row in rows:
-            item = self.loaded_rows.get(row)
-            if item is not None:
-                self._unload_one(item)
+        for item in chosen:
+            self._unload_one(item)
 
     def _unload_all(self):
         with self.lock:
@@ -2256,78 +1784,17 @@ class Zoomies:
             loaded = list(self.shared["loaded"])
             status = dict(self.shared["status"])
 
-        for name, lbl in self.backend_status.items():
-            info = status.get(name)
-            if not info:
-                lbl.configure(text="", style="Dim.TLabel")
-                continue
-            available, why, up = info
-            if up:
-                lbl.configure(text="* running", style="Ok.TLabel")
-            elif available:
-                lbl.configure(text="o " + why, style="Dim.TLabel")
-            else:
-                lbl.configure(text="x " + why, style="Bad.TLabel")
-
-        # Rows are keyed by which model on which endpoint, not by position.
-        # Numbering them meant that when one model replaced another, the row
-        # that was on screen kept its place and simply changed its text - so a
-        # model that had just been unloaded looked like the new one arriving
-        # under the wrong name. Now the old row goes and a new one appears.
-        existing = set(self.tree.get_children(""))
-        wanted = []
-        self.loaded_rows = {}
-        for item in loaded:
-            iid = "%s|%s|%s" % (item.backend, item.endpoint, item.label)
-            if iid in self.loaded_rows:                # same model twice over
-                continue
-            wanted.append(iid)
-            self.loaded_rows[iid] = item
-            values = (
-                item.label,
-                backends.get(item.backend).display_name if backends.get(item.backend)
-                else item.backend,
-                human_bytes(item.vram_bytes),
-                format(item.context, ",") if item.context else "-",
-                item.endpoint.replace("http://", "") or "-",
-                item.pid or "-",
-                self._until(item.expires),
-            )
-            tag = "ours" if item.owned_by_us else "foreign"
-            if iid in existing:
-                self.tree.item(iid, values=values, tags=(tag,))
-            else:
-                self.tree.insert("", "end", iid=iid, values=values, tags=(tag,))
-        for iid in existing - set(wanted):
-            self.tree.delete(iid)
-        for position, iid in enumerate(wanted):
-            self.tree.move(iid, "", position)
+        self.view.show_backend_status(status)
+        self.loaded_items = loaded
+        self.view.show_loaded(loaded)
 
         if self.metrics is not None:
-            self._refresh_live()
-
-        total = sum(i.vram_bytes for i in loaded)
-        self.vram_lbl.configure(
-            text="VRAM in use: %s" % human_bytes(total) if total else "")
+            snap = self.metrics.snapshot()
+            self.view.show_live(snap)
+            self._check_spills(snap)
+            self._vram_follow_live()
 
         self.after_id = self.root.after(REFRESH_MS, self.refresh)
-
-    @staticmethod
-    def _until(expires):
-        if not expires:
-            return "-"
-        import datetime
-        try:
-            txt = expires.split(".")[0]
-            when = datetime.datetime.fromisoformat(txt)
-            secs = (when - datetime.datetime.now()).total_seconds()
-            if secs <= 0:
-                return "now"
-            if secs < 3600:
-                return "%dm" % round(secs / 60)
-            return "%.1fh" % (secs / 3600)
-        except (ValueError, TypeError):
-            return "-"
 
     # ------------------------------------------------------------------
     # shutdown
@@ -2335,11 +1802,12 @@ class Zoomies:
 
     def _on_close(self):
         self.shutdown.set()
-        if self.after_id:
-            try:
-                self.root.after_cancel(self.after_id)
-            except tk.TclError:
-                pass
+        for pending in (self.after_id, self._vram_after):
+            if pending:
+                try:
+                    self.root.after_cancel(pending)
+                except tk.TclError:
+                    pass
         if self.metrics is not None:
             # stop(), not just cleanup(): the GPU thread may be halfway through
             # a typeperf sample. Exiting without killing it leaves typeperf
@@ -2351,8 +1819,9 @@ class Zoomies:
         state.save_session(self.session)
 
         # Loaded models are deliberately left running - keeping them warm is
-        # the whole point of the tool. Opt in if you want otherwise.
-        if self.unload_exit.get():
+        # the whole point of the tool. Opt in if you want otherwise. Never on
+        # a layout switch, which only closes the window to reopen it.
+        if self.unload_exit.get() and not self._restarting:
             with self.lock:
                 loaded = list(self.shared["loaded"])
             for item in loaded:
@@ -2368,16 +1837,52 @@ class Zoomies:
         self.root.destroy()
 
 
+def relaunch():
+    """Start the next Zoomies with the same interpreter and arguments, less
+    any layout choice: config.json now says which one to open."""
+    args, skip = [], False
+    for arg in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if arg == "--layout":
+            skip = True
+            continue
+        if arg.startswith("--layout=") or arg == "--classic":
+            continue
+        args.append(arg)
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)] + args,
+                         cwd=here)
+    except OSError as exc:
+        messagebox.showerror("Could not restart Zoomies",
+                             "Start it again by hand - it will open in the "
+                             "new layout.\n\n%s" % exc)
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Zoomies")
+    parser.add_argument("--layout", choices=sorted(LAYOUTS),
+                        help="open in this layout (and remember it)")
+    parser.add_argument("--classic", action="store_const", dest="layout",
+                        const="classic", help="same as --layout classic")
+    return parser.parse_args(argv)
+
+
 def main():
+    args = parse_args(sys.argv[1:])
     enable_dpi_awareness()
     root = tk.Tk()
-    app = Zoomies(root)
+    app = Zoomies(root, layout=args.layout)
     try:
         root.mainloop()
     finally:
         app.shutdown.set()
         for worker in app.workers:
             worker.join(timeout=3)
+    if app._restarting:
+        relaunch()
 
 
 if __name__ == "__main__":
