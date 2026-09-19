@@ -177,21 +177,56 @@ APPLY OPTIMAL SETTINGS
   re-reads that set.
 
   REASONING
-  The Reasoning dropdown offers exactly what the model's docs say,
+  The Reasoning dropdown offers exactly what the model's chat template
+  accepts - the template inside the .gguf, or the file Extra flags name
+  with --chat-template-file. It is read as soon as you pick a model,
   because models do this differently:
 
-      qwen3.8       effort level: xhigh (default), medium, low, none
-      gemma4        on / off
-      ministral-3   cannot be switched - "separate model": its Reasoning
-                    version is a different download
+      qwen3.6, ornith, gemma4, laguna   off / on
+      qwen3.8        off / low / medium / xhigh (xhigh is its default)
+      granite4.2     off / low-effort / on
+      muse-glimmer   low / medium / high / xhigh - no off switch
+      ministral-3    cannot be switched - "separate model": its Reasoning
+                     version is a different download
+
+  Where a template takes a value without listing the allowed ones (Muse
+  Glimmer), the list comes from the model's docs, and reasoning.py says
+  which page. When Zoomies cannot tell what a model accepts - no template
+  in the file, or an undocumented value - the dropdown says "unknown" and
+  the Output pane says why, rather than offering a guess. Switches a
+  template has but its docs never mention (Nemotron Lightning's
+  medium_effort) are reported there too, and not offered.
 
   Reasoning and Mode move together so they never contradict each other:
   choosing Instruct switches reasoning off, and choosing a reasoning level
   switches Mode back to Thinking.
 
-  llama.cpp applies the choice when the server starts. On Ollama the
-  dropdown is greyed out: Ollama takes reasoning per request, so the app
-  sending the prompt (jobbuddy, for example) decides, not the launcher.
+  llama.cpp applies the choice when the server starts, as the server's
+  default. An app that sends its own setting with a request still wins -
+  that is how opencode's dropdown works. On Ollama the dropdown is greyed
+  out: Ollama takes reasoning per request, so the app sending the prompt
+  (jobbuddy, for example) decides, not the launcher.
+
+  OPENCODE
+  "Sync opencode..." (top right) gives every model in opencode's config
+  that runs on a Zoomies port the same levels, as opencode "variants" -
+  so opencode's reasoning dropdown offers off / low / medium / xhigh for
+  Qwen3.8, off / on for Qwen3.6, and so on. It also hides the low /
+  medium / high opencode invents for other models, which those templates
+  ignore, and sets "reasoning" to whether the model can reason at all.
+
+  It shows every change and writes nothing until you press "Write
+  changes". Only "reasoning" and "variants" change - names, limits,
+  sampling and comments stay as written - and the old file is kept
+  beside it as opencode.jsonc.bak-<date>-<time>. An agent pointing at a
+  variant that was replaced (the old "no-think") is moved to the level
+  that sends the same settings ("off"). Models it cannot account for are
+  listed and left alone. It does not add or remove models. Restart
+  opencode afterwards.
+
+  Levels are listed least reasoning first, because opencode runs titles
+  and summaries with a model's first variant - so those run with
+  reasoning off.
 
   KV CACHE
   The KV cache dropdown sits beside Parallel: f16 (llama.cpp's default),

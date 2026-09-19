@@ -24,7 +24,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import backends
 import metrics
+import opencode
 import processes
+import reasoning
 import runner
 import state
 
@@ -145,7 +147,8 @@ class Zoomies:
         self.doc_line = ""
         self.scale = 1.0
         self.mode_keys = {}
-        self.reasoning = None             # docs' reasoning control, if any
+        self.reasoning = None             # reasoning.Spec for the chosen model
+        self._reasoning_key = None        # (model, extra flags) it was read for
         self._pending_reason = None       # level to keep across a mode re-read
         self._kv_choice = backends.KV_CACHE_START     # remembered across toggles
         self._reasoning_is_variant = False
@@ -284,6 +287,8 @@ class Zoomies:
         self.unload_exit = tk.BooleanVar(value=self.cfg.get("unload_on_exit", False))
         ttk.Checkbutton(top, text="Unload on exit",
                         variable=self.unload_exit).pack(side="right", padx=(0, 12))
+        ttk.Button(top, text="Sync opencode...",
+                   command=self._sync_opencode).pack(side="right", padx=(0, 12))
 
         # ---- backend + model ----------------------------------------
         pick = ttk.Frame(self.root)
@@ -334,7 +339,7 @@ class Zoomies:
                                       state="readonly")
         self.model_box.grid(row=2, column=1, sticky="ew", pady=3)
         self.model_box.bind("<<ComboboxSelected>>",
-                            lambda e: self._refresh_preset_box())
+                            lambda e: self._model_selected())
 
         # ---- settings ------------------------------------------------
         box = ttk.LabelFrame(self.root, text=" Settings ")
@@ -425,6 +430,9 @@ class Zoomies:
         for key in backends.SETTING_WIDE:
             row += 1
             make_field(key, row, 0, span=4)
+        # --chat-template-file changes which template sets the levels.
+        self.entries["extra_flags"].bind(
+            "<FocusOut>", lambda e: self._refresh_reasoning())
 
         self.source_lbl = ttk.Label(box, text="", style="Dim.TLabel",
                                     wraplength=self.px(940), justify="left")
@@ -739,10 +747,10 @@ class Zoomies:
 
     def settings_dict(self):
         out = {k: v.get().strip() for k, v in self.vars.items()}
-        info, level = self.reasoning, self.reason_var.get()
-        if info and level in info["levels"] and self.backend().supports("reasoning"):
+        spec, level = self.reasoning, self.reason_var.get()
+        if spec and level in spec.levels and self.backend().supports("reasoning"):
             out["reasoning"] = level
-            out["reasoning_style"] = info["style"]
+            out["reasoning_style"] = "template"
         if self.backend().supports("kv_cache"):
             kv_type = backends.kv_choice_value(self.kv_var.get())
             if kv_type:
@@ -821,10 +829,9 @@ class Zoomies:
 
         level = str(preset.get("settings", {}).get("reasoning") or "")
         if level and be.supports("reasoning"):
-            if self.reasoning and level in self.reasoning["levels"]:
-                self.reason_var.set(level)
-            else:
-                self._pending_reason = level
+            # Settled once the template is read for the preset's Extra flags,
+            # which may name a different chat template file.
+            self._pending_reason = level
             applied.append("Reasoning")
         elif level:
             skipped.append("Reasoning")
@@ -832,6 +839,7 @@ class Zoomies:
         self.source_note = "preset: %s" % name
         self.source_lbl.configure(
             text=preset.get("note") or ("Applied preset %s." % name))
+        self._refresh_reasoning()
         if skipped:
             self.set_status("Applied %s. %s not supported by %s."
                             % (name, ", ".join(skipped), be.display_name),
@@ -851,10 +859,10 @@ class Zoomies:
         self.mode_keys = {}
         self.opt_result = None
         self.source_note = ""
-        self.reasoning = None
         self._pending_reason = None
         self._reasoning_is_variant = False
-        self._refresh_reason_box()
+        self.reason_var.set("")
+        self._refresh_reasoning()
 
     # ------------------------------------------------------------------
     # backend / model wiring
@@ -971,7 +979,7 @@ class Zoomies:
             self.model_var.set("")
             if err:
                 self.log("%s: %s" % (be.display_name, err), "err")
-        self._refresh_preset_box()
+        self._model_selected()
 
     def _browse(self):
         chosen = filedialog.askdirectory(
@@ -1083,7 +1091,6 @@ class Zoomies:
                                       "Nothing usable found on that page.")
             self.set_status("No settings found - type them in, or pick a page.",
                             "Warn.TLabel")
-            self.reasoning = None
             self._reasoning_is_variant = False
             self._refresh_reason_box()
             if result.candidates:
@@ -1109,24 +1116,12 @@ class Zoomies:
         if result.mode:
             self.mode_var.set(result.mode_labels.get(result.mode, result.mode))
 
-        # Reasoning follows Mode, so the two can never contradict each other:
-        # Instruct (non-thinking) sampling with reasoning switched off, and
-        # thinking sampling with the level the docs call default - unless the
-        # user just picked a level, which is what caused this re-read.
-        self.reasoning = result.reasoning
-        self._reasoning_is_variant = (not result.reasoning and any(
+        # The levels come from the chat template, not the docs; the docs only
+        # say whether a model with no switch has a separate Reasoning build.
+        self._reasoning_is_variant = any(
             "reason" in str(label).lower()
-            for label in result.mode_labels.values()))
-        if self.reasoning:
-            pending, self._pending_reason = self._pending_reason, None
-            levels = self.reasoning["levels"]
-            if pending in levels:
-                self.reason_var.set(pending)
-            elif result.mode == "instruct" and self.reasoning.get("off"):
-                self.reason_var.set(self.reasoning["off"])
-            else:
-                self.reason_var.set(self.reasoning["default"])
-        self._refresh_reason_box()
+            for label in result.mode_labels.values())
+        self._refresh_reasoning()
 
         self.source_note = result.source_line()
         self.source_lbl.configure(text=result.describe())
@@ -1138,26 +1133,104 @@ class Zoomies:
         for hint in result.suggestions:
             self.log("Not applied: " + hint, "note")
 
-    def _refresh_reason_box(self):
-        """Offer exactly the reasoning levels this model's docs describe.
+    def _model_selected(self):
+        self.reason_var.set("")
+        self._pending_reason = None
+        self._reasoning_is_variant = False
+        self._refresh_preset_box()
+        self._refresh_reasoning(force=True)
 
-        Nothing is hardcoded because the scales differ: Qwen3.8 has four
-        effort levels, Gemma 4 is on or off, and Ministral 3 cannot be
-        switched at all - its Reasoning version is a separate download.
+    def _refresh_reasoning(self, force=False):
+        """Read the chosen model's chat template for its reasoning levels.
+
+        Read for the Extra flags in the form, because --chat-template-file
+        swaps the template the server renders. Off the UI thread: the first
+        read of a .gguf steps over its whole vocabulary.
+        """
+        model = self.selected_model()
+        be = self.backend()
+        if model is None or not be.supports("reasoning"):
+            self.reasoning, self._reasoning_key = None, None
+            self._refresh_reason_box()
+            return
+        extra = self.vars["extra_flags"].get().strip()
+        key = (be.name, model.id, extra)
+        if key == self._reasoning_key and not force:
+            self._choose_reason()
+            self._refresh_reason_box()
+            return
+        self._reasoning_key = key
+        self.reasoning = None
+        self._refresh_reason_box()
+        threading.Thread(
+            target=lambda: self.out_queue.put(
+                ("reasoning", key, reasoning.spec_for(model, extra))),
+            daemon=True).start()
+
+    def _reasoning_ready(self, key, spec):
+        if key != self._reasoning_key:
+            return                    # the model or its flags changed since
+        self.reasoning = spec
+        self.log("Reasoning for %s: %s" % (key[1], spec.describe()),
+                 "note" if spec.problem else None)
+        for note in spec.notes:
+            self.log("  " + note, "note")
+        self._choose_reason()
+        self._refresh_reason_box()
+
+    def _choose_reason(self):
+        """Reasoning follows Mode, so the two can never contradict each other:
+        Instruct (non-thinking) sampling with reasoning switched off, and
+        thinking sampling with the template's default level - unless a level
+        was just picked or came from a preset."""
+        spec = self.reasoning
+        if not spec or not spec.usable:
+            return
+        pending, self._pending_reason = self._pending_reason, None
+        mode = self.mode_keys.get(self.mode_var.get())
+        current = self.reason_var.get()
+        if pending in spec.levels:
+            choice = pending
+        elif pending in ("none", "off") and spec.off:
+            choice = spec.off         # a preset saved before levels were read
+        elif mode == "instruct" and spec.off:
+            choice = spec.off
+        elif current in spec.levels and not (mode == "thinking"
+                                             and current == spec.off):
+            choice = current
+        else:
+            choice = spec.default
+        self.reason_var.set(choice)
+
+    def _refresh_reason_box(self):
+        """Offer exactly the levels this model's chat template accepts.
+
+        Nothing is hardcoded because the scales differ: Qwen3.8 has an off
+        switch and three effort levels, Muse Glimmer has four strengths and
+        no off, Gemma 4 is on or off, and Ministral 3 cannot be switched at
+        all - its Reasoning version is a separate download.
         """
         be = self.backend()
-        info = self.reasoning
-        if not info:
+        spec = self.reasoning
+        if not spec or not spec.usable:
             self.reason_box.configure(values=())
-            self.reason_var.set("separate model" if self._reasoning_is_variant
-                                else "")
+            if not be.supports("reasoning") or self.selected_model() is None:
+                text = ""
+            elif spec is None:
+                text = "reading..."
+            elif spec.problem:
+                text = "unknown"
+            elif self._reasoning_is_variant:
+                text = "separate model"
+            else:
+                text = "always on" if spec.thinks else "none"
+            self.reason_var.set(text)
             self.reason_box.state(["disabled"])
             return
-        self.reason_box.configure(values=tuple(info["levels"]))
-        if self.reason_var.get() not in info["levels"]:
-            self.reason_var.set(info["default"])
-        self.reason_box.state(["!disabled"] if be.supports("reasoning")
-                              else ["disabled"])
+        self.reason_box.configure(values=spec.levels)
+        if self.reason_var.get() not in spec.levels:
+            self.reason_var.set(spec.default)
+        self.reason_box.state(["!disabled"])
 
     def _refresh_kv_box(self):
         """Selectable where the backend applies it per load (llama.cpp); on
@@ -1184,10 +1257,10 @@ class Zoomies:
     def _reason_changed(self):
         """Switching reasoning off moves Mode to Instruct, and switching it on
         moves Mode to Thinking, so the sampling numbers always match."""
-        info, level = self.reasoning, self.reason_var.get()
-        if not info or level not in info["levels"]:
+        spec, level = self.reasoning, self.reason_var.get()
+        if not spec or level not in spec.levels:
             return
-        want = "instruct" if level == info.get("off") else "thinking"
+        want = "instruct" if level == spec.off else "thinking"
         current = self.mode_keys.get(self.mode_var.get())
         if want == current or want not in self.mode_keys.values():
             return
@@ -1293,7 +1366,8 @@ class Zoomies:
             return
         self._show_text("Script preview", plan.script_text, plan.notes)
 
-    def _show_text(self, title, body, notes=()):
+    def _show_text(self, title, body, notes=(), action=None):
+        """action: (button text, callback) offered beside Close."""
         win = tk.Toplevel(self.root)
         win.title(title)
         win.configure(bg=BG)
@@ -1315,7 +1389,55 @@ class Zoomies:
         txt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         sbx.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+        buttons = ttk.Frame(win)
+        buttons.pack(pady=(0, 10))
+        if action:
+            text, callback = action
+            ttk.Button(buttons, text=text, style="Go.TButton",
+                       command=lambda: (win.destroy(), callback())).pack(
+                side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="left")
+
+    def _sync_opencode(self):
+        """Bring opencode's reasoning dropdowns in line with each model's
+        chat template. Shows every change and asks before writing."""
+        self.set_status("Reading opencode's config and every model's template...")
+
+        def work():
+            try:
+                self.out_queue.put(("opencode", opencode.plan_sync(), None))
+            except Exception as exc:                  # noqa: BLE001
+                self.out_queue.put(("opencode", None, str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _opencode_planned(self, plan, err):
+        if plan is None:
+            self.set_status("Could not read opencode's config.", "Warn.TLabel")
+            self.log("opencode: %s" % err, "err")
+            return
+        self.set_status("")
+        if not plan.edits:
+            self._show_text("opencode reasoning", plan.summary(),
+                            notes=[plan.path])
+            return
+
+        def apply():
+            try:
+                backup = opencode.write(plan)
+            except Exception as exc:                  # noqa: BLE001
+                self.log("opencode: could not write %s: %s" % (plan.path, exc),
+                         "err")
+                return
+            self.log("opencode: updated %s (%d change%s). Previous version "
+                     "saved as %s. Restart opencode to pick it up."
+                     % (plan.path, len(plan.changed),
+                        "" if len(plan.changed) == 1 else "s", backup))
+            self.set_status("opencode config updated.", "Ok.TLabel")
+        self._show_text("opencode reasoning", plan.summary(),
+                        notes=["%s - only reasoning and variants change, and "
+                               "the current file is backed up first."
+                               % plan.path],
+                        action=("Write changes", apply))
 
     def _load(self):
         if self.busy:
@@ -1756,6 +1878,10 @@ class Zoomies:
                     self._refresh_processes()
                 elif kind == "optimal":
                     self._apply_result(msg[1], msg[2], keep_edits=msg[3])
+                elif kind == "reasoning":
+                    self._reasoning_ready(msg[1], msg[2])
+                elif kind == "opencode":
+                    self._opencode_planned(msg[1], msg[2])
                 elif kind == "models":
                     self._models_ready(msg[1], msg[2], msg[3], msg[4])
         except queue.Empty:

@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+import reasoning
 import runner
 import state
 
@@ -243,16 +244,28 @@ def ollama_kv_cache_type():
     return (value or "f16").strip()
 
 
-def reasoning_kwargs(settings):
+def reasoning_kwargs(settings, model=None, notes=None):
     """Chat-template kwargs for the chosen reasoning setting, or None.
 
-    The style comes from the model's docs page, so a Gemma level can never be
-    sent to a Qwen model: enable_thinking takes on/off, reasoning_effort takes
-    whatever levels that page listed.
+    "template" is the current style: the level is looked up in what the
+    model's own chat template accepts (see reasoning.py), so a Gemma level can
+    never be sent to a Qwen model. enable_thinking and reasoning_effort are
+    the older, docs-based styles, still read so saved presets keep working.
     """
     style = str(settings.get("reasoning_style") or "")
     level = str(settings.get("reasoning") or "").strip().lower()
     if not style or not level:
+        return None
+    if style == "template":
+        if model is None:
+            return None
+        spec = reasoning.spec_for(model, settings.get("extra_flags"))
+        if level in spec.kwargs:
+            return spec.kwargs[level]
+        if notes is not None:
+            notes.append("Reasoning left at the server default: %s"
+                         % (spec.problem or "this model's template has no "
+                            "level called %r." % level))
         return None
     if style == "enable_thinking":
         if level not in ("on", "off"):
@@ -1464,7 +1477,7 @@ class LlamaCppBackend(Backend):
                              "it off (-fa off)." % kv_type)
             else:
                 a += ["'-ctv'", runner.ps_single(kv_type)]
-        kwargs = reasoning_kwargs(settings)
+        kwargs = reasoning_kwargs(settings, model, notes)
         if kwargs:
             # PowerShell 5.1 strips bare double quotes from native arguments;
             # backslash-escaped ones arrive intact.
