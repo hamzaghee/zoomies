@@ -132,6 +132,8 @@ class ClassicLayout:
         self.preset_box.pack(side="left")
         self.preset_box.bind("<<ComboboxSelected>>",
                              lambda e: app._preset_chosen())
+        ttk.Button(bar, text="Save...", command=app._save_preset).pack(
+            side="left", padx=(4, 0))
         ttk.Button(bar, text="Clear", command=app._clear_settings).pack(
             side="left", padx=(10, 0))
         # Answers are saved permanently once found, so there has to be a way

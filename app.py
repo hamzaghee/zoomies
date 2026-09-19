@@ -61,6 +61,17 @@ POLL_SECONDS = 2.0
 REFRESH_MS = 200
 
 
+def _number_or_text(value):
+    """"65536" -> 65536, "0.05" -> 0.05, anything else as typed - so a saved
+    preset reads like the hand-written ones."""
+    for kind in (int, float):
+        try:
+            return kind(value)
+        except ValueError:
+            pass
+    return value
+
+
 def enable_dpi_awareness():
     """Must run before the first Tk window exists.
 
@@ -574,6 +585,63 @@ class Zoomies:
     def _preset_text(preset):
         return "Preset %s: %s" % (preset["name"], preset.get("note")
                                   or "measured on this machine.")
+
+    def _save_preset(self):
+        """Save the form as a preset for this model on this backend, so the
+        same numbers come back next time by picking it.
+
+        Everything filled in is saved - typed, from the docs or from a
+        preset - because that is what Launch would use. Empty fields and
+        ones this backend greys out are left out. Saving under an existing
+        name replaces that preset's settings and keeps its note.
+        """
+        model, be = self.selected_model(), self.backend()
+        if model is None:
+            self.set_status("Pick a model first.", "Warn.TLabel")
+            return
+        settings = {}
+        for key, value in self.settings_dict().items():
+            if not value or (key in self.vars and not be.supports(key)):
+                continue
+            settings[key] = _number_or_text(value)
+        if not settings:
+            self.set_status("Nothing to save - every field is empty.",
+                            "Warn.TLabel")
+            return
+        suggested = (self._active_preset or {}).get("name", "")
+        name = simpledialog.askstring(
+            "Save as preset",
+            "Save these %d settings for %s on %s.\n\nPreset name:"
+            % (len(settings), model.label, be.display_name),
+            initialvalue=suggested, parent=self.root)
+        name = (name or "").strip()
+        if not name:
+            return
+        candidates = [c for c in (model.id, model.gguf_path, model.label) if c]
+        old = state.find_preset(candidates, be.name, name)
+        if old and not messagebox.askyesno(
+                "Save as preset",
+                "Replace the settings in preset %s?\n\nIts note is kept." % name,
+                parent=self.root):
+            return
+        preset = dict(old or {})
+        preset.update(name=name, backend=be.name, settings=settings)
+        preset.setdefault("note", "Saved from the form on %s."
+                          % time.strftime("%Y-%m-%d"))
+        if not state.save_preset(candidates, preset):
+            self.set_status("Could not write %s." % state.PRESETS_PATH,
+                            "Warn.TLabel")
+            return
+        self._refresh_preset_box()
+        self.preset_var.set(name)
+        self._active_preset = preset
+        self._refresh_apply_btn()
+        self.source_note = "preset: %s" % name
+        self.view.set_source(self._preset_text(preset))
+        self.set_status("Saved preset %s (%d settings)." % (name, len(settings)),
+                        "Ok.TLabel")
+        self.log("Preset %s saved for %s: %s" % (name, model.label, ", ".join(
+            "%s=%s" % kv for kv in settings.items())), "note")
 
     def _clear_settings(self):
         for key in self.vars:

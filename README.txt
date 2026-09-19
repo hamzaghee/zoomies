@@ -369,6 +369,22 @@ PRESETS
   switches reasoning off gets the docs' Instruct numbers. Values arrive
   blue either way, and anything you typed yourself (white) is kept.
 
+  SAVING ONE
+  "Save..." beside the dropdown ("Save current" in the compact layout)
+  writes the form as a preset for the selected model on the selected
+  backend, and asks for a name. Everything filled in is saved - what
+  you typed, what the docs filled in and what a preset put there -
+  because that is what Launch would use. Empty fields are left out, so
+  is anything this backend greys out, and a preset saved on one backend
+  is never offered on the other.
+
+  Saving under the name of an existing preset replaces its settings and
+  keeps its note, which is how a measured preset gains sampling numbers
+  without losing what the benchmark said. Any other name adds a preset,
+  noted as saved from the form with the date. The preset in use is
+  offered as the default name, so re-saving the one you are working
+  from is the quickest path.
+
   A preset records the backend it was measured on. llama.cpp flags mean
   nothing to Ollama, so an Ollama preset is never offered for a
   llama.cpp model or the other way round. Anything the current backend
@@ -386,9 +402,10 @@ PRESETS
       ornith:35b-q4_K_M              -> ornith-35b-q4-k-m
       C:\models\ornith-35b-Q4_K_M.gguf -> ornith-35b-q4-k-m
 
-  The file is plain JSON and safe to edit by hand. Each entry has a
-  name, the backend it was measured on, a settings block in the same
-  shape the form uses, and a note saying where the numbers came from.
+  The file is plain JSON and safe to edit by hand, and hand-written
+  entries survive a save from the app. Each entry has a name, the
+  backend it was measured on, a settings block in the same shape the
+  form uses, and a note saying where the numbers came from.
 
 
 GREYED-OUT FIELDS

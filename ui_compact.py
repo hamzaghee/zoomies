@@ -533,7 +533,10 @@ class CompactLayout:
         box, head = self._section(form, "Profile")
         self.apply_link = self._link(head, "Fill from docs", app._apply_optimal)
         self.apply_link.pack(side="right")
-        ttk.Label(box, text="Preset", style="Dim.TLabel").pack(anchor="w")
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        ttk.Label(row, text="Preset", style="Dim.TLabel").pack(side="left")
+        self._link(row, "Save current", app._save_preset).pack(side="right")
         self.chips = ttk.Frame(box)
         self.chips.pack(fill="x")
         self._chip_btns = {}

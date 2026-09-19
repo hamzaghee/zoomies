@@ -151,6 +151,40 @@ def save_presets(models):
     return write_json(PRESETS_PATH, {"version": 1, "models": models})
 
 
+def find_preset(candidates, backend_name, name):
+    """The saved preset with this name for this model and backend, or None."""
+    return next((p for p in presets_for(candidates, backend_name)
+                 if p.get("name") == name), None)
+
+
+def save_preset(candidates, preset):
+    """Add a preset, or replace the one with the same name and backend in
+    place, so the dropdown keeps its order.
+
+    It goes under whichever key the file already uses for this model - the
+    same weights can be listed as a tag or a .gguf name - and a new model
+    goes under the first handle given. Works on the raw file so entries
+    load_presets() would skip are kept as they were.
+    """
+    raw = read_json(PRESETS_PATH, {})
+    models = raw.get("models")
+    if not isinstance(models, dict):
+        models = {}
+    wanted = {preset_key(c) for c in candidates if c}
+    key = next((k for k in models if preset_key(k) in wanted), None) \
+        or next(c for c in candidates if c)
+    items = list(models.get(key) or [])
+    for i, old in enumerate(items):
+        if isinstance(old, dict) and old.get("name") == preset["name"] \
+                and old.get("backend") in (None, "", preset.get("backend")):
+            items[i] = preset
+            break
+    else:
+        items.append(preset)
+    models[key] = items
+    return save_presets(models)
+
+
 def load_history(limit=None):
     """Past requests, newest first. Never raises: a corrupt file costs the
     history, not the app."""
