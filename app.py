@@ -13,6 +13,7 @@ Threading model, copied from the Ollama Monitor because it works:
 
 import argparse
 import ctypes
+import ctypes.wintypes
 import os
 import queue
 import re
@@ -32,6 +33,7 @@ import reasoning
 import runner
 import state
 import ui_classic
+import ui_compact
 import vram
 from ui_common import BG, BG_PANEL, BORDER, FG, FONT, FONT_MONO, apply_style
 
@@ -46,6 +48,7 @@ APP_TITLE = "Zoomies"
 # --layout use; the first entry is the default.
 LAYOUTS = {
     "classic": ui_classic.ClassicLayout,
+    "compact": ui_compact.CompactLayout,
 }
 
 # What a layout switch carries to the next process, deleted once read.
@@ -94,6 +97,34 @@ def window_dpi(widget):
         return 96.0
 
 
+def work_area():
+    """(left, top, right, bottom) of the main screen less the taskbar, in
+    real pixels, or None if Windows will not say."""
+    rect = ctypes.wintypes.RECT()
+    try:
+        if ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(rect), 0):
+            return rect.left, rect.top, rect.right, rect.bottom
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def geometry_on_screen(geometry):
+    """True if a saved WxH+X+Y still lands on a monitor - the one it was
+    saved on may since have been unplugged."""
+    m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", geometry or "")
+    if not m:
+        return False
+    w, _h, x, y = (int(n) for n in m.groups())
+    try:
+        # The middle of the top edge: that is where the title bar is, and
+        # a window whose title bar is reachable can always be dragged back.
+        point = ctypes.wintypes.POINT(x + w // 2, y + 10)
+        return bool(ctypes.windll.user32.MonitorFromPoint(point, 0))
+    except (AttributeError, OSError):
+        return False
+
+
 def dark_titlebar(root):
     """Windows 10/11 only, and entirely cosmetic - a white title bar above a
     near-black window looks broken."""
@@ -122,6 +153,8 @@ class Zoomies:
             layout = self.cfg.get("layout")
         self.layout_name = layout if layout in LAYOUTS else next(iter(LAYOUTS))
         self._restarting = False
+        self._unload_now = False          # "Unload all and exit" was chosen
+        self._first_poll_seen = False
 
         self.shutdown = threading.Event()
         self.lock = threading.Lock()
@@ -218,10 +251,21 @@ class Zoomies:
         max_w = int(self.root.winfo_screenwidth() * 0.92)
         max_h = int(self.root.winfo_screenheight() * 0.92)
         width, height = min(want_w, max_w), min(want_h, max_h)
-        self.root.geometry("%dx%d+%d+%d" % (
-            width, height,
-            max(0, (self.root.winfo_screenwidth() - width) // 2),
-            max(0, (self.root.winfo_screenheight() - height) // 3)))
+        saved = self.cfg.get("geometry_" + layout_cls.name) \
+            if layout_cls.remember_geometry else None
+        area = work_area()
+        if saved and geometry_on_screen(saved):
+            self.root.geometry(saved)
+        elif layout_cls.dock == "right" and area:
+            left, top, right, bottom = area
+            height = min(want_h, bottom - top - self.px(40))   # title bar
+            self.root.geometry("%dx%d+%d+%d" % (width, height,
+                                                right - width - self.px(16), top))
+        else:
+            self.root.geometry("%dx%d+%d+%d" % (
+                width, height,
+                max(0, (self.root.winfo_screenwidth() - width) // 2),
+                max(0, (self.root.winfo_screenheight() - height) // 3)))
         self.root.minsize(min(min_w, max_w), min(min_h, max_h))
         dark_titlebar(self.root)
         apply_style(self.root, self.px)
@@ -1382,6 +1426,7 @@ class Zoomies:
         self.set_status("Loading...")
         self.log("")
         self.log("=== %s ===" % os.path.basename(plan.script_path), "note")
+        self.view.launch_started()
         threading.Thread(target=self._run_worker,
                          args=(plan, tag_existed, clear_first), daemon=True).start()
 
@@ -1481,6 +1526,8 @@ class Zoomies:
             detail = res.message or "exit code %s" % res.returncode
             self.set_status("Failed - %s" % detail, "Bad.TLabel")
             self.log("FAILED: %s" % detail, "err")
+        if plan.kind == "load":
+            self.view.launch_finished(res.ok)
         self._poll_once()
         self._refresh_processes()
 
@@ -1729,6 +1776,7 @@ class Zoomies:
         with self.lock:
             self.shared["loaded"] = loaded
             self.shared["status"] = status
+            self.shared["polled"] = True
 
     def _poll_loop(self):
         n = 0
@@ -1783,10 +1831,14 @@ class Zoomies:
         with self.lock:
             loaded = list(self.shared["loaded"])
             status = dict(self.shared["status"])
+            polled = self.shared.get("polled", False)
 
         self.view.show_backend_status(status)
         self.loaded_items = loaded
         self.view.show_loaded(loaded)
+        if polled and not self._first_poll_seen:
+            self._first_poll_seen = True
+            self.view.first_poll(loaded)
 
         if self.metrics is not None:
             snap = self.metrics.snapshot()
@@ -1799,6 +1851,29 @@ class Zoomies:
     # ------------------------------------------------------------------
     # shutdown
     # ------------------------------------------------------------------
+
+    def exit(self, unload=False):
+        """The menu's Exit, and Unload all and exit - which unloads this
+        once without changing the Unload on exit setting."""
+        if unload:
+            with self.lock:
+                loaded = list(self.shared["loaded"])
+            ours = [i.label for i in loaded if not i.foreign_process]
+            outside = [i.label for i in loaded if i.foreign_process]
+            if not ours:
+                question = "Nothing Zoomies can unload is running.\n\nExit anyway?"
+            else:
+                question = "Unload %s and exit?" % ", ".join(ours)
+            if outside:
+                # Same rule as Unload on exit: servers somebody else started
+                # are theirs to stop.
+                question += ("\n\n%s stays running - its server was started "
+                             "outside Zoomies." % ", ".join(outside))
+            if not messagebox.askyesno("Unload all and exit", question,
+                                       parent=self.root):
+                return
+            self._unload_now = True
+        self._on_close()
 
     def _on_close(self):
         self.shutdown.set()
@@ -1815,13 +1890,15 @@ class Zoomies:
             self.metrics.stop()
         self.cfg["unload_on_exit"] = bool(self.unload_exit.get())
         self.cfg["one_model_at_a_time"] = bool(self.one_at_a_time.get())
+        if self.view.remember_geometry and self.root.state() == "normal":
+            self.cfg["geometry_" + self.layout_name] = self.root.geometry()
         state.save_config(self.cfg)
         state.save_session(self.session)
 
         # Loaded models are deliberately left running - keeping them warm is
         # the whole point of the tool. Opt in if you want otherwise. Never on
         # a layout switch, which only closes the window to reopen it.
-        if self.unload_exit.get() and not self._restarting:
+        if (self.unload_exit.get() or self._unload_now) and not self._restarting:
             with self.lock:
                 loaded = list(self.shared["loaded"])
             for item in loaded:

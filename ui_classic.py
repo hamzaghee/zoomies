@@ -23,6 +23,8 @@ class ClassicLayout:
     name = "classic"
     size = (980, 800)             # at 100% display scale
     min_size = (780, 560)
+    remember_geometry = False     # opens centred, as it always has
+    dock = None
 
     def __init__(self, app):
         self.app = app
@@ -377,6 +379,20 @@ class ClassicLayout:
         self.vram_notes = ttk.Label(frame, text="", style="Dim.TLabel",
                                     wraplength=self.px(940), justify="left")
         self.vram_notes.pack(fill="x")
+
+    # ------------------------------------------------------------------
+    # moments the compact layout moves between views on; this one shows
+    # everything at once, so it has nothing to do
+    # ------------------------------------------------------------------
+
+    def first_poll(self, loaded):
+        pass
+
+    def launch_started(self):
+        pass
+
+    def launch_finished(self, ok):
+        pass
 
     # ------------------------------------------------------------------
     # setup: what the controller calls
