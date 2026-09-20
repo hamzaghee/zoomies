@@ -410,11 +410,17 @@ PRESETS
   produce a recipe called "To" - is listed as "Recommended".
 
   Picking one gives you both: the docs' numbers underneath, the
-  preset's on top. A preset usually holds the load settings - context,
-  layers, KV cache, flags, reasoning - and no sampling numbers, so the
-  docs fill in temperature, top P and the rest, and wherever both have
-  a value the preset wins, because it was measured on this machine. The
-  note under the settings says which fields came from where.
+  preset's on top. Wherever both have a value the preset wins, because
+  it was measured on this machine, and the note under the settings says
+  which fields came from where.
+
+  A preset is worth holding sampling numbers as well as load settings,
+  even though the docs would fill those in anyway: "Sync opencode..."
+  sends opencode exactly what the preset holds and strips what it does
+  not, so a preset with no temperature in it means opencode sends none
+  and the server's own value stands. Saving from a filled-in form is
+  enough - the docs' numbers are in the form by then, and the save
+  dialog says which ones are missing.
 
   The preset stays in charge until you pick another model or press
   Clear: switching Mode or Reasoning re-reads the docs and puts the
