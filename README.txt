@@ -268,10 +268,22 @@ FILL FROM DOCS
   medium / high opencode invents for other models, which those templates
   ignore, and sets "reasoning" to whether the model can reason at all.
 
+  It also keeps the sampling numbers in step. opencode sends its
+  "options" block with every request, and a request's own value beats
+  whatever the server was started with, so a number left there quietly
+  overrules Zoomies. Where a model's preset holds sampling numbers, they
+  are written into that block and anything Zoomies owns but the preset
+  does not is removed, leaving the server's value to stand. Where no
+  preset holds any - which is most models until you save some - the
+  block is left exactly as it is and said so in the summary, because
+  silence in a preset means nobody has saved numbers yet, not that
+  llama.cpp's own defaults are wanted. Settings Zoomies has no opinion
+  on, such as a timeout, are never touched.
+
   It shows every change and writes nothing until you press "Write
-  changes". Only "reasoning" and "variants" change - names, limits,
-  sampling and comments stay as written - and the old file is kept
-  beside it as opencode.jsonc.bak-<date>-<time>. An agent pointing at a
+  changes". Only "reasoning", "variants" and the sampling half of
+  "options" change - names, limits and comments stay as written - and
+  the old file is kept beside it as opencode.jsonc.bak-<date>-<time>. An agent pointing at a
   variant that was replaced (the old "no-think") is moved to the level
   that sends the same settings ("off"). Models it cannot account for are
   listed and left alone. It does not add or remove models. Restart

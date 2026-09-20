@@ -15,10 +15,19 @@ So this writes, for each model the config already lists on a Zoomies port:
       "off": {"chat_template_kwargs": {"enable_thinking": false}},  ...
       "medium": {"disabled": true} opencode's guesses that do nothing
     }
+    "options": {                   the sampling numbers from the model's
+      "temperature": 0.15, ...     preset - and only those
+    }
 
-and nothing else. Names, limits, sampling, comments and agents stay exactly
-as written - an agent's "variant" is only touched when it names a variant
-this replaced, and then only if a new level sends the same kwargs.
+The options block matters because opencode sends it with every request,
+and a request's own value beats whatever the server was started with: a
+number left there quietly overrules Zoomies, which is the one place these
+are meant to be set. So where a preset has a number it is written here,
+and where it has none the setting is removed and the server's own value
+stands. Settings Zoomies does not own - a timeout, a header - are left
+alone, as are names, limits and comments. An agent's "variant" is only
+touched when it names a variant this replaced, and then only if a new
+level sends the same kwargs.
 
 Levels are listed least reasoning first on purpose: opencode runs titles and
 summaries with a model's first variant.
@@ -195,6 +204,108 @@ def variants_for(model_id, spec):
     return out
 
 
+# What opencode sends per request, and what Zoomies calls the same setting.
+# Anything else in an "options" block - a timeout, a header - is none of our
+# business and is left exactly as written.
+SAMPLING_OPTIONS = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "min_p": "min_p",
+    "repeat_penalty": "repeat_penalty",
+    "presence_penalty": "presence_penalty",
+    "seed": "seed",
+}
+# The same settings under the names the ai-sdk spells them, so a block
+# written by hand in camelCase is recognised rather than duplicated.
+_OPTION_ALIASES = {"topP": "top_p", "topK": "top_k", "minP": "min_p",
+                   "repeatPenalty": "repeat_penalty",
+                   "repetition_penalty": "repeat_penalty",
+                   "presencePenalty": "presence_penalty"}
+
+
+def _sampling_for_config(model):
+    """The sampling numbers Zoomies owns for this model, or (None, why).
+
+    They come from the model's presets, which is the only place Zoomies
+    keeps numbers when the GUI is not open. Two cases leave the model
+    alone rather than writing: presets that disagree, and presets with no
+    sampling numbers at all.
+
+    The second matters more than it looks. Silence in a preset is not an
+    instruction to use the server's numbers - it usually means nobody has
+    saved any yet. Stripping the block on that basis would hand every one
+    of those models to llama.cpp's built-in defaults (temperature 0.8),
+    not to the numbers its docs recommend, and quietly change how it
+    writes. So Zoomies only takes a model's options over once it has
+    numbers of its own to put there.
+    """
+    presets = list(state.presets_for(
+        [c for c in (model.id, model.gguf_path, model.label) if c], "llamacpp"))
+    subsets = []
+    for preset in presets:
+        settings = preset.get("settings") or {}
+        subsets.append({k: settings[k] for k in SAMPLING_OPTIONS
+                        if settings.get(k) not in (None, "")})
+    for other in subsets[1:]:
+        if other != subsets[0]:
+            return None, ("its presets disagree about the sampling numbers "
+                          "(%s vs %s)." % (subsets[0] or "none", other or "none"))
+    if not subsets or not subsets[0]:
+        return None, ("no preset of its own holds sampling numbers, so "
+                      "opencode keeps sending its. Save a preset with them "
+                      "to move them here.")
+    return subsets[0], ""
+
+
+def _plan_options(plan, name, mnode, anchor, indent, wanted):
+    """Make opencode's options block say what Zoomies says, and nothing else.
+
+    opencode sends these with every request, and a request's own value beats
+    whatever the server was started with - so a number left here quietly
+    overrules Zoomies. Where Zoomies has a number, it is written; where it
+    has none, the setting is removed and the server's own value stands.
+
+    wanted is None when Zoomies cannot say what the numbers should be; then
+    the block is not touched at all.
+    """
+    if wanted is None:
+        return []
+    o_node = mnode.get("options")
+    old = dict((o_node.value if o_node else None) or {})
+    keep = {k: v for k, v in old.items()
+            if _OPTION_ALIASES.get(k, k) not in SAMPLING_OPTIONS}
+    had = {_OPTION_ALIASES.get(k, k): v for k, v in old.items()
+           if _OPTION_ALIASES.get(k, k) in SAMPLING_OPTIONS}
+    new_options = dict(keep)
+    new_options.update({SAMPLING_OPTIONS[k]: v for k, v in wanted.items()})
+    if new_options == old:
+        return []
+
+    if not new_options:
+        _remove_member(plan, mnode, "options")
+    elif o_node is not None:
+        plan.edits.append((o_node.start, o_node.end,
+                           _render(new_options, indent)))
+    else:
+        plan.edits.append((anchor.end, anchor.end, ',\n%s"options": %s'
+                           % (indent, _render(new_options, indent))))
+
+    what = []
+    for key in SAMPLING_OPTIONS:
+        before, after = had.get(key), wanted.get(key)
+        if before == after:
+            continue
+        if after is None:
+            what.append("%s %s removed" % (key, json.dumps(before)))
+        elif before is None:
+            what.append("%s %s" % (key, json.dumps(after)))
+        else:
+            what.append("%s %s -> %s" % (key, json.dumps(before),
+                                         json.dumps(after)))
+    return ["options: " + ", ".join(what)] if what else []
+
+
 def _spec_for_config(model):
     """The Spec across every llama.cpp preset for this model. Presets can
     name different --chat-template-file files; if those disagree, opencode
@@ -282,13 +393,18 @@ def plan_sync(path=None, models=None):
                 continue
             for note in spec.notes:
                 plan.notes.append("%s: %s" % (mid, note))
-            _plan_model(plan, name, mid, mnode, spec, new_variants)
+            sampling, why = _sampling_for_config(model)
+            if sampling is None:
+                # No single answer to write, so its options block is left as
+                # it is - but the reasoning half of the sync still applies.
+                plan.skipped.append("%s: options left alone, %s" % (name, why))
+            _plan_model(plan, name, mid, mnode, spec, new_variants, sampling)
 
     _plan_agents(plan, root, new_variants)
     return plan
 
 
-def _plan_model(plan, name, mid, mnode, spec, new_variants):
+def _plan_model(plan, name, mid, mnode, spec, new_variants, sampling=None):
     text = plan.text
     want_reason = bool(spec.thinks)
     want_variants = variants_for(mid, spec)
@@ -323,6 +439,8 @@ def _plan_model(plan, name, mid, mnode, spec, new_variants):
                                % (indent, _render(want_variants, indent))))
         shown = [k for k, v in want_variants.items() if not v.get("disabled")]
         what.append("variants %s" % (" / ".join(shown) or "none"))
+
+    what += _plan_options(plan, name, mnode, anchor, indent, sampling)
     if what:
         plan.changed.append("%s: %s" % (name, "; ".join(what)))
     new_variants[name] = (old_variants, want_variants)
