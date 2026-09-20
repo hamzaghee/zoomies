@@ -1969,6 +1969,7 @@ class Zoomies:
 
     def _on_close(self):
         self.shutdown.set()
+        self.view.close()
         for pending in (self.after_id, self._vram_after):
             if pending:
                 try:
@@ -2034,8 +2035,9 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description="Zoomies")
     parser.add_argument("--layout", choices=sorted(LAYOUTS),
                         help="open in this layout (and remember it)")
-    parser.add_argument("--classic", action="store_const", dest="layout",
-                        const="classic", help="same as --layout classic")
+    for name in sorted(LAYOUTS):
+        parser.add_argument("--" + name, action="store_const", dest="layout",
+                            const=name, help="same as --layout %s" % name)
     return parser.parse_args(argv)
 
 

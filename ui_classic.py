@@ -389,6 +389,9 @@ class ClassicLayout:
     def first_poll(self, loaded):
         pass
 
+    def close(self):
+        pass
+
     def launch_started(self):
         pass
 

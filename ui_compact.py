@@ -176,6 +176,7 @@ class CompactLayout:
         self._picked = None               # (backend, endpoint, label) chosen
         self._gpu_rows = []
         self._launch_t0 = 0.0
+        self._tick_id = None              # the loading view's one-second tick
         self._hist_filter = None          # a model name, or None for all
         self._hist_key = None             # what the table currently shows
         self._hist_rows = []              # the rows behind it, filtered
@@ -777,8 +778,10 @@ class CompactLayout:
             anchor="w", padx=pad, pady=(self.px(10), self.px(2)))
         wrap = ttk.Frame(f)
         wrap.pack(fill="both", expand=True, padx=pad)
+        # width=20: a Text asks for 80 characters by default, which would
+        # make the whole window want to be that wide.
         self.load_out = tk.Text(wrap, bg=BG_PANEL, fg=FG_DIM, font=FONT_MONO,
-                                relief="flat", wrap="char", height=8,
+                                relief="flat", wrap="char", height=8, width=20,
                                 highlightthickness=1, highlightbackground=BORDER)
         self.load_out.pack(fill="both", expand=True)
         self.load_out.tag_configure("err", foreground=BAD)
@@ -983,6 +986,9 @@ class CompactLayout:
 
     def launch_finished(self, ok):
         self._launching = False
+        if self._tick_id:
+            self.root.after_cancel(self._tick_id)
+            self._tick_id = None
         self.load_bar.stop()
         self._show_mon_panel()
         if not ok:
@@ -990,12 +996,24 @@ class CompactLayout:
         self._paint_nav()
 
     def _tick_loading(self):
+        self._tick_id = None
         if not self._launching:
             return
         secs = int(time.time() - self._launch_t0)
         self.load_elapsed.configure(text="%d:%02d" % (secs // 60, secs % 60)
                                     if secs >= 60 else "%d s" % secs)
-        self.root.after(1000, self._tick_loading)
+        self._tick_id = self.root.after(1000, self._tick_loading)
+
+    def close(self):
+        """The window is going. A tick still pending would fire into a dead
+        interpreter, which Tk complains about on the way out."""
+        self._launching = False
+        if self._tick_id:
+            try:
+                self.root.after_cancel(self._tick_id)
+            except tk.TclError:
+                pass
+            self._tick_id = None
 
     def _cancel_clicked(self):
         self.cancel_btn.configure(text="Cancelling...")

@@ -20,18 +20,62 @@ HOW TO START IT
   includes it). No pip installs, no build step, no other dependencies.
 
 
+THE TWO LAYOUTS
+  The same Zoomies, drawn two ways. Both do everything; pick whichever
+  suits the screen you have.
+
+  CLASSIC   one wide window with every panel stacked: model, settings,
+            Loaded, and a Live pane with History, Output and Processes
+            as tabs. What Zoomies has always looked like.
+
+  COMPACT   a slim window meant to sit docked beside whatever you are
+            working in. One view at a time - Setup, Monitor, History,
+            Processes - picked from the icons along the bottom or with
+            Ctrl+1 to Ctrl+4. It opens on Setup, or on Monitor when a
+            model is already running, and jumps to Monitor when you
+            launch. A launch that fails goes back to Setup, where the
+            error sits beside the Launch button.
+
+            While a model loads, Monitor shows how long it has taken,
+            the log as it arrives, and a Cancel button. Cancelling a
+            llama.cpp load ends the script and the server under it, the
+            same way Unload stops it. Cancelling an Ollama load ends
+            only the script, because it may have started Ollama's own
+            server - Ollama can still finish loading in the background,
+            in which case the model simply appears as loaded, and any
+            temporary tag it made is cleaned up like any other.
+
+            Everything the classic top bar held lives in the "..."
+            menu: always on top, unload on exit, one model at a time,
+            the model folder, download, temporary tags, Sync opencode,
+            the log and scripts folders, Exit, and Unload all and exit.
+
+            It remembers where you put it and opens there next time.
+            The first time, it docks to the right edge of the screen.
+
+  SWITCHING
+  "Try compact layout" in the classic top bar, or "Switch to classic
+  layout" in the compact menu. Zoomies reopens in the other layout,
+  which takes a second; loaded models keep running, and whatever you
+  had typed in the form comes with it. The choice is remembered.
+  From a command line:  python app.py --compact   or   --classic
+
+
 WHERE THINGS LIVE
   Zoomies never writes into this project folder. Everything it keeps
   goes to  %LOCALAPPDATA%\Zoomies :
 
-    config.json    your preferences
+    config.json    your preferences, and which layout you last used
     session.json   what is running, and what Zoomies created
     presets.json   measured settings per model - see PRESETS below
+    history.json   the last 200 requests - see LIVE NUMBERS below
+    handoff.json   only while switching layouts; deleted once read
     scripts\       every generated script, newest 20 kept
     logs\          matching log for each script, newest 20 kept
     cache\         docs pages, model cards, and saved settings answers
 
-  Use "Open folder" and "Open log" in the Output pane to get to them.
+  "Open folder" and "Open log" get to them: in the Output pane in the
+  classic layout, in the "..." menu in the compact one.
 
 
 THE TWO BACKENDS
@@ -392,9 +436,17 @@ THE LIVE PANEL
   If no server can be reached, Zoomies falls back to reading Ollama's
   log, %LOCALAPPDATA%\Ollama\server.log, when it exists.
 
-  The History tab keeps the last 25 requests. A request is filed when it
-  finishes, when the next one starts, or once it has been quiet for five
-  seconds.
+  History keeps the last 200 requests, in history.json, so the numbers
+  you measured this morning are still there tomorrow. A request is filed
+  when it finishes, when the next one starts, or once it has been quiet
+  for five seconds; the file is written at most every few seconds, and
+  once more on the way out.
+
+  In the compact layout History groups requests by day, filters by model
+  with the chips at the top, and shows one line each - time, model,
+  backend, generation speed, context used. Open a row for its time to
+  first token, the prompt and output breakdown and the KV type. "Export
+  CSV" writes whatever the filter is showing; "Clear" forgets the lot.
 
   GPU numbers come from Windows' own "GPU Engine" counters, the same
   source Task Manager reads, and show the highest engine per card rather
@@ -415,11 +467,12 @@ KEEPING THE MACHINE CLEAN
   Unload button, then loads the new one. Untick it to run several
   models side by side.
 
-  THE PROCESSES TAB
+  PROCESSES
   Lists every llama.exe and ollama.exe on the machine with its memory,
   start time and what started it, and says in words what each one is.
-  Anything nothing accounts for is marked LEFTOVER, and the tab title
-  shows how many there are:
+  Anything nothing accounts for is listed first as a LEFTOVER, and the
+  tab title - or the Procs icon, in the compact layout - shows how many
+  there are:
 
       a llama.cpp chat or `ollama run` left open in a terminal
       a llama.cpp server started outside Zoomies
@@ -439,6 +492,8 @@ STATUS
   v1    live tokens/sec, TTFT, context bar and GPU utilisation.   DONE
   v1.5  settings from model cards and Ollama; llama.cpp backend.  DONE
         (the Unsloth Studio backend was removed in favour of it)
+  v2    a compact layout for a window docked at the side of the
+        screen, history kept on disk, and Cancel while loading.   DONE
 
   Zoomies covers everything the separate Ollama Monitor did, for both
   backends rather than just Ollama.
