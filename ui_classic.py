@@ -289,6 +289,14 @@ class ClassicLayout:
         self.ctx_label = ttk.Label(ctx, text="-", style="Dim.TLabel")
         self.ctx_label.pack(side="left", padx=(8, 0))
 
+        # What is on the cards right now, one bar each, side by side because
+        # the window is wide. The estimate bars above answer "will it fit";
+        # these answer "what is on there", and the compact layout has shown
+        # them since it was built.
+        self.gpu_box = ttk.Frame(box)
+        self.gpu_box.pack(fill="x", padx=8, pady=(0, 6))
+        self._gpu_cells = []
+
         tabs = ttk.Notebook(box)
         tabs.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
@@ -603,25 +611,59 @@ class ClassicLayout:
             self.ctx_bar.configure(value=0)
             self.ctx_label.configure(text="-")
 
+        self._show_gpus(snap)
+
+        self._show_history(snap.get("history") or [])
+
+    def _show_gpus(self, snap):
+        """A bar per card, from Windows' own counters via metrics.py.
+
+        The cells are rebuilt only when the number of cards changes - a
+        driver reinstall or a card appearing - because this runs five times
+        a second and destroying widgets that often flickers.
+        """
         gpus = snap.get("gpus") or []
-        if gpus:
-            parts = []
-            for gpu in gpus:
-                pct, used = gpu.get("pct"), gpu.get("used")
-                parts.append("%s %s%s" % (
-                    gpu["name"], "-" if pct is None else "%.0f%%" % pct,
-                    "" if used is None else "  %s/%.0f GB" % (
-                        vram.gb(used), gpu["vram"] / float(vram.GB))))
-            spilling = bool(snap.get("spills"))
-            if spilling:
-                parts.append("SPILLING INTO SYSTEM RAM")
-            self.live_gpu.configure(text="   ".join(parts),
-                                    style="Bad.TLabel" if spilling else "Dim.TLabel")
+        if len(gpus) != len(self._gpu_cells):
+            for child in self.gpu_box.winfo_children():
+                child.destroy()
+            self._gpu_cells = []
+            for i, _gpu in enumerate(gpus):
+                self.gpu_box.columnconfigure(i, weight=1, uniform="gpu")
+                cell = ttk.Frame(self.gpu_box)
+                cell.grid(row=0, column=i, sticky="ew",
+                          padx=(0, self.px(16)) if i < len(gpus) - 1 else 0)
+                head = ttk.Frame(cell)
+                head.pack(fill="x")
+                name = ttk.Label(head, text="", style="Dim.TLabel")
+                name.pack(side="left")
+                mem = ttk.Label(head, text="", style="Dim.TLabel")
+                mem.pack(side="right")
+                bar = ttk.Progressbar(cell, mode="determinate", maximum=1000,
+                                      style="Zoom.Horizontal.TProgressbar")
+                bar.pack(fill="x")
+                self._gpu_cells.append((name, mem, bar))
+
+        for gpu, (name, mem, bar) in zip(gpus, self._gpu_cells):
+            pct, used = gpu.get("pct"), gpu.get("used")
+            name.configure(text="%s%s" % (
+                gpu["name"], "" if pct is None else "   %.0f%% busy" % pct))
+            if used is None:
+                mem.configure(text="-")
+                bar.configure(value=0)
+            else:
+                mem.configure(text="%s / %.0f GB" % (
+                    vram.gb(used), gpu["vram"] / float(vram.GB)))
+                bar.configure(value=min(1000, int(
+                    1000.0 * used / max(1, gpu["vram"]))))
+
+        if snap.get("spills"):
+            self.live_gpu.configure(text="Spilling into system RAM",
+                                    style="Bad.TLabel")
         elif snap.get("gpu_error"):
             self.live_gpu.configure(text="GPU: %s" % snap["gpu_error"],
                                     style="Bad.TLabel")
-
-        self._show_history(snap.get("history") or [])
+        else:
+            self.live_gpu.configure(text="", style="Dim.TLabel")
 
     def _show_history(self, rows):
         # 200 rows rewritten five times a second is work for nothing: the

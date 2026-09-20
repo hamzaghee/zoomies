@@ -500,7 +500,15 @@ THE LIVE PANEL
   Once a model is answering, the Live strip shows what it is actually
   doing: prompt-eval speed, time to first token, generation rate, tokens
   produced, KV cache type, and how much of the context window is used.
-  Your GPUs and their utilisation sit on the right.
+
+  Under that is a bar per graphics card showing what is on it right now,
+  with how busy it is, from Windows' own counters via metrics.py - no
+  GPU is touched to read them. Both layouts draw the same thing; the
+  classic one used to show these numbers as a line of text.
+
+  These are not the bars in the settings, which show what the load you
+  are about to start will need. One answers "will it fit", the other
+  "what is on there now".
 
   WHERE THE NUMBERS COME FROM
   Both backends run llama.cpp underneath, whoever started them. Zoomies
