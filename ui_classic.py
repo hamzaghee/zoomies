@@ -16,7 +16,7 @@ import metrics
 import processes
 import vram
 from ui_common import (ACCENT, BAD, BG_PANEL, BORDER, FG, FG_DIM, FONT_MONO,
-                       WARN, human_bytes, until)
+                       WARN, fill_combo, human_bytes, until)
 
 
 class ClassicLayout:
@@ -405,21 +405,23 @@ class ClassicLayout:
     # ------------------------------------------------------------------
 
     def show_models(self, labels):
-        self.model_box.configure(values=labels)
+        # Never grown: it is the one full-width box, and widening it would
+        # push the window wider than the screen for a long model name.
+        fill_combo(self.model_box, labels)
 
     def show_presets(self, names):
-        self.preset_box.configure(values=names)
+        fill_combo(self.preset_box, names, grow=True, max_chars=22)
         self.preset_box.state(["!disabled"] if names else ["disabled"])
 
     def show_modes(self, labels):
-        self.mode_box.configure(values=labels)
+        fill_combo(self.mode_box, labels, grow=True, max_chars=26)
 
     def show_reasoning(self, levels, enabled):
-        self.reason_box.configure(values=levels)
+        fill_combo(self.reason_box, levels, grow=True, max_chars=12)
         self.reason_box.state(["!disabled"] if enabled else ["disabled"])
 
     def show_kv(self, choices, enabled):
-        self.kv_box.configure(values=choices)
+        fill_combo(self.kv_box, choices, grow=True, max_chars=14)
         self.kv_box.state(["!disabled"] if enabled else ["disabled"])
         self.kv_label.configure(style="Dim.TLabel" if enabled else "Off.TLabel")
 

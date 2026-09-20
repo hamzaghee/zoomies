@@ -7,6 +7,7 @@ controller that imports the layout.
 """
 
 import datetime
+import tkinter as tk
 from tkinter import ttk
 
 # Same palette as the Ollama Monitor, so the two tools look like siblings.
@@ -24,6 +25,29 @@ BAD = "#e06c75"
 FONT = ("Segoe UI", 9)
 FONT_BOLD = ("Segoe UI", 9, "bold")
 FONT_MONO = ("Consolas", 9)
+
+
+def fill_combo(box, values, grow=False, min_chars=6, max_chars=40):
+    """Put values into a combobox, and make sure they can be read.
+
+    A ttk Combobox is a fixed number of characters wide and its popup list
+    inherits that width, so anything longer is silently cut off - which is
+    how "Instruct (or non-thinking) mode" came to read "Instruct (or non-t".
+    The popup is always widened to the longest value. grow widens the box
+    itself too, for the layouts with room for it; the narrow one leaves the
+    box as laid out and lets the popup do the talking.
+    """
+    values = tuple(values)
+    box.configure(values=values)
+    longest = max([len(str(v)) for v in values] or [0])
+    if grow:
+        box.configure(width=max(min_chars, min(longest + 1, max_chars)))
+    try:
+        popdown = box.tk.call("ttk::combobox::PopdownWindow", box)
+        box.tk.call("%s.f.l" % popdown, "configure", "-width",
+                    max(min_chars, longest + 1))
+    except tk.TclError:
+        pass                  # a Tk build that names its popup differently
 
 
 def human_bytes(n):

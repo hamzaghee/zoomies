@@ -24,7 +24,8 @@ import metrics
 import processes
 import vram
 from ui_common import (ACCENT, BAD, BG, BG_FIELD, BG_PANEL, BORDER, FG, FG_DIM,
-                       FONT_MONO, OK_GREEN, WARN, human_bytes, until)
+                       FONT_MONO, OK_GREEN, WARN, fill_combo, human_bytes,
+                       until)
 
 # Segoe Fluent Icons ships with Windows 11 and MDL2 Assets with Windows 10;
 # both put the same glyphs at the same code points.
@@ -1045,7 +1046,7 @@ class CompactLayout:
     # ------------------------------------------------------------------
 
     def show_models(self, labels):
-        self.model_box.configure(values=labels)
+        fill_combo(self.model_box, labels)
         self.models_lbl.configure(text="%d model%s" % (
             len(labels), "" if len(labels) == 1 else "s") if labels else "")
 
@@ -1066,15 +1067,17 @@ class CompactLayout:
         self._paint_chips()
 
     def show_modes(self, labels):
-        self.mode_box.configure(values=labels)
+        # The boxes keep their laid-out width here - the window is narrow on
+        # purpose - so only the popup grows to fit what it is offering.
+        fill_combo(self.mode_box, labels)
         self.mode_box.state(["!disabled"] if labels else ["disabled"])
 
     def show_reasoning(self, levels, enabled):
-        self.reason_box.configure(values=levels)
+        fill_combo(self.reason_box, levels)
         self.reason_box.state(["!disabled"] if enabled else ["disabled"])
 
     def show_kv(self, choices, enabled):
-        self.kv_box.configure(values=choices)
+        fill_combo(self.kv_box, choices)
         self.kv_box.state(["!disabled"] if enabled else ["disabled"])
         self.kv_label.configure(style="Dim.TLabel" if enabled else "Off.TLabel")
 
