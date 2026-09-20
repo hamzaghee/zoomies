@@ -21,6 +21,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import backends
 import metrics
+import processes
 import vram
 from ui_common import (ACCENT, BAD, BG, BG_FIELD, BG_PANEL, BORDER, FG, FG_DIM,
                        FONT_MONO, OK_GREEN, WARN, human_bytes, until)
@@ -167,6 +168,7 @@ class CompactLayout:
         self.log_lines = collections.deque(maxlen=500)
         self.entries, self.labels = {}, {}
         self._wrapping = []               # labels that wrap to the form's width
+        self._form_width = 0              # what the last resize measured
         self._backend_status = {}
         self._est = None
         self._vram_labels = {}
@@ -177,6 +179,9 @@ class CompactLayout:
         self._hist_filter = None          # a model name, or None for all
         self._hist_key = None             # what the table currently shows
         self._hist_rows = []              # the rows behind it, filtered
+        self.procs = []
+        self._procs_key = None            # what the list currently shows
+        self._proc_pick = None            # the row End was pressed on
         self._styles()
         self._build()
         self.show("setup")
@@ -192,6 +197,18 @@ class CompactLayout:
         st = ttk.Style()
         st.configure("Section.TLabel", background=BG, foreground=FG,
                      font=("Segoe UI", 9, "bold"))
+        # Processes reads as a list of small print: what each one is, then
+        # its numbers underneath.
+        st.configure("Small.TLabel", background=BG, foreground=FG,
+                     font=("Segoe UI", 8))
+        st.configure("SmallDim.TLabel", background=BG, foreground=FG_DIM,
+                     font=("Segoe UI", 8))
+        st.configure("SmallWarn.TLabel", background=BG, foreground=WARN,
+                     font=("Segoe UI", 8))
+        st.configure("SmallOff.TLabel", background=BG, foreground="#5a5a5a",
+                     font=("Segoe UI", 8))
+        st.configure("Small.TButton", font=("Segoe UI", 8),
+                     padding=(self.px(6), 0))
         st.configure("Bar.TFrame", background=BG_PANEL)
         st.configure("Bar.TLabel", background=BG_PANEL, foreground=FG_DIM)
         st.configure("Hint.TFrame", background=HINT_BG)
@@ -380,8 +397,14 @@ class CompactLayout:
 
         def resize(event):
             canvas.itemconfigure(item, width=event.width)
-            for lbl, spare in self._wrapping:
-                lbl.configure(wraplength=max(self.px(100), event.width - spare))
+            self._form_width = event.width
+            for entry in list(self._wrapping):
+                lbl, spare = entry
+                try:
+                    lbl.configure(wraplength=max(self.px(100),
+                                                 event.width - spare))
+                except tk.TclError:
+                    self._wrapping.remove(entry)   # a rebuilt row; it is gone
             fit()
 
         def wheel(event):
@@ -397,8 +420,12 @@ class CompactLayout:
         return inner
 
     def _wrap(self, lbl, spare):
-        """Wrap lbl to the form's width, less spare pixels of padding."""
+        """Wrap lbl to the form's width, less spare pixels of padding. Rows
+        built after the last resize take the width it saw."""
         self._wrapping.append((lbl, self.px(spare)))
+        if self._form_width:
+            lbl.configure(wraplength=max(self.px(100),
+                                         self._form_width - self.px(spare)))
         return lbl
 
     def _section(self, parent, title):
@@ -884,9 +911,18 @@ class CompactLayout:
         scroll.configure(command=self.hist_tree.yview)
 
     def _build_procs(self, f):
-        self._placeholder(f, "The process list is still being built. The "
-                          "classic layout has it under Processes.")
-        self.procs_lbl = self._line(f)
+        pad = self.px(12)
+        top = ttk.Frame(f)
+        top.pack(fill="x", padx=pad, pady=(self.px(8), 0))
+        line = ttk.Frame(top)
+        line.pack(fill="x")
+        self.procs_lbl = ttk.Label(line, text="", style="Small.TLabel")
+        self.procs_lbl.pack(side="left")
+        self._link(line, "Refresh", self.app._refresh_processes).pack(side="right")
+        self.procs_left_lbl = ttk.Label(top, text="", style="SmallWarn.TLabel")
+        self.procs_left_lbl.pack(anchor="w", pady=(self.px(2), 0))
+
+        self.procs_box = self._scrolled(f)
 
     # ------------------------------------------------------------------
     # navigation
@@ -1443,16 +1479,83 @@ class CompactLayout:
         self._show_history([])
 
     def show_procs(self, items):
+        """items: the processes.Proc list, or None when it could not be read."""
         if items is None:
-            self.procs_lbl.configure(text="Could not read the process list.")
+            self._set(self.procs_lbl, "Could not read the process list.",
+                      style="SmallWarn.TLabel")
             return
+        self.procs = items
         left = [p for p in items if p.leftover]
-        self.procs_lbl.configure(text="%d running, %d leftover%s."
-                                 % (len(items), len(left),
-                                    "" if len(left) == 1 else "s"))
+        self._set(self.procs_lbl, "%d running \u00b7 %s" % (
+            len(items), processes.fmt_ram(sum(p.ram for p in items))),
+            style="Small.TLabel")
+        self._set(self.procs_left_lbl, "%d leftover%s \u00b7 %s" % (
+            len(left), "" if len(left) == 1 else "s",
+            processes.fmt_ram(sum(p.ram for p in left))) if left else "")
         if len(left) != self._leftovers:
             self._leftovers = len(left)
             self._paint_nav()
 
+        key = tuple((p.pid, p.what, p.ram // (64 * 1024 ** 2)) for p in items)
+        if key == self._procs_key:
+            return                        # same list, give or take 64 MB
+        self._procs_key = key
+        for child in self.procs_box.winfo_children():
+            child.destroy()
+        if not items:
+            ttk.Label(self.procs_box, text="Nothing of ours is running.",
+                      style="SmallOff.TLabel").pack(anchor="w",
+                                                    padx=self.px(12))
+            return
+        for head, group in (("Leftovers \u00b7 nothing accounts for these", left),
+                            ("Accounted for", [p for p in items
+                                               if not p.leftover])):
+            if not group:
+                continue
+            ttk.Label(self.procs_box, text=head, style="SmallDim.TLabel").pack(
+                anchor="w", padx=self.px(12), pady=(self.px(10), self.px(2)))
+            for proc in group:
+                self._proc_row(proc)
+            if group is left:
+                ttk.Button(self.procs_box, style="Small.TButton",
+                           text="Clean up %d leftover%s" % (
+                               len(left), "" if len(left) == 1 else "s"),
+                           command=self.app._clean_leftovers).pack(
+                    fill="x", padx=self.px(12), pady=(self.px(6), 0))
+
+    def _proc_row(self, proc):
+        row = ttk.Frame(self.procs_box)
+        row.pack(fill="x", padx=self.px(12), pady=(self.px(2), 0))
+        row.columnconfigure(0, weight=1)
+        what = ttk.Label(row, text=proc.what, justify="left",
+                         style="SmallWarn.TLabel" if proc.leftover
+                         else "Small.TLabel")
+        what.grid(row=0, column=0, sticky="w")
+        self._wrap(what, 90)
+        if proc.protected:
+            ttk.Label(row, text="kept", style="SmallOff.TLabel").grid(
+                row=0, column=1, sticky="e")
+        elif proc.zoomies_port or "Ollama unloads it" in proc.what:
+            # Unloading is the right way to stop these; ending them by hand
+            # would leave the backend believing they are still there.
+            ttk.Label(row, text="unload", style="SmallOff.TLabel").grid(
+                row=0, column=1, sticky="e")
+        else:
+            ttk.Button(row, text="End", style="Small.TButton",
+                       command=lambda p=proc: self._end_proc(p)).grid(
+                row=0, column=1, sticky="e", padx=(self.px(6), 0))
+        started = proc.started[11:16] if len(proc.started) > 15 else proc.started
+        ttk.Label(row, text=join("pid %d" % proc.pid,
+                                 processes.fmt_ram(proc.ram), started,
+                                 proc.parent or "parent exited"),
+                  style="SmallDim.TLabel").grid(row=1, column=0, columnspan=2,
+                                                sticky="w")
+
+    def _end_proc(self, proc):
+        """The controller asks before ending anything, and says what it will
+        end - so the row is offered to it as the selection."""
+        self._proc_pick = proc.pid
+        self.app._end_selected()
+
     def selected_procs(self):
-        return []
+        return [p for p in self.procs if p.pid == self._proc_pick][:1]

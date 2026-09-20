@@ -192,7 +192,10 @@ def classify(rows, session=None, blob_names=None):
                     model or "?", port_text, gone)
                 p.leftover = True
     order = {"ollama app.exe": 0, "ollama.exe": 1, "llama.exe": 2, "llama-server.exe": 2}
-    procs.sort(key=lambda p: (p.leftover, order.get(p.name.lower(), 3), p.started))
+    # Leftovers first: they are the only rows anyone is here to act on, and
+    # burying them under the healthy processes is how they go unnoticed.
+    procs.sort(key=lambda p: (not p.leftover, order.get(p.name.lower(), 3),
+                              p.started))
     return procs
 
 
