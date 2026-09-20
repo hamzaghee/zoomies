@@ -142,53 +142,16 @@ class ClassicLayout:
                    command=lambda: app._apply_optimal(force=True)).pack(
             side="left", padx=(6, 0))
 
-        grid = ttk.Frame(box)
-        grid.pack(fill="x", padx=8, pady=4)
-
-        # Four label/entry column pairs. The entry columns share one uniform
-        # group so every field is exactly the same width - without that, grid
-        # hands the leftovers to whichever column has the longest label and
-        # the row comes out ragged.
-        for col in range(4):
-            grid.columnconfigure(col * 2, weight=0)
-            grid.columnconfigure(col * 2 + 1, weight=1, uniform="field")
-
-        def make_field(key, row, col, span=1):
-            lab = ttk.Label(grid, text=backends.SETTING_TEXT[key],
-                            style="Dim.TLabel", anchor="e")
-            lab.grid(row=row, column=col * 2, sticky="e", padx=(0, 6), pady=3)
-            # Small minimum width: the columns stretch to fill the window
-            # anyway, and the default 20 characters made the grid wider
-            # than the window at its minimum size.
-            ent = ttk.Entry(grid, textvariable=app.vars[key], justify="left",
-                            width=8)
-            ent.grid(row=row, column=col * 2 + 1, sticky="ew",
-                     padx=(0, self.px(18)), pady=3,
-                     columnspan=(span * 2 - 1) if span > 1 else 1)
-            self.entries[key], self.labels[key] = ent, lab
-
-        row = 0
-        for row, keys in enumerate(backends.SETTING_ROWS):
-            for col, key in enumerate(keys):
-                if key:
-                    make_field(key, row, col)
-        # KV cache takes the free cell beside Parallel: it is a load-time
-        # setting like its neighbours, and the top bar has no room left.
-        kv_row = len(backends.SETTING_ROWS) - 1
-        self.kv_label = ttk.Label(grid, text="KV cache", style="Dim.TLabel",
-                                  anchor="e")
-        self.kv_label.grid(row=kv_row, column=6, sticky="e", padx=(0, 6), pady=3)
-        self.kv_box = ttk.Combobox(grid, textvariable=app.kv_var,
-                                   state="readonly", width=8,
-                                   values=backends.KV_CACHE_CHOICES)
-        self.kv_box.grid(row=kv_row, column=7, sticky="ew",
-                         padx=(0, self.px(18)), pady=3)
-        self.kv_box.bind("<<ComboboxSelected>>", lambda e: app._kv_changed())
-
-        for key in backends.SETTING_WIDE:
-            row += 1
-            make_field(key, row, 0, span=4)
-        # --chat-template-file changes which template sets the levels.
+        # Two groups, because there are two kinds of setting here and the
+        # difference is the one that catches people out: the loading ones
+        # cost VRAM and need the model started again, the writing ones are
+        # only the server's defaults and take effect on the next reply.
+        self._field_group(box, backends.WRITE_TITLE, backends.WRITE_BLURB,
+                          backends.WRITE_KEYS)
+        self._field_group(box, backends.LOAD_TITLE, backends.LOAD_BLURB,
+                          backends.LOAD_KEYS + backends.SETTING_WIDE)
+        # --chat-template-file changes which template sets the levels. The
+        # controller also watches this field as it is typed in.
         self.entries["extra_flags"].bind(
             "<FocusOut>", lambda e: app._refresh_reasoning())
 
@@ -239,6 +202,46 @@ class ClassicLayout:
         self.vram_lbl.pack(side="right")
 
         self._build_live(self.root)
+
+    def _field_group(self, parent, title, blurb, keys):
+        """One labelled block of fields, four to a row."""
+        app = self.app
+        head = ttk.Frame(parent)
+        head.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(head, text=title, style="Head.TLabel").pack(side="left")
+        ttk.Label(head, text="   " + blurb, style="Dim.TLabel").pack(side="left")
+
+        grid = ttk.Frame(parent)
+        grid.pack(fill="x", padx=8, pady=(2, 4))
+        # The entry columns share one uniform group so every field comes out
+        # the same width - without it, grid hands the leftovers to whichever
+        # column has the longest label and the row reads ragged.
+        for col in range(4):
+            grid.columnconfigure(col * 2, weight=0)
+            grid.columnconfigure(col * 2 + 1, weight=1, uniform="field")
+
+        row = col = 0
+        for key in keys:
+            wide = key in backends.SETTING_WIDE
+            if wide and col:
+                row, col = row + 1, 0
+            label = ttk.Label(grid, text=backends.SETTING_TEXT.get(
+                key, "KV cache"), style="Dim.TLabel", anchor="e")
+            label.grid(row=row, column=col * 2, sticky="e", padx=(0, 6), pady=3)
+            if key == "kv_cache":
+                field = ttk.Combobox(grid, textvariable=app.kv_var,
+                                     state="readonly", width=8,
+                                     values=backends.KV_CACHE_CHOICES)
+                field.bind("<<ComboboxSelected>>", lambda e: app._kv_changed())
+                self.kv_box, self.kv_label = field, label
+            else:
+                field = ttk.Entry(grid, textvariable=app.vars[key],
+                                  justify="left", width=8)
+                self.entries[key], self.labels[key] = field, label
+            field.grid(row=row, column=col * 2 + 1, sticky="ew",
+                       padx=(0, self.px(18)), pady=3,
+                       columnspan=7 if wide else 1)
+            row, col = (row + 1, 0) if wide or col == 3 else (row, col + 1)
 
     def _build_live(self, parent):
         """Compact live-metrics strip plus a tabbed History/Output pane.

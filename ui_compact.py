@@ -50,11 +50,14 @@ NAV_BG = BG_FIELD
 NAV_HOVER = "#37373b"
 HINT_BG = "#12324a"               # accent tint behind the context hint
 
-# Setup's sections. KV cache is a dropdown rather than a typed value but
-# sits in the grid like one; the rest are backends.SETTING_LABELS keys.
-SAMPLING = ("temperature", "top_p", "top_k", "min_p")
-SIZING = ("context_length", "gpu_layers", "kv_cache", "parallel")
-ADVANCED = ("repeat_penalty", "presence_penalty", "seed", "keep_alive")
+# Setup's sections, from the two groups in backends: what a setting does
+# is the division worth showing, so "How it writes" holds every sampling
+# number and "How it loads" everything that costs VRAM. Seed stays with
+# the writing ones - it steers the words, however rarely it is touched.
+# Extra flags is the only thing left folded away, being a line of text
+# rather than a number.
+WRITES = backends.WRITE_KEYS
+LOADS = backends.LOAD_KEYS
 TONE = {"Ok.TLabel": OK_GREEN, "Warn.TLabel": WARN, "Bad.TLabel": BAD,
         "Dim.TLabel": FG_DIM}
 
@@ -562,13 +565,18 @@ class CompactLayout:
                                                justify="left"), 24)
         self.source_lbl.pack(fill="x", pady=(self.px(6), 0))
 
-        # Sampling
-        box, _head = self._section(form, "Sampling")
-        self._fields(box, SAMPLING)
+        # How it writes
+        box, _head = self._section(form, backends.WRITE_TITLE)
+        ttk.Label(box, text=backends.WRITE_BLURB, style="Off.TLabel",
+                  wraplength=self.px(330), justify="left").pack(anchor="w")
+        self._fields(box, WRITES)
 
-        # Sizing, with what the load will need beside the numbers driving it
-        box, _head = self._section(form, "Sizing")
-        self._fields(box, SIZING)
+        # How it loads, with what the load will need beside the numbers
+        # driving it
+        box, _head = self._section(form, backends.LOAD_TITLE)
+        ttk.Label(box, text=backends.LOAD_BLURB, style="Off.TLabel",
+                  wraplength=self.px(330), justify="left").pack(anchor="w")
+        self._fields(box, LOADS)
         self._build_vram(box)
 
         # Advanced, folded away: rarely touched, and the form is long enough
@@ -578,7 +586,6 @@ class CompactLayout:
         self.adv_head.bind("<Button-1>", lambda e: self._toggle_advanced())
         self.adv_head.pack(side="left")
         self.adv_body = ttk.Frame(box)
-        self._fields(self.adv_body, ADVANCED)
         lab = ttk.Label(self.adv_body, text=backends.SETTING_TEXT["extra_flags"],
                         style="Dim.TLabel")
         lab.pack(anchor="w")

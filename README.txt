@@ -171,6 +171,29 @@ THE OLLAMA TEMPORARY TAG - READ THIS ONE
   time.
 
 
+THE TWO KINDS OF SETTING
+  The form is in two labelled groups, because the difference between
+  them is what catches people out.
+
+  "How it loads" - context, GPU layers, KV cache, parallel, keep alive
+  and Extra flags - decides how the weights are laid into the cards.
+  These cost VRAM, and the model has to be loaded again for a change to
+  mean anything. Presets are made of these, which is why a benchmark can
+  measure them.
+
+  "How it writes" - temperature, top P, top K, min P, repeat penalty,
+  presence penalty and seed - steers the words that come out. No VRAM,
+  no effect on speed. On llama.cpp these are handed to the server when it
+  starts, as its defaults, so they need a reload too - but they are only
+  defaults, and an app that sends its own values with a request still
+  wins. Keeping opencode from doing exactly that is what "Sync
+  opencode..." is for; see OPENCODE.
+
+  Seed sits with the writing settings. It is reached for when
+  reproducing a benchmark rather than when tuning, but it steers the
+  words like the rest of them.
+
+
 FILL FROM DOCS
   Picking a model fills in its recommended settings straight away - the
   "Fill from docs" button does the same on demand. The line underneath

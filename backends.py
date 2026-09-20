@@ -65,15 +65,33 @@ SETTING_LABELS = (
 )
 SETTING_TEXT = dict(SETTING_LABELS)
 
-# Explicit grid, rather than flowing the list into columns: sampling knobs on
-# the first row, sizing on the second, backend-specific ones last, so the
-# fields Ollama greys out sit together instead of being scattered.
+# The two kinds of setting, which is the division that actually matters and
+# the one the form is built around. Loading settings decide how the weights
+# are laid into the cards: they cost VRAM and the model has to be started
+# again for a change to mean anything. Writing settings steer the words that
+# come out; they cost nothing and are only the server's defaults, which a
+# client can override per request - see opencode.py.
+#
+# "kv_cache" is a dropdown rather than a typed value, but it sits in the
+# grid like one. "extra_flags" is a whole line to itself.
+LOAD_KEYS = ("context_length", "gpu_layers", "kv_cache", "parallel",
+             "keep_alive")
+WRITE_KEYS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+              "presence_penalty", "seed")
+SETTING_WIDE = ("extra_flags",)
+
+LOAD_TITLE = "How it loads"
+LOAD_BLURB = "Uses VRAM. Reload the model for a change to apply."
+WRITE_TITLE = "How it writes"
+WRITE_BLURB = "Steers the words. The server's defaults; a client can override."
+
+# The same two groups as rows of four, for the layout that lays them out as
+# a grid rather than as sections.
 SETTING_ROWS = (
     ("temperature", "top_p", "top_k", "min_p"),
-    ("repeat_penalty", "presence_penalty", "context_length", "seed"),
-    ("keep_alive", "gpu_layers", "parallel", None),
+    ("repeat_penalty", "presence_penalty", "seed", None),
+    ("context_length", "gpu_layers", "parallel", "keep_alive"),
 )
-SETTING_WIDE = ("extra_flags",)
 
 
 def slug(text):
