@@ -392,8 +392,22 @@ PRESETS
   answer different questions: the docs know the model, only a benchmark
   knows your cards.
 
-  The Preset dropdown lists the presets saved for the selected model on
-  the selected backend, and is greyed out when there are none.
+  The "For" dropdown lists the presets saved for the selected model on
+  the selected backend, and is greyed out when there are none. Each is
+  shown by the job it was saved for - "Coding agent", "General chat",
+  "Fast short prompts" - so you pick what you are about to do rather
+  than remembering which saved name meant what. A preset saved without
+  a job shows its own name instead.
+
+  Picking one also points the docs recipe at that job. Where a model's
+  docs carry more than one set of sampling numbers - Qwen lists "precise
+  coding tasks" beside "general tasks" - the coding preset takes the
+  coding numbers without being asked. That was the old Mode dropdown's
+  job; it is now called "Docs recipe" and sits with the writing settings
+  (under Advanced in the compact layout), for the rare case where you
+  want a recipe the preset does not imply. A passage whose leading words
+  name nothing - the docs sentence "set the parameters to ..." used to
+  produce a recipe called "To" - is listed as "Recommended".
 
   Picking one gives you both: the docs' numbers underneath, the
   preset's on top. A preset usually holds the load settings - context,
@@ -412,7 +426,11 @@ PRESETS
   SAVING ONE
   "Save..." beside the dropdown ("Save current" in the compact layout)
   writes the form as a preset for the selected model on the selected
-  backend, and asks for a name. Everything filled in is saved - what
+  backend, and asks for a name and what it is for. The job is stored
+  with the preset rather than guessed from its name later - guessing is
+  how "Long context" came to mean a 64k preset on one model and an 8k
+  one on another. It also warns when a sampling number is missing,
+  because "Sync opencode..." sends only what a preset holds. Everything filled in is saved - what
   you typed, what the docs filled in and what a preset put there -
   because that is what Launch would use. Empty fields are left out, so
   is anything this backend greys out, and a preset saved on one backend

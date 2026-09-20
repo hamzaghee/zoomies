@@ -27,6 +27,67 @@ FONT_BOLD = ("Segoe UI", 9, "bold")
 FONT_MONO = ("Consolas", 9)
 
 
+class PresetDialog(tk.Toplevel):
+    """Name a preset and say what it is for.
+
+    A plain askstring would do for the name, but the job it was measured
+    for has to be stored with it rather than guessed from the name later -
+    that guessing is what made "Long context" mean two different things.
+    """
+
+    def __init__(self, parent, title, blurb, intents, name="", intent="",
+                 note=""):
+        tk.Toplevel.__init__(self, parent)
+        self.title(title)
+        self.result = None
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.resizable(False, False)
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        ttk.Label(body, text=blurb, style="Dim.TLabel", justify="left",
+                  wraplength=380).pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(body, text="Name").pack(anchor="w")
+        self._name = tk.StringVar(value=name)
+        entry = ttk.Entry(body, textvariable=self._name, width=44)
+        entry.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(body, text="What is it for?").pack(anchor="w")
+        self._labels = {label: key for key, label in intents}
+        self._intent = tk.StringVar(
+            value=next((l for l, k in self._labels.items() if k == intent), ""))
+        box = ttk.Combobox(body, textvariable=self._intent, state="readonly",
+                           values=tuple(self._labels) + ("Nothing in particular",))
+        box.pack(fill="x")
+        ttk.Label(body, text="Sets what the form offers for this model.",
+                  style="Off.TLabel").pack(anchor="w", pady=(2, 10))
+
+        if note:
+            ttk.Label(body, text=note, style="Warn.TLabel", justify="left",
+                      wraplength=380).pack(anchor="w", pady=(0, 10))
+
+        row = ttk.Frame(body)
+        row.pack(fill="x")
+        ttk.Button(row, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(row, text="Save", style="Go.TButton",
+                   command=self._ok).pack(side="right", padx=(0, 8))
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        entry.focus_set()
+        entry.selection_range(0, "end")
+        self.grab_set()
+        self.wait_window(self)
+
+    def _ok(self):
+        name = self._name.get().strip()
+        if not name:
+            return
+        self.result = (name, self._labels.get(self._intent.get(), ""))
+        self.destroy()
+
+
 def fill_combo(box, values, grow=False, min_chars=6, max_chars=40):
     """Put values into a combobox, and make sure they can be read.
 

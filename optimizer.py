@@ -527,6 +527,33 @@ ROW = re.compile(r"^\s*\|(.+)\|\s*$")
 RULE = re.compile(r"^\s*\|[\s:|\-]+\|\s*$")
 
 
+# What is left of a sentence once the filler is stripped is not always a
+# name. "set the parameters to `temperature=...`" leaves "to", which then
+# appeared in the form as a mode called To. A fragment this short, or one
+# that is only a linking word, names nothing.
+_NOT_A_NAME = {"to", "for", "with", "as", "on", "in", "at", "by", "of",
+               "the", "a", "an", "and", "or", "is", "are", "be", "use"}
+
+
+def _clean_labels(labels):
+    """Saved labels, with any that name nothing put right."""
+    out = {}
+    for key, label in (labels or {}).items():
+        _, fixed = name_or_default(str(label))
+        out[key] = fixed if fixed == "Recommended" else label
+    return out
+
+
+def name_or_default(head):
+    """(key, label) for a passage's leading words - "Recommended" when
+    those words turn out not to name anything."""
+    words = [w for w in re.split(r"\s+", head.strip()) if w]
+    if not words or len(head) > 48 or all(
+            w.lower().strip(",.;:") in _NOT_A_NAME for w in words):
+        return "default", "Recommended"
+    return mode_key(head), head[0].upper() + head[1:]
+
+
 def mode_key(label):
     """Collapse wildly inconsistent column labels onto a few stable keys.
 
@@ -827,7 +854,7 @@ def _result_from(saved, model, mode):
     return Result(
         settings={k: (v if isinstance(v, str) else fmt(v))
                   for k, v in settings.items()},
-        modes=modes, mode_labels=dict(saved.get("labels") or {}), mode=chosen,
+        modes=modes, mode_labels=_clean_labels(saved.get("labels")), mode=chosen,
         page=saved.get("page", ""), url=saved.get("url", ""),
         section=saved.get("section", ""), line=int(saved.get("line") or 0),
         age=age, notes=notes,
@@ -1202,10 +1229,7 @@ def parse_card(block_lines):
             continue
         head = re.sub(r"\([^)]*\)", " ", text[:first.start()])
         head = re.sub(r"\s+", " ", _CARD_FILLER.sub(" ", head)).strip(" :,.;-*")
-        if not head or len(head) > 48:
-            mk, label = "default", "Default"
-        else:
-            mk, label = mode_key(head), head[0].upper() + head[1:]
+        mk, label = name_or_default(head)
         labels.setdefault(mk, label)
         for key, value in hits:
             out.setdefault(mk, {})[key] = value

@@ -80,6 +80,27 @@ WRITE_KEYS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
               "presence_penalty", "seed")
 SETTING_WIDE = ("extra_flags",)
 
+# What a preset is for. A preset says how to load a model; this says which
+# job that was measured for, so the form can offer "Coding agent" rather
+# than asking you to remember which saved name meant what. The key is what
+# goes in presets.json, the label is what the form shows, and the mode keys
+# are the docs' own recipes in the order they suit that job - see
+# optimizer.mode_key for where those come from.
+INTENTS = (
+    ("agent", "Coding agent", ("coder", "precise coding tasks", "deepswe",
+                               "instruct", "default")),
+    ("chat", "General chat", ("general tasks", "default", "instruct")),
+    ("fast", "Fast short prompts", ("general tasks", "default", "instruct")),
+)
+INTENT_LABELS = {key: label for key, label, _ in INTENTS}
+INTENT_MODES = {key: modes for key, _, modes in INTENTS}
+
+
+def intent_label(key):
+    """The label for a stored intent, or "" for an untagged preset."""
+    return INTENT_LABELS.get(str(key or ""), "")
+
+
 LOAD_TITLE = "How it loads"
 LOAD_BLURB = "Uses VRAM. Reload the model for a change to apply."
 WRITE_TITLE = "How it writes"

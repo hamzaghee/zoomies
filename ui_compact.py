@@ -539,7 +539,7 @@ class CompactLayout:
         self.apply_link.pack(side="right")
         row = ttk.Frame(box)
         row.pack(fill="x")
-        ttk.Label(row, text="Preset", style="Dim.TLabel").pack(side="left")
+        ttk.Label(row, text="For", style="Dim.TLabel").pack(side="left")
         self._link(row, "Save current", app._save_preset).pack(side="right")
         self.chips = ttk.Frame(box)
         self.chips.pack(fill="x")
@@ -550,9 +550,11 @@ class CompactLayout:
         pair.pack(fill="x", pady=(self.px(6), 0))
         for col in (0, 1):
             pair.columnconfigure(col, weight=1, uniform="pair")
+        # Mode used to sit beside Reasoning. It is the docs' recipe for the
+        # sampling numbers, which picking what a preset is for now answers,
+        # so it has moved to Advanced and left Reasoning the row.
         for col, (text, var, attr, handler) in enumerate((
-                ("Mode", app.mode_var, "mode_box", app._mode_changed),
-                ("Reasoning", app.reason_var, "reason_box", app._reason_changed))):
+                ("Reasoning", app.reason_var, "reason_box", app._reason_changed),)):
             cell = ttk.Frame(pair)
             cell.grid(row=0, column=col, sticky="ew",
                       padx=(0, self.px(8)) if col == 0 else (self.px(8), 0))
@@ -586,6 +588,12 @@ class CompactLayout:
         self.adv_head.bind("<Button-1>", lambda e: self._toggle_advanced())
         self.adv_head.pack(side="left")
         self.adv_body = ttk.Frame(box)
+        ttk.Label(self.adv_body, text="Docs recipe",
+                  style="Dim.TLabel").pack(anchor="w")
+        self.mode_box = ttk.Combobox(self.adv_body, textvariable=app.mode_var,
+                                     state="readonly", width=6)
+        self.mode_box.pack(fill="x", pady=(0, self.px(6)))
+        self.mode_box.bind("<<ComboboxSelected>>", lambda e: app._mode_changed())
         lab = ttk.Label(self.adv_body, text=backends.SETTING_TEXT["extra_flags"],
                         style="Dim.TLabel")
         lab.pack(anchor="w")

@@ -228,17 +228,14 @@ def _sampling_for_config(model):
     """The sampling numbers Zoomies owns for this model, or (None, why).
 
     They come from the model's presets, which is the only place Zoomies
-    keeps numbers when the GUI is not open. Two cases leave the model
-    alone rather than writing: presets that disagree, and presets with no
-    sampling numbers at all.
+    keeps numbers when the GUI is not open. Presets that disagree are the
+    one case left alone: there is no single answer to write.
 
-    The second matters more than it looks. Silence in a preset is not an
-    instruction to use the server's numbers - it usually means nobody has
-    saved any yet. Stripping the block on that basis would hand every one
-    of those models to llama.cpp's built-in defaults (temperature 0.8),
-    not to the numbers its docs recommend, and quietly change how it
-    writes. So Zoomies only takes a model's options over once it has
-    numbers of its own to put there.
+    A preset with no sampling numbers still counts as an answer - opencode
+    is stripped back to the server's own values - because a model whose
+    numbers live in two places is exactly what this is meant to end. The
+    summary says so per model, loudly enough to act on: the fix is to save
+    the numbers into the preset, not to leave them in opencode.
     """
     presets = list(state.presets_for(
         [c for c in (model.id, model.gguf_path, model.label) if c], "llamacpp"))
@@ -251,11 +248,7 @@ def _sampling_for_config(model):
         if other != subsets[0]:
             return None, ("its presets disagree about the sampling numbers "
                           "(%s vs %s)." % (subsets[0] or "none", other or "none"))
-    if not subsets or not subsets[0]:
-        return None, ("no preset of its own holds sampling numbers, so "
-                      "opencode keeps sending its. Save a preset with them "
-                      "to move them here.")
-    return subsets[0], ""
+    return (subsets[0] if subsets else {}), ""
 
 
 def _plan_options(plan, name, mnode, anchor, indent, wanted):
@@ -398,6 +391,12 @@ def plan_sync(path=None, models=None):
                 # No single answer to write, so its options block is left as
                 # it is - but the reasoning half of the sync still applies.
                 plan.skipped.append("%s: options left alone, %s" % (name, why))
+            elif not sampling:
+                plan.notes.append(
+                    "%s: no preset of its own holds sampling numbers, so "
+                    "opencode is left sending none and the server's own "
+                    "values stand. Save them into its preset to pin them."
+                    % name)
             _plan_model(plan, name, mid, mnode, spec, new_variants, sampling)
 
     _plan_agents(plan, root, new_variants)

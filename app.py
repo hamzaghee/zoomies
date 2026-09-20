@@ -36,7 +36,8 @@ import state
 import ui_classic
 import ui_compact
 import vram
-from ui_common import BG, BG_PANEL, BORDER, FG, FONT, FONT_MONO, apply_style
+from ui_common import (BG, BG_PANEL, BORDER, FG, FONT, FONT_MONO,
+                       PresetDialog, apply_style)
 
 try:
     import optimizer
@@ -222,6 +223,7 @@ class Zoomies:
         self._vram_req = 0
         self._vram_after = None
         self._reasoning_after = None      # debounce for the Extra flags watch
+        self._intent_tried = False        # the preset's recipe was sought
         self._vram_est = None
         self._vram_adapters = vram.adapters()
         self._spill_alerted = set()       # pids already alerted
@@ -516,8 +518,16 @@ class Zoomies:
             candidates = [model.id, model.gguf_path, model.label]
         self._presets = list(state.presets_for(
             [c for c in candidates if c], be.name)) if model else []
-        names = tuple(p["name"] for p in self._presets)
-        self.view.show_presets(names)
+        # Shown by the job each was measured for, where it says so: picking
+        # "Coding agent" reads better than remembering which saved name was
+        # the one with the long context. Untagged presets keep their name.
+        self._preset_labels = {}
+        for preset in self._presets:
+            label = backends.intent_label(preset.get("use_for")) or preset["name"]
+            while label in self._preset_labels:      # two for the same job
+                label = "%s (%s)" % (label, preset["name"])
+            self._preset_labels[label] = preset
+        self.view.show_presets(tuple(self._preset_labels))
         self.preset_var.set("")
 
     def _preset_chosen(self):
@@ -530,13 +540,14 @@ class Zoomies:
         and the preset wins wherever both have a value. Values arrive blue
         either way, so it stays obvious which numbers you typed.
         """
-        name = self.preset_var.get()
-        preset = next((p for p in getattr(self, "_presets", [])
-                       if p["name"] == name), None)
+        label = self.preset_var.get()
+        preset = getattr(self, "_preset_labels", {}).get(label)
         if not preset:
             return
+        name = preset["name"]
         be = self.backend()
         self._active_preset = preset
+        self._intent_tried = False
         self._refresh_apply_btn()
         applied, skipped = self._apply_preset_values(preset, force=True)
         level = str(preset.get("settings", {}).get("reasoning") or "")
@@ -562,6 +573,34 @@ class Zoomies:
         if optimizer is not None and model is not None:
             self._preset_fresh = True
             self._start_lookup(model, keep_edits=True)
+
+    def _intent_mode(self):
+        """Point the docs recipe at the job the active preset is for.
+
+        A model's docs often carry more than one set of sampling numbers -
+        Qwen lists "precise coding tasks" beside "general tasks" - and
+        choosing between them was the whole job of the old Mode dropdown.
+        A preset that records what it is for answers that itself, so the
+        recipe follows the preset instead of being a separate question.
+
+        Returns True when it asked for a re-read, which the caller must let
+        finish rather than carrying on with the numbers now on screen.
+        """
+        preset = self._active_preset
+        wanted = backends.INTENT_MODES.get(str((preset or {}).get("use_for") or ""))
+        # Once per preset: the re-read comes back through here, and a recipe
+        # the docs do not actually have must not send it round again.
+        if not wanted or len(self.mode_keys) < 2 or self._intent_tried:
+            return False
+        self._intent_tried = True
+        keys = {key: label for label, key in self.mode_keys.items()}
+        key = next((k for want in wanted for k in keys
+                    if want in k or k in want), None)
+        if key is None or key == self.mode_keys.get(self.mode_var.get()):
+            return False
+        self.mode_var.set(keys[key])
+        self._mode_changed()
+        return True
 
     def _apply_preset_values(self, preset, force=False):
         """Put a preset's fields into the form. force: over values you typed
@@ -601,6 +640,10 @@ class Zoomies:
         preset - because that is what Launch would use. Empty fields and
         ones this backend greys out are left out. Saving under an existing
         name replaces that preset's settings and keeps its note.
+
+        The dialog also asks what the preset is for. That is stored with
+        it, so the form can offer the job rather than the name, and so
+        "Sync opencode..." knows which docs recipe the numbers came from.
         """
         model, be = self.selected_model(), self.backend()
         if model is None:
@@ -615,15 +658,23 @@ class Zoomies:
             self.set_status("Nothing to save - every field is empty.",
                             "Warn.TLabel")
             return
-        suggested = (self._active_preset or {}).get("name", "")
-        name = simpledialog.askstring(
-            "Save as preset",
-            "Save these %d settings for %s on %s.\n\nPreset name:"
-            % (len(settings), model.label, be.display_name),
-            initialvalue=suggested, parent=self.root)
-        name = (name or "").strip()
-        if not name:
+        active = self._active_preset or {}
+        missing = [k for k in backends.WRITE_KEYS
+                   if be.supports(k) and k not in settings]
+        answer = PresetDialog(
+            self.root, "Save as preset",
+            "Saving %d settings for %s on %s." % (
+                len(settings), model.label, be.display_name),
+            tuple((k, l) for k, l, _ in backends.INTENTS),
+            name=active.get("name", ""), intent=active.get("use_for", ""),
+            note=("Nothing is filled in for %s. opencode is synced to send "
+                  "only what a preset holds, so those fall back to the "
+                  "server's own values." % ", ".join(
+                      backends.SETTING_TEXT.get(k, k) for k in missing)
+                  if missing else "")).result
+        if not answer:
             return
+        name, intent = answer
         candidates = [c for c in (model.id, model.gguf_path, model.label) if c]
         old = state.find_preset(candidates, be.name, name)
         if old and not messagebox.askyesno(
@@ -633,6 +684,10 @@ class Zoomies:
             return
         preset = dict(old or {})
         preset.update(name=name, backend=be.name, settings=settings)
+        if intent:
+            preset["use_for"] = intent
+        else:
+            preset.pop("use_for", None)
         preset.setdefault("note", "Saved from the form on %s."
                           % time.strftime("%Y-%m-%d"))
         if not state.save_preset(candidates, preset):
@@ -640,8 +695,9 @@ class Zoomies:
                             "Warn.TLabel")
             return
         self._refresh_preset_box()
-        self.preset_var.set(name)
+        self.preset_var.set(backends.intent_label(intent) or name)
         self._active_preset = preset
+        self._intent_tried = False
         self._refresh_apply_btn()
         self.source_note = "preset: %s" % name
         self.view.set_source(self._preset_text(preset))
@@ -966,6 +1022,8 @@ class Zoomies:
         self.view.show_modes(tuple(self.mode_keys))
         if result.mode:
             self.mode_var.set(result.mode_labels.get(result.mode, result.mode))
+        if self._intent_mode():
+            return          # re-reading for the recipe that job wants
 
         # The preset goes back on top: it was measured on this machine, the
         # docs were not. Its reasoning level too, when it has one.

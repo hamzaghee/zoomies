@@ -115,18 +115,13 @@ class ClassicLayout:
         self.apply_btn = ttk.Button(bar, text="Fill from docs",
                                     command=app._apply_optimal)
         self.apply_btn.pack(side="left")
-        ttk.Label(bar, text="Mode").pack(side="left", padx=(14, 4))
-        self.mode_box = ttk.Combobox(bar, textvariable=app.mode_var,
-                                     state="readonly", width=22)
-        self.mode_box.pack(side="left")
-        self.mode_box.bind("<<ComboboxSelected>>", lambda e: app._mode_changed())
         ttk.Label(bar, text="Reasoning").pack(side="left", padx=(14, 4))
         self.reason_box = ttk.Combobox(bar, textvariable=app.reason_var,
                                        state="readonly", width=14)
         self.reason_box.pack(side="left")
         self.reason_box.bind("<<ComboboxSelected>>",
                              lambda e: app._reason_changed())
-        ttk.Label(bar, text="Preset").pack(side="left", padx=(14, 4))
+        ttk.Label(bar, text="For").pack(side="left", padx=(14, 4))
         self.preset_box = ttk.Combobox(bar, textvariable=app.preset_var,
                                        state="readonly", width=18)
         self.preset_box.pack(side="left")
@@ -146,8 +141,16 @@ class ClassicLayout:
         # difference is the one that catches people out: the loading ones
         # cost VRAM and need the model started again, the writing ones are
         # only the server's defaults and take effect on the next reply.
-        self._field_group(box, backends.WRITE_TITLE, backends.WRITE_BLURB,
-                          backends.WRITE_KEYS)
+        writes = self._field_group(box, backends.WRITE_TITLE,
+                                   backends.WRITE_BLURB, backends.WRITE_KEYS)
+        # The docs' own recipe for these numbers. Picking what a preset is
+        # for normally answers this, so it sits here rather than in the bar.
+        ttk.Label(writes, text="Docs recipe", style="Dim.TLabel").pack(
+            side="left", padx=(0, 4))
+        self.mode_box = ttk.Combobox(writes, textvariable=app.mode_var,
+                                     state="readonly", width=22)
+        self.mode_box.pack(side="left")
+        self.mode_box.bind("<<ComboboxSelected>>", lambda e: app._mode_changed())
         self._field_group(box, backends.LOAD_TITLE, backends.LOAD_BLURB,
                           backends.LOAD_KEYS + backends.SETTING_WIDE)
         # --chat-template-file changes which template sets the levels. The
@@ -242,6 +245,7 @@ class ClassicLayout:
                        padx=(0, self.px(18)), pady=3,
                        columnspan=7 if wide else 1)
             row, col = (row + 1, 0) if wide or col == 3 else (row, col + 1)
+        return head
 
     def _build_live(self, parent):
         """Compact live-metrics strip plus a tabbed History/Output pane.
