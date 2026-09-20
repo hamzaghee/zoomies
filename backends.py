@@ -86,11 +86,13 @@ SETTING_WIDE = ("extra_flags",)
 # goes in presets.json, the label is what the form shows, and the mode keys
 # are the docs' own recipes in the order they suit that job - see
 # optimizer.mode_key for where those come from.
+# Only recipes that describe a task belong here. Thinking versus
+# non-thinking is the Reasoning dropdown's question, and a job that
+# silently answered it would switch a model's thinking off for you.
 INTENTS = (
-    ("agent", "Coding agent", ("coder", "precise coding tasks", "deepswe",
-                               "instruct", "default")),
-    ("chat", "General chat", ("general tasks", "default", "instruct")),
-    ("fast", "Fast short prompts", ("general tasks", "default", "instruct")),
+    ("agent", "Coding agent", ("coder", "precise coding tasks", "deepswe")),
+    ("chat", "General chat", ("general tasks",)),
+    ("fast", "Fast short prompts", ("general tasks",)),
 )
 INTENT_LABELS = {key: label for key, label, _ in INTENTS}
 INTENT_MODES = {key: modes for key, _, modes in INTENTS}
