@@ -221,6 +221,7 @@ class Zoomies:
         self._vram_manual = set()         # sliders the user has moved
         self._vram_req = 0
         self._vram_after = None
+        self._reasoning_after = None      # debounce for the Extra flags watch
         self._vram_est = None
         self._vram_adapters = vram.adapters()
         self._spill_alerted = set()       # pids already alerted
@@ -333,6 +334,12 @@ class Zoomies:
         """Hooks that need both the variables and a layout to report to."""
         for key in ("context_length", "gpu_layers", "parallel", "extra_flags"):
             self.vars[key].trace_add("write", lambda *a: self._schedule_vram())
+        # --chat-template-file swaps the template the server renders, and the
+        # template is what decides the reasoning levels. Watching the flags
+        # means the Reasoning list follows them on its own, instead of
+        # standing there stale until something else happened to refresh it.
+        self.vars["extra_flags"].trace_add(
+            "write", lambda *a: self._schedule_reasoning())
         self.kv_var.trace_add("write", lambda *a: self._schedule_vram())
         # With it on, the model loaded now is unloaded first, so its VRAM
         # stops counting as "in use by other apps".
@@ -874,10 +881,16 @@ class Zoomies:
                          args=(model, force, keep_edits), daemon=True).start()
 
     def _refresh_apply_btn(self):
-        """Greyed out while a lookup runs, and while a preset is active -
-        picking the preset already filled everything the docs have."""
-        usable = optimizer is not None and not self._looking_up             and self._active_preset is None
-        self.view.set_apply_enabled(usable)
+        """Greyed out only while a lookup is already running.
+
+        It used to be greyed for as long as a preset was active, on the
+        grounds that the preset had already filled everything in - but that
+        turned picking a preset into a dead end you had to press Clear to
+        escape. The docs fill in around a preset anyway: they only touch
+        fields the preset left empty, and the preset goes back on top.
+        """
+        self.view.set_apply_enabled(optimizer is not None
+                                    and not self._looking_up)
 
     def _apply_worker(self, model, force=False, keep_edits=False):
         """keep_edits: set when a preset asked for the docs, which must fill
@@ -1119,6 +1132,17 @@ class Zoomies:
     # the .gguf header (vram.py), so it never touches a GPU. Each card also
     # has a value for what everything else already holds on it; those follow
     # Windows' own counters until you move one.
+
+    def _schedule_reasoning(self):
+        """Re-read the template shortly after the last keystroke in Extra
+        flags, not on every one: each read opens the .gguf."""
+        if self._reasoning_after:
+            self.root.after_cancel(self._reasoning_after)
+        self._reasoning_after = self.root.after(400, self._reasoning_due)
+
+    def _reasoning_due(self):
+        self._reasoning_after = None
+        self._refresh_reasoning()
 
     def _schedule_vram(self):
         """Re-estimate shortly after the last change, not on every key."""

@@ -180,8 +180,9 @@ FILL FROM DOCS
   so its numbers never sit under the new model's name; anything you
   typed yourself stays. When nothing is found, the status line says so,
   and pressing "Fill from docs" offers the list of pages to choose from.
-  The button is greyed out while a preset is active, because picking the
-  preset already filled in everything the docs have (see PRESETS).
+  The button is greyed out only while a lookup is running. Pressing it
+  with a preset active is fine: the docs fill in the fields the preset
+  left empty and the preset's own numbers go back on top (see PRESETS).
 
   WHERE IT LOOKS, BEST FIRST
     1. The Unsloth documentation page for that model.
@@ -241,6 +242,10 @@ FILL FROM DOCS
       muse-glimmer   low / medium / high / xhigh - no off switch
       ministral-3    cannot be switched - "separate model": its Reasoning
                      version is a different download
+
+  The levels are read for whatever Extra flags currently say, because
+  --chat-template-file swaps the template the server renders. Typing in
+  that field re-reads them a moment later, so the list is never stale.
 
   Where a template takes a value without listing the allowed ones (Muse
   Glimmer), the list comes from the model's docs, and reasoning.py says
