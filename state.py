@@ -46,6 +46,13 @@ PRESETS_PATH = os.path.join(ROOT, "presets.json")
 # morning are still there tomorrow - the metrics themselves only live as
 # long as the process that watched them.
 HISTORY_PATH = os.path.join(ROOT, "history.json")
+# How much of each card can actually be handed out, learned by watching.
+# A card's sticker VRAM is not its budget: Windows keeps a reserve for the
+# desktop and gives a process less than the raw total, so a load can spill
+# with gigabytes apparently free. The moment a model spills, the card's
+# usage is that budget - if more could have been placed there, it would
+# have been - which makes this measurable rather than a guess.
+VRAM_LIMITS_PATH = os.path.join(ROOT, "vram_limits.json")
 
 KEEP_FILES = 20                  # how many generated scripts / logs to retain
 
@@ -195,6 +202,59 @@ def load_history(limit=None):
 
 def save_history(rows):
     return write_json(HISTORY_PATH, {"version": 1, "rows": list(rows)})
+
+
+def load_vram_limits():
+    """{luid: {"vram", "ceiling", "clean", "seen", "at"}}."""
+    cards = read_json(VRAM_LIMITS_PATH, {}).get("cards")
+    return cards if isinstance(cards, dict) else {}
+
+
+def save_vram_limits(cards):
+    return write_json(VRAM_LIMITS_PATH, {"version": 1, "cards": cards})
+
+
+def note_vram(cards, luid, vram_bytes, used, spilling):
+    """Fold one observation of a card into what is known about its budget.
+
+    Spilling puts a ceiling on the card: that is as much as it would hand
+    out. Not spilling puts a floor under it: that much was handed out and
+    was fine. The lowest ceiling is kept because it is the one that has to
+    hold, and a later floor above it wins - a ceiling measured while
+    something else was busy should not bind forever.
+
+    Returns True when anything changed and the file is worth writing.
+    """
+    if not luid or not used or not vram_bytes:
+        return False
+    card = dict(cards.get(luid) or {})
+    before = dict(card)
+    card["vram"] = int(vram_bytes)
+    if spilling:
+        ceiling = int(used)
+        card["ceiling"] = min(int(card.get("ceiling") or ceiling), ceiling)
+        # A floor recorded earlier, with less on the card, is not evidence
+        # against a spill happening now. The newer measurement wins; a later
+        # clean run can raise it again on its own.
+        card["clean"] = min(int(card.get("clean") or ceiling), ceiling)
+        card["seen"] = int(card.get("seen") or 0) + 1
+        card["at"] = time.strftime("%Y-%m-%d %H:%M")
+    else:
+        card["clean"] = max(int(card.get("clean") or 0), int(used))
+    if card == before:
+        return False
+    cards[luid] = card
+    return True
+
+
+def vram_budget(cards, luid, vram_bytes):
+    """What one card can really hand out, or its sticker VRAM if unknown."""
+    card = cards.get(luid) or {}
+    ceiling = int(card.get("ceiling") or 0)
+    if not ceiling:
+        return int(vram_bytes)
+    # A clean run above an old ceiling proves the ceiling has moved.
+    return min(int(vram_bytes), max(ceiling, int(card.get("clean") or 0)))
 
 
 def preset_key(text):

@@ -89,6 +89,9 @@ GPU_COUNTERS = (r"\GPU Engine(*)\Utilization Percentage",
 # so the line sits well above that.
 SPILL_BYTES = 768 * 1024 ** 2
 SPILL_MIN_DEDICATED = 2 * 1024 ** 3    # only processes that hold a model
+# Naming a card as the one that spilled needs more than its share of normal
+# staging, which spreads across every card a model is split over.
+SPILL_CARD_BYTES = 256 * 1024 ** 2
 
 GPU_POLL_SECONDS = 2
 SLOTS_POLL_SECONDS = 0.5      # how often each llama-server is asked
@@ -750,8 +753,10 @@ class Metrics:
         """({luid: max utilisation percent}, memory, error).
 
         memory is {"used": {luid: bytes}, "procs": {pid: {"dedicated": n,
-        "shared": n, "by_card": {luid: n}}}}: VRAM in use per card, and per
-        process, summed over its cards and split by card.
+        "shared": n, "by_card": {luid: n}, "shared_by_card": {luid: n}}}}:
+        VRAM in use per card, and per process, summed over its cards and
+        split by card. Shared memory is split by card too: which card a
+        process could not fit on is the whole point of noticing a spill.
 
         Windows reports one value per engine per process; Task Manager shows
         the highest per adapter rather than the sum, and so do we - summing
@@ -817,9 +822,11 @@ class Metrics:
                     pid = PID_RE.search(header)
                     if pid:
                         entry = procs.setdefault(int(pid.group(1)), {
-                            "dedicated": 0, "shared": 0, "by_card": {}})
+                            "dedicated": 0, "shared": 0, "by_card": {},
+                            "shared_by_card": {}})
                         if header.endswith("Shared Usage"):
                             entry["shared"] += int(number)
+                            entry["shared_by_card"][luid] = int(number)
                         else:
                             entry["dedicated"] += int(number)
                             entry["by_card"][luid] = int(number)
@@ -847,6 +854,27 @@ class Metrics:
             # is still installed: same hardware key, a new LUID, and no
             # counters behind it. Keep the one that is actually reporting.
             adapters = state.physical_adapters(adapters, live_luids=usage)
+            procs = memory.get("procs") or {}
+            spilled = spills(procs)
+            # Which cards are hosting a model at all. A card carrying one is
+            # the only card whose usage says anything about what it will
+            # hand out to the next one; the desktop alone proves nothing.
+            hosting = {}
+            for pid, mem in procs.items():
+                if mem.get("dedicated", 0) < SPILL_MIN_DEDICATED:
+                    continue
+                if not model_server(pid):
+                    continue
+                for luid, held in (mem.get("by_card") or {}).items():
+                    hosting[luid] = hosting.get(luid, 0) + held
+            # What each card pushed into system RAM, so a card's own row can
+            # say it. Held apart from "used", which counts dedicated VRAM
+            # only and so can look comfortable on the very card that ran out.
+            per_card = {}
+            for spill in spilled:
+                for card in spill["cards"]:
+                    per_card[card["luid"]] = (per_card.get(card["luid"], 0)
+                                              + card["shared"])
             rows = []
             for adapter in adapters:
                 rows.append({
@@ -855,9 +883,9 @@ class Metrics:
                     "vram": adapter["vram"],
                     "pct": usage.get(adapter["luid"]),
                     "used": (memory.get("used") or {}).get(adapter["luid"]),
+                    "spilled": per_card.get(adapter["luid"], 0),
+                    "model_bytes": hosting.get(adapter["luid"], 0),
                 })
-            procs = memory.get("procs") or {}
-            spilled = spills(procs)
             with self.lock:
                 self.state["gpus"] = rows
                 self.state["gpu_error"] = err
@@ -874,16 +902,28 @@ def model_server(pid):
 
 
 def spills(procs):
-    """[{"pid", "image", "dedicated", "shared"}] for model servers with part
-    of their memory pushed into system RAM."""
+    """[{"pid", "image", "dedicated", "shared", "cards"}] for model servers
+    with part of their memory pushed into system RAM.
+
+    "cards" is [{"luid", "shared", "dedicated"}] worst first, because a spill
+    is a fact about one card rather than about the machine: the card that ran
+    out can be full while another still has room, and only the per-card view
+    says whether the answer is a smaller model or a different split.
+    """
     out = []
     for pid, mem in procs.items():
         if mem["shared"] < SPILL_BYTES or mem["dedicated"] < SPILL_MIN_DEDICATED:
             continue
         image = model_server(pid)
-        if image:
-            out.append({"pid": pid, "image": image,
-                        "dedicated": mem["dedicated"], "shared": mem["shared"]})
+        if not image:
+            continue
+        cards = [{"luid": luid, "shared": shared,
+                  "dedicated": (mem.get("by_card") or {}).get(luid, 0)}
+                 for luid, shared in (mem.get("shared_by_card") or {}).items()
+                 if shared >= SPILL_CARD_BYTES]
+        out.append({"pid": pid, "image": image,
+                    "dedicated": mem["dedicated"], "shared": mem["shared"],
+                    "cards": sorted(cards, key=lambda c: -c["shared"])})
     return out
 
 

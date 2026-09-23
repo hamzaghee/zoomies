@@ -1356,15 +1356,21 @@ class CompactLayout:
                 self._set(mem, "-")
                 bar.configure(value=0)
             else:
-                self._set(mem, "%s / %.0f GB" % (vram.gb(used),
-                                                 gpu["vram"] / float(vram.GB)))
+                # Spilled bytes are in system RAM, so "used" leaves them out
+                # and the bar can look comfortable on the card that ran out.
+                spilled = gpu.get("spilled") or 0
+                self._set(mem, "%s / %.0f GB%s" % (
+                    vram.gb(used), gpu["vram"] / float(vram.GB),
+                    " +%s in RAM" % vram.gb(spilled) if spilled else ""))
                 bar.configure(value=min(1000, int(1000.0 * used
                                                   / max(1, gpu["vram"]))))
         spills = snap.get("spills") or []
         if spills:
+            named = {g["luid"]: g["name"] for g in gpus if g.get("luid")}
             text = "Spilling into system RAM: " + ", ".join(
-                "%.1f GB (pid %d)" % (sp["shared"] / float(vram.GB), sp["pid"])
-                for sp in spills)
+                "%s GB on %s" % (vram.gb(c["shared"]),
+                                 named.get(c["luid"], "?"))
+                for sp in spills for c in (sp.get("cards") or []))
             self._set(self.spill_lbl, text, style="Bad.TLabel")
         elif snap.get("gpu_error"):
             self._set(self.spill_lbl, "GPU: %s" % snap["gpu_error"],

@@ -651,8 +651,14 @@ class ClassicLayout:
                 mem.configure(text="-")
                 bar.configure(value=0)
             else:
-                mem.configure(text="%s / %.0f GB" % (
-                    vram.gb(used), gpu["vram"] / float(vram.GB)))
+                # Spilled bytes sit in system RAM, so they are missing from
+                # "used" and the bar can read comfortably on the one card
+                # that ran out. Said on the row rather than left to a label
+                # somewhere else that seems to contradict it.
+                spilled = gpu.get("spilled") or 0
+                mem.configure(text="%s / %.0f GB%s" % (
+                    vram.gb(used), gpu["vram"] / float(vram.GB),
+                    "   + %s GB in RAM" % vram.gb(spilled) if spilled else ""))
                 bar.configure(value=min(1000, int(
                     1000.0 * used / max(1, gpu["vram"]))))
 

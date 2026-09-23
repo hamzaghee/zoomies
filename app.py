@@ -61,6 +61,11 @@ CANCELLED = "cancelled"          # RunResult.message of a load stopped by Cancel
 POLL_SECONDS = 2.0
 REFRESH_MS = 200
 
+# How llama.cpp is told which share of the layers each card takes. Held here
+# because the spill alert both writes one and has to drop the one already in
+# Extra flags before it does.
+SPLIT_FLAGS = {"-ts", "--tensor-split"}
+
 
 def _number_or_text(value):
     """"65536" -> 65536, "0.05" -> 0.05, anything else as typed - so a saved
@@ -227,6 +232,8 @@ class Zoomies:
         self._vram_est = None
         self._vram_adapters = vram.adapters()
         self._spill_alerted = set()       # pids already alerted
+        self._vram_limits = state.load_vram_limits()
+        self._spill_status = False        # the status line is ours to clear
         self._vram_seen = None            # the counter sample last followed
         self._filling = False             # see _set_value
         self._active_preset = None        # the preset under the docs values
@@ -323,6 +330,11 @@ class Zoomies:
         self.reason_var = tk.StringVar()
         self.preset_var = tk.StringVar()
         self.kv_var = tk.StringVar(value=backends.KV_CACHE_START)
+
+        # What opencode was last told about the running servers, so the
+        # poll only opens its config when something has actually changed.
+        self._opencode_seen = None
+        self._opencode_moan = ""
 
         self.vars, self.dirty = {}, {}
         keys = [k for row in backends.SETTING_ROWS for k in row if k]
@@ -1301,24 +1313,37 @@ class Zoomies:
         if est.problem:
             self.view.show_vram_estimate(None, est.problem, "Dim.TLabel", "")
             return
-        parts = ["%s %s + %s = %s / %.0f GB" % (
+        # Against what each card will hand out, not its sticker VRAM.
+        parts = ["%s %s + %s = %s / %s GB" % (
             c.name, vram.gb(c.other), vram.gb(c.model), vram.gb(c.used),
-            c.total / float(vram.GB)) for c in est.cards]
+            vram.gb(c.limit)) for c in est.cards]
         worst = min(est.cards, key=lambda c: c.spare)
-        if not est.fits:
+        # Tight first: it is a kind of not-fitting now, and the two read
+        # very differently to someone deciding whether to press Load.
+        if est.tight:
+            verdict = "tight - only %s GB spare on %s" % (
+                vram.gb(worst.spare), worst.name)
+            style = "Warn.TLabel"
+        elif not est.fits:
             verdict = "will spill about %s GB into system RAM on %s" % (
                 vram.gb(-worst.spare), worst.name)
             style = "Bad.TLabel"
-        elif est.tight:
-            verdict = "tight - %s GB spare on %s" % (vram.gb(worst.spare),
-                                                     worst.name)
-            style = "Warn.TLabel"
         else:
             verdict = "fits - %s GB spare" % vram.gb(worst.spare)
             style = "Ok.TLabel"
         notes = ["Other apps + this model = total. Accurate to about 0.25 GB "
                  "per card; keeps %s GB free per card for \"largest context\"."
-                 % vram.gb(est.margin)] + est.notes
+                 % vram.gb(est.margin)]
+        measured = [c for c in est.cards if c.budget and c.budget < c.total]
+        if measured:
+            notes.append(
+                "Card limits are measured rather than the number on the box "
+                "(%s): Windows holds the rest back for the desktop, and a "
+                "model that spilled there is what showed where the line is."
+                % ", ".join("%s %s of %.0f GB" % (
+                    c.name, vram.gb(c.budget), c.total / float(vram.GB))
+                    for c in measured))
+        notes += est.notes
         self.view.show_vram_estimate(
             est, "%s   ->   %s" % ("   |   ".join(parts), verdict), style,
             "  ".join(notes), verdict=verdict)
@@ -1334,36 +1359,163 @@ class Zoomies:
         Windows does not fail a load that does not fit; it backs the rest
         with shared memory and the model just runs slowly, so without this
         nothing on screen would say why.
+
+        Which card ran out is the useful half, and the two cases want
+        opposite answers: a card that is full while another still has room
+        is a split to rebalance, not a model to shrink. A card is only
+        named once the counters say it holds the spilled memory - the
+        process totals alone cannot tell the two apart.
         """
         live_pids = set(snap.get("gpu_procs") or {})
         if live_pids:                     # not after a failed sample
             self._spill_alerted &= live_pids
-        for spill in snap.get("spills") or []:
+        spilling = snap.get("spills") or []
+        if not spilling and self._spill_status:
+            # Said once, and taken back once: a status line still claiming a
+            # spill after the model was reloaded smaller is worse than saying
+            # nothing at all.
+            self.set_status("No longer spilling into system RAM.", "Ok.TLabel")
+            self._spill_status = False
+        for spill in spilling:
             if spill["pid"] in self._spill_alerted:
                 continue
             self._spill_alerted.add(spill["pid"])
             name = next((m.label for m in self.loaded_items
-                         if m.pid == spill["pid"]), "") or \
-                os.path.basename(spill["image"])
-            text = ("%s is spilling: %.1f GB of its memory is in system RAM "
-                    "(%.1f GB on the cards), so prompts and generation will be "
-                    "much slower. Lower Context, pick a smaller KV cache type, "
-                    "or close whatever else is using the cards."
-                    % (name, spill["shared"] / float(vram.GB),
-                       spill["dedicated"] / float(vram.GB)))
+                         if m.pid == spill["pid"]), "") or os.path.basename(
+                             spill["image"])
+            text, split = self._spill_text(name, spill, snap)
             self.log("[zoomies] " + text, "err")
-            self.set_status("%s is spilling into system RAM." % name, "Bad.TLabel")
-            self._alert("Model spilling into system RAM", text)
+            self.set_status("%s is spilling into system RAM." % name,
+                            "Bad.TLabel")
+            self._spill_status = True
+            self._alert("Model spilling into system RAM", text, split)
 
-    def _alert(self, title, text):
-        """A small window that does not block the rest of the app."""
+    def _learn_vram(self, snap):
+        """Remember what each card actually hands out.
+
+        Every poll while a model is loaded is a measurement. A card with
+        part of that model in system RAM is at its limit - if more could
+        have been placed there it would have been - and a card holding one
+        without spilling proves at least that much is fine. Cards with no
+        model on them are ignored: the desktop sitting at 3 GB says nothing
+        about what the next 11 GB request will be given.
+
+        This is the only way to know. Windows publishes the sticker VRAM,
+        never the budget, and the gap between them is what makes an
+        estimate say "fits" and a load spill anyway.
+        """
+        changed = False
+        for row in snap.get("gpus") or []:
+            if row.get("used") is None or not row.get("model_bytes"):
+                continue
+            if state.note_vram(self._vram_limits, row.get("luid"),
+                               row.get("vram"), row["used"],
+                               bool(row.get("spilled"))):
+                changed = True
+        if changed:
+            state.save_vram_limits(self._vram_limits)
+            self._schedule_vram()     # whatever is on screen was worked out
+                                      # against the old limits
+
+    def _spill_text(self, name, spill, snap):
+        """(what spilled and the fix it calls for, the -ts to offer).
+
+        The flag is handed back rather than only named, because a split is
+        the one fix nobody can work out in their head: it is per card, it
+        is proportional, and the numbers move with whatever else is on the
+        cards at the time.
+        """
+        cards = {g["luid"]: g for g in (snap.get("gpus") or []) if g.get("luid")}
+        worst = (spill.get("cards") or [None])[0]
+        where, roomy, split = "", [], ""
+        if worst and worst["luid"] in cards:
+            card = cards[worst["luid"]]
+            where = " on %s" % card["name"]
+            if card.get("used") is not None:
+                where += " (at %s / %.0f GB)" % (
+                    vram.gb(card["used"]), card["vram"] / float(vram.GB))
+            roomy = [c for luid, c in cards.items()
+                     if luid != worst["luid"] and c.get("used") is not None
+                     and c["vram"] - c["used"] >= worst["shared"]]
+        if roomy:
+            split = self._spill_split(spill, snap)
+            fix = ("%s still has %s GB free, so moving some layers there "
+                   "should fix it without shrinking the model: "
+                   % (roomy[0]["name"],
+                      vram.gb(roomy[0]["vram"] - roomy[0]["used"])))
+            fix += ("put %s in Extra flags and load again." % split if split
+                    else "-ts in Extra flags decides the share each card takes.")
+        else:
+            fix = ("No other card has room for it, so lower Context, pick a "
+                   "smaller KV cache type, or close whatever else is using "
+                   "the cards.")
+        return ("%s is spilling%s: %s GB of its memory is in system RAM "
+                "(%s GB on the cards), so prompts and generation will be much "
+                "slower. %s" % (name, where, vram.gb(spill["shared"]),
+                                vram.gb(spill["dedicated"]), fix)), split
+
+    def _spill_split(self, spill, snap):
+        """A -ts giving each card a share of this model in proportion to the
+        room it has for it, or "" when there is nothing sensible to say.
+
+        This model's own bytes come off each card first: the question is
+        where its layers could go, not where they sit now. The cards come
+        from vram.cards_for, so the entries land in llama.cpp's own device
+        order - the integrated GPU is skipped, which means there are as
+        many numbers as there are rows in the VRAM panel.
+        """
+        cards = vram.cards_for(
+            reasoning.split_flags(self.vars["extra_flags"].get()),
+            self._vram_adapters)
+        if len(cards) < 2:
+            return ""                     # one card cannot be split over
+        rows = {g["luid"]: g for g in (snap.get("gpus") or []) if g.get("luid")}
+        mine = ((snap.get("gpu_procs") or {}).get(spill["pid"])
+                or {}).get("by_card") or {}
+        free = []
+        for card in cards:
+            row = rows.get(card.luid)
+            if row is None or row.get("used") is None:
+                return ""                 # a card the counters did not report
+            other = max(0, row["used"] - int(mine.get(card.luid, 0)))
+            free.append(max(0, card.limit - other))
+        total = float(sum(free))
+        if total <= 0:
+            return ""
+        # llama.cpp normalises -ts itself, so these need not sum to 1.
+        return "-ts " + ",".join("%.2f" % (f / total) for f in free)
+
+    def _apply_split(self, flag, win=None):
+        """Put the recommended -ts into Extra flags, replacing one already
+        there. The field's trace re-estimates on its own, so the VRAM rows
+        say whether it worked before anything is loaded again."""
+        kept, _ = backends.split_extra_flags(
+            {"extra_flags": self.vars["extra_flags"].get()}, SPLIT_FLAGS)
+        self.vars["extra_flags"].set(" ".join(kept + flag.split()))
+        if win is not None:
+            win.destroy()
+        self.set_status("Extra flags now say %s - load again to use it."
+                        % flag, "Ok.TLabel")
+
+    def _alert(self, title, text, apply_split=""):
+        """A small window that does not block the rest of the app.
+
+        apply_split: a -ts the window offers to write into Extra flags, so
+        the fix is a button rather than a number to copy out by hand.
+        """
         win = tk.Toplevel(self.root)
         win.title(title)
         win.configure(bg=BG)
         win.transient(self.root)
         ttk.Label(win, text=text, style="Bad.TLabel", wraplength=self.px(460),
                   justify="left").pack(padx=14, pady=(14, 8))
-        ttk.Button(win, text="OK", command=win.destroy).pack(pady=(0, 12))
+        row = ttk.Frame(win)
+        row.pack(pady=(0, 12))
+        if apply_split:
+            ttk.Button(row, text="Apply to Extra flags",
+                       command=lambda: self._apply_split(apply_split, win)
+                       ).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="OK", command=win.destroy).pack(side="left")
         win.lift()
         self.root.bell()
 
@@ -2019,6 +2171,42 @@ class Zoomies:
             self.shared["loaded"] = loaded
             self.shared["status"] = status
             self.shared["polled"] = True
+        self._sync_opencode_limits(loaded)
+
+    def _sync_opencode_limits(self, loaded):
+        """Keep opencode's idea of the context in step with the servers.
+
+        opencode reads the window size out of its own config and never asks
+        the server, so a number left over from an earlier load decides when
+        it compacts. Hooked onto the poll rather than onto the load button
+        this covers every way a model can come up, including a server
+        started outside Zoomies, and costs a set comparison when nothing has
+        changed.
+        """
+        signature = tuple(sorted(
+            (model.endpoint, model.id, model.context) for model in loaded
+            if model.backend == "llamacpp" and model.context))
+        if signature == self._opencode_seen:
+            return
+        self._opencode_seen = signature
+        if not signature:
+            return
+        try:
+            plan = opencode.plan_limits(loaded=loaded)
+            if plan.changed:
+                opencode.write(plan, backup=False)
+                for line in plan.changed:
+                    self.out_queue.put(("line", "[zoomies] opencode " + line))
+            self._opencode_moan = ""
+        except (OSError, ValueError) as exc:
+            # A config that is missing, half-edited or not ours to parse is
+            # not worth interrupting a load over. Said once, then left until
+            # something changes rather than repeated at every load.
+            if str(exc) != self._opencode_moan:
+                self._opencode_moan = str(exc)
+                self.out_queue.put(
+                    ("line", "[zoomies] could not tell opencode the context: %s"
+                     % exc))
 
     def _poll_loop(self):
         n = 0
@@ -2085,6 +2273,10 @@ class Zoomies:
         if self.metrics is not None:
             snap = self.metrics.snapshot()
             self.view.show_live(snap)
+            # Learned first: the spill itself is the measurement that says
+            # what the card that ran out will hand out, and the advice the
+            # alert gives is worked out against exactly that number.
+            self._learn_vram(snap)
             self._check_spills(snap)
             self._vram_follow_live()
 

@@ -70,6 +70,10 @@ class Card:
     state: int = 0
     compute: int = 0
     layers: int = 0
+    # What this card will actually hand out. Windows keeps a reserve for the
+    # desktop, so a 16 GB card can start spilling at 13.6 GB; 0 means
+    # nothing has been measured yet and the sticker figure has to do.
+    budget: int = 0
 
     @property
     def model(self):
@@ -80,8 +84,12 @@ class Card:
         return self.other + self.model
 
     @property
+    def limit(self):
+        return self.budget or self.total
+
+    @property
     def spare(self):
-        return self.total - self.used
+        return self.limit - self.used
 
 
 @dataclass
@@ -94,12 +102,25 @@ class Estimate:
     margin: int = DEFAULT_MARGIN
 
     @property
-    def fits(self):
+    def holds(self):
+        """The arithmetic works, with nothing to spare."""
         return not self.problem and all(c.spare >= 0 for c in self.cards)
 
     @property
+    def fits(self):
+        """Room for the model and the margin on every card.
+
+        The margin is not politeness. Other apps move around while a model
+        loads, and the load itself peaks above what it settles at, so a card
+        with nothing spare is a card that spills.
+        """
+        return not self.problem and all(c.spare >= self.margin
+                                        for c in self.cards)
+
+    @property
     def tight(self):
-        return self.fits and any(c.spare < self.margin for c in self.cards)
+        """Fits on paper, but without the margin somewhere."""
+        return self.holds and not self.fits
 
 
 # --------------------------------------------------------------------------
@@ -141,8 +162,11 @@ def cards_for(tokens, found=None):
     else:
         # What build_launch does when no --device is given: dedicated only.
         chosen = [a for a in found if a["vram"] >= GB]
+    limits = state.load_vram_limits()
     return [Card(name=state.display_label(a, chosen), luid=a["luid"],
-                 total=int(a["vram"])) for a in chosen]
+                 total=int(a["vram"]),
+                 budget=state.vram_budget(limits, a["luid"], a["vram"]))
+            for a in chosen]
 
 
 # --------------------------------------------------------------------------
@@ -325,7 +349,8 @@ def estimate(model, settings, other=None, found=None, margin=DEFAULT_MARGIN):
 
 def _fill(layers, setup, cards, ctx, margin):
     """Place the layers on the cards and cost everything for one context."""
-    cards = [Card(c.name, c.luid, c.total, c.other) for c in cards]
+    cards = [Card(c.name, c.luid, c.total, c.other, budget=c.budget)
+             for c in cards]
     n, n_all = layers.n, layers.n_all
     # llama.cpp offloads the last layers, and counts the output layer (and
     # any unused nextn layer) as positions in the split.

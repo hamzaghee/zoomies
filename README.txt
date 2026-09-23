@@ -372,6 +372,27 @@ FILL FROM DOCS
   Output pane, and "SPILLING INTO SYSTEM RAM" in red on the Live panel's
   GPU line, which also shows each card's memory in use.
 
+  The popup says which card ran out, and the two cases want opposite
+  answers. When another card still has room it is a split to rebalance,
+  not a model to shrink: llama.cpp takes -ts (--tensor-split), a share
+  per card, and the popup works one out and offers "Apply to Extra
+  flags". The share each card gets is the room it has for this model -
+  its budget less whatever else is on it - so the card carrying your
+  desktop is given fewer layers than the one sitting idle. That is the
+  whole fix for two equal cards where only one drives a monitor: same
+  size, so llama.cpp splits them 50/50 by default, and the one with the
+  desktop on it runs out first.
+
+  The flag's entries line up with the rows in the VRAM panel, in that
+  order. There are as many numbers as there are rows - the integrated
+  GPU is not one of them, because Zoomies leaves it out of --device.
+  Typing -ts by hand works just as well, and the estimate follows what
+  you type, so the rows say whether it worked before you load anything.
+
+  When no card has room, -ts cannot help: lower Context (or press "Use
+  largest context"), pick a smaller KV cache type, or close whatever
+  else is on the cards. The popup says which of the two it is.
+
   IT WILL LEAVE THE BOXES EMPTY RATHER THAN GUESS. If no source has
   settings for your model you get an empty form, a list of Unsloth pages
   to pick from, and a "Search the web" button - not a near-match. A wrong

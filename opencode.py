@@ -299,6 +299,67 @@ def _plan_options(plan, name, mnode, anchor, indent, wanted):
     return ["options: " + ", ".join(what)] if what else []
 
 
+def _limit_edits(plan, mnode, anchor, indent, context, max_tokens):
+    """Tell opencode how much room the server actually has.
+
+    opencode never asks: it reads these two numbers from its own config and
+    trusts them. "context" is what it thinks the window is, and "output" is
+    both the max_tokens it sends and the room it holds back - it starts
+    compacting at context minus output. Left stale, a 64k number against a
+    262k server compacts at a quarter of the room there really is.
+
+    Only these two members are touched. A "limit" block can also carry an
+    "input", which opencode prefers for the compaction sum when it is there;
+    anything already written is kept.
+    """
+    wanted = {}
+    if context:
+        wanted["context"] = int(context)
+    if max_tokens:
+        wanted["output"] = int(max_tokens)
+    if not wanted:
+        return []
+    l_node = mnode.get("limit")
+    old = dict((l_node.value if l_node else None) or {})
+    what = ["%s %s -> %s" % (k, json.dumps(old.get(k)), json.dumps(v))
+            for k, v in wanted.items() if old.get(k) != v]
+    if not what:
+        return []
+    merged = dict(old)
+    merged.update(wanted)
+    if l_node is None:
+        plan.edits.append((anchor.end, anchor.end, ',\n%s"limit": %s'
+                           % (indent, _render(merged, indent))))
+    else:
+        plan.edits.append((l_node.start, l_node.end, _render(merged, indent)))
+    return ["limit: " + ", ".join(what)]
+
+
+def _preset_max_tokens(candidates):
+    """What the presets say a reply may run to, or "" if they cannot agree."""
+    values = set()
+    for preset in state.presets_for([c for c in candidates if c], "llamacpp"):
+        value = (preset.get("settings") or {}).get("max_tokens")
+        if value not in (None, ""):
+            values.add(str(value).strip())
+    return values.pop() if len(values) == 1 else ""
+
+
+def _preset_context(candidates):
+    """What the presets say the context is, or 0 if they cannot agree."""
+    values = set()
+    for preset in state.presets_for([c for c in candidates if c], "llamacpp"):
+        value = (preset.get("settings") or {}).get("context_length")
+        if value not in (None, ""):
+            values.add(str(value).strip())
+    if len(values) != 1:
+        return 0
+    try:
+        return int(values.pop())
+    except ValueError:
+        return 0
+
+
 def _spec_for_config(model):
     """The Spec across every llama.cpp preset for this model. Presets can
     name different --chat-template-file files; if those disagree, opencode
@@ -347,7 +408,7 @@ class Plan:
         return "\n\n".join(parts)
 
 
-def plan_sync(path=None, models=None):
+def plan_sync(path=None, models=None, loaded=None):
     """Read opencode's config and work out the edits; writes nothing."""
     path = path or config_path()
     with open(path, encoding="utf-8") as f:
@@ -360,6 +421,7 @@ def plan_sync(path=None, models=None):
     # a loose file's name (Qwen3.6-35B-A3B-UD-Q4_K_XL) rather than its path.
     by_id = {m.label: m for m in models if m.source == "folder"}
     by_id.update({m.id: m for m in models})
+    live = _live_by_port(loaded)
     providers = root.get("provider")
     if providers is None:
         plan.notes.append("No providers in %s." % path)
@@ -397,13 +459,83 @@ def plan_sync(path=None, models=None):
                     "opencode is left sending none and the server's own "
                     "values stand. Save them into its preset to pin them."
                     % name)
-            _plan_model(plan, name, mid, mnode, spec, new_variants, sampling)
+            # What a server is serving beats what a preset asked for: the
+            # context can be typed into the form without saving, and llama.cpp
+            # can hand out less than was asked for. Only a model that is down
+            # is described by its preset.
+            running = live.get((port, mid))
+            context = (running.context if running else
+                       _preset_context([model.id, model.gguf_path, model.label]))
+            limits = (context, backends.max_tokens_for(
+                context, _preset_max_tokens(
+                    [model.id, model.gguf_path, model.label])))
+            _plan_model(plan, name, mid, mnode, spec, new_variants, sampling,
+                        limits)
 
     _plan_agents(plan, root, new_variants)
     return plan
 
 
-def _plan_model(plan, name, mid, mnode, spec, new_variants, sampling=None):
+def _live_by_port(loaded=None):
+    """{(port, name): model} for every llama.cpp server that is up."""
+    if loaded is None:
+        loaded = backends.get("llamacpp").list_loaded()
+    live = {}
+    for model in loaded:
+        port = _LOCAL_URL.match(str(model.endpoint or ""))
+        if model.backend != "llamacpp" or not model.context or not port:
+            continue
+        for key in (model.id, model.label):
+            if key:
+                live[(int(port.group(1)), key)] = model
+    return live
+
+
+def plan_limits(path=None, loaded=None):
+    """Edits that put the running servers' real context into opencode.
+
+    The context a model is serving is decided at load time and changes from
+    one load to the next, so it is read back off the server rather than
+    taken from a preset: llama.cpp can hand out less than was asked for, and
+    what it handed out is what opencode has to believe.
+
+    Only models that are up are touched. An entry for something not loaded
+    keeps whatever it has - it says nothing about a server that isn't there.
+    """
+    path = path or config_path()
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    root = parse(text)
+    plan = Plan(path, text)
+    live = _live_by_port(loaded)
+    providers = root.get("provider")
+    if providers is None or not live:
+        return plan
+
+    for pid, pnode, _ in providers.members:
+        base = str(((pnode.value or {}).get("options") or {}).get("baseURL") or "")
+        match = _LOCAL_URL.match(base)
+        if not match:
+            continue
+        port = int(match.group(1))
+        models_node = pnode.get("models")
+        for mid, mnode, key_start in (models_node.members if models_node else []):
+            model = live.get((port, mid))
+            if model is None or not mnode.members:
+                continue
+            indent = _indent_at(text, mnode.members[0][2])
+            anchor = mnode.members[0][1]
+            what = _limit_edits(
+                plan, mnode, anchor, indent, model.context,
+                backends.max_tokens_for(
+                    model.context, _preset_max_tokens([model.id, model.label])))
+            if what:
+                plan.changed.append("%s/%s: %s" % (pid, mid, "; ".join(what)))
+    return plan
+
+
+def _plan_model(plan, name, mid, mnode, spec, new_variants, sampling=None,
+                limits=(0, 0)):
     text = plan.text
     want_reason = bool(spec.thinks)
     want_variants = variants_for(mid, spec)
@@ -439,6 +571,7 @@ def _plan_model(plan, name, mid, mnode, spec, new_variants, sampling=None):
         shown = [k for k, v in want_variants.items() if not v.get("disabled")]
         what.append("variants %s" % (" / ".join(shown) or "none"))
 
+    what += _limit_edits(plan, mnode, anchor, indent, *limits)
     what += _plan_options(plan, name, mnode, anchor, indent, sampling)
     if what:
         plan.changed.append("%s: %s" % (name, "; ".join(what)))
@@ -486,11 +619,16 @@ def _plan_agents(plan, root, new_variants):
                                     aname, chosen, target, " / ".join(live)))
 
 
-def write(plan):
-    """Back up the config, then write the planned text. Returns the backup."""
+def write(plan, backup=True):
+    """Back up the config, then write the planned text. Returns the backup.
+
+    backup=False keeps one rolling copy instead of a dated one: the sync
+    that runs on every load would otherwise fill the folder with them.
+    """
     new_text = plan.new_text
     parse(new_text)                   # never write something opencode can't read
-    backup = "%s.bak-%s" % (plan.path, time.strftime("%Y%m%d-%H%M%S"))
+    backup = ("%s.bak-%s" % (plan.path, time.strftime("%Y%m%d-%H%M%S"))
+              if backup else plan.path + ".bak-auto")
     with open(backup, "w", encoding="utf-8", newline="") as f:
         f.write(plan.text)
     tmp = plan.path + ".zoomies-tmp"

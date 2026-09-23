@@ -44,7 +44,7 @@ import state
 
 SETTING_KEYS = (
     "temperature", "top_p", "top_k", "min_p", "repeat_penalty",
-    "presence_penalty", "seed", "context_length", "gpu_layers",
+    "presence_penalty", "seed", "max_tokens", "context_length", "gpu_layers",
     "parallel", "flash_attn", "keep_alive", "extra_flags",
 )
 
@@ -58,6 +58,7 @@ SETTING_LABELS = (
     ("presence_penalty", "Presence pen."),
     ("context_length", "Context"),
     ("seed", "Seed"),
+    ("max_tokens", "Max tokens"),
     ("keep_alive", "Keep alive"),
     ("gpu_layers", "GPU layers"),
     ("parallel", "Parallel"),
@@ -77,7 +78,7 @@ SETTING_TEXT = dict(SETTING_LABELS)
 LOAD_KEYS = ("context_length", "gpu_layers", "kv_cache", "parallel",
              "keep_alive")
 WRITE_KEYS = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty",
-              "presence_penalty", "seed")
+              "presence_penalty", "seed", "max_tokens")
 SETTING_WIDE = ("extra_flags",)
 
 # What a preset is for. A preset says how to load a model; this says which
@@ -112,9 +113,51 @@ WRITE_BLURB = "Steers the words. The server's defaults; a client can override."
 # a grid rather than as sections.
 SETTING_ROWS = (
     ("temperature", "top_p", "top_k", "min_p"),
-    ("repeat_penalty", "presence_penalty", "seed", None),
+    ("repeat_penalty", "presence_penalty", "seed", "max_tokens"),
     ("context_length", "gpu_layers", "parallel", "keep_alive"),
 )
+
+# A reply cannot be longer than this however large the context is: opencode
+# clamps max tokens to 32000 (OUTPUT_TOKEN_MAX in its own source) and quietly
+# sends that instead of a larger number.
+MAX_TOKENS_CAP = 32000
+# With nothing entered, a quarter of the context. The quarter is not a guess
+# at what a model wants to say - it is the reserve that keeps a reply inside
+# the context. opencode starts compacting at context minus max tokens, so the
+# two are one decision: reserve too little and a long reply runs off the end
+# of the context part-way through, reserve too much and the conversation is
+# compacted while there is still room. A quarter leaves three quarters for
+# the conversation, and on a 64k context gives 16384 - the number these
+# presets were already carrying by hand.
+MAX_TOKENS_SHARE = 4
+
+
+def max_tokens_for(context, entered=None):
+    """How many tokens a reply may run to, given the context it runs in.
+
+    `entered` is what the preset says, if anything; blank means work it out.
+    Returns 0 when there is no context to work from and nothing was entered,
+    which means "say nothing about it" - the server's own default stands.
+
+    Whatever is entered is still held to two limits, because both produce a
+    config that reads sensibly and behaves badly: above the 32000 opencode
+    honours the file would claim a length it never sends, and at half the
+    context or more the reserve swallows the conversation and every single
+    turn arrives already needing compaction.
+    """
+    context = int(context or 0)
+    try:
+        wanted = int(str(entered).strip())
+    except (TypeError, ValueError):
+        wanted = 0
+    if wanted <= 0:
+        if context <= 0:
+            return 0
+        wanted = context // MAX_TOKENS_SHARE
+    ceiling = MAX_TOKENS_CAP
+    if context > 0:
+        ceiling = min(ceiling, context // 2)
+    return max(1, min(wanted, ceiling)) if ceiling > 0 else 0
 
 
 def slug(text):
@@ -404,9 +447,10 @@ OLLAMA_PARAM_MAP = {
     "min_p": "min_p",
     "repeat_penalty": "repeat_penalty",
     "seed": "seed",
+    "max_tokens": "num_predict",
     "context_length": "num_ctx",
 }
-INT_PARAMS = {"top_k", "seed", "num_ctx"}
+INT_PARAMS = {"top_k", "seed", "num_ctx", "num_predict"}
 
 
 def find_ollama_exe():
@@ -623,7 +667,7 @@ class OllamaBackend(Backend):
 
     def supports(self, key):
         if key in ("temperature", "top_p", "top_k", "min_p",
-                   "repeat_penalty", "seed", "context_length"):
+                   "repeat_penalty", "seed", "max_tokens", "context_length"):
             return "applied via a temporary tag"
         if key == "presence_penalty":
             return "this load only"
@@ -940,9 +984,11 @@ LLAMACPP_FLAGS = (
     ("temperature", "--temp"), ("top_p", "--top-p"), ("top_k", "--top-k"),
     ("min_p", "--min-p"), ("repeat_penalty", "--repeat-penalty"),
     ("presence_penalty", "--presence-penalty"), ("seed", "--seed"),
+    ("max_tokens", "-n"),
     ("context_length", "-c"), ("gpu_layers", "-ngl"), ("parallel", "-np"),
 )
-LLAMACPP_INT_FLAGS = {"top_k", "seed", "context_length", "gpu_layers", "parallel"}
+LLAMACPP_INT_FLAGS = {"top_k", "seed", "max_tokens", "context_length",
+                      "gpu_layers", "parallel"}
 LLAMACPP_SAMPLING = {"temperature", "top_p", "top_k", "min_p", "repeat_penalty",
                      "presence_penalty", "seed"}
 # Zoomies decides where the server listens and which model it serves.
@@ -1294,6 +1340,7 @@ class LlamaCppBackend(Backend):
         if key in LLAMACPP_SAMPLING:
             return "server default - a request's own value wins"
         return {
+            "max_tokens": "-n (a request's own value wins)",
             "context_length": "-c",
             "gpu_layers": "-ngl",
             "parallel": "-np (slots share the context)",
@@ -1502,6 +1549,18 @@ class LlamaCppBackend(Backend):
         else:
             a += ["'-m'", runner.ps_single(model.gguf_path or model.id)]
         a += ["'--alias'", runner.ps_single(model.id)]
+        # A blank Max tokens is worked out from the context rather than left
+        # to the server's own -1, which lets a single reply run until the
+        # context is full. The number has to be the one opencode is told to
+        # expect, or the two disagree about how much room a reply may take.
+        settings = dict(settings)
+        capped = max_tokens_for(setting_number(settings, "context_length", True),
+                                settings.get("max_tokens"))
+        if capped and not str(settings.get("max_tokens") or "").strip():
+            notes.append("Replies are capped at %d tokens (-n), a quarter of "
+                         "the context. Set Max tokens to choose it yourself."
+                         % capped)
+        settings["max_tokens"] = capped or ""
         for key, flag in LLAMACPP_FLAGS:
             value = setting_number(settings, key, key in LLAMACPP_INT_FLAGS)
             if value is not None:
