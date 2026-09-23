@@ -233,6 +233,9 @@ class Zoomies:
         self._vram_adapters = vram.adapters()
         self._spill_alerted = set()       # pids already alerted
         self._vram_limits = state.load_vram_limits()
+        self._vram_watch = {}             # per card, is its footprint still
+                                          # growing - see state.note_vram
+        self._vram_learned = None         # the counter sample last learned
         self._spill_status = False        # the status line is ours to clear
         self._vram_seen = None            # the counter sample last followed
         self._filling = False             # see _set_value
@@ -1393,24 +1396,32 @@ class Zoomies:
     def _learn_vram(self, snap):
         """Remember what each card actually hands out.
 
-        Every poll while a model is loaded is a measurement. A card with
-        part of that model in system RAM is at its limit - if more could
-        have been placed there it would have been - and a card holding one
-        without spilling proves at least that much is fine. Cards with no
-        model on them are ignored: the desktop sitting at 3 GB says nothing
-        about what the next 11 GB request will be given.
+        A card with part of a model in system RAM is at its limit - if more
+        could have been placed there it would have been - and a card
+        holding one without spilling proves at least that much is fine.
+        Cards with no model on them are ignored: the desktop sitting at
+        3 GB says nothing about what the next 11 GB request will be given.
 
         This is the only way to know. Windows publishes the sticker VRAM,
         never the budget, and the gap between them is what makes an
-        estimate say "fits" and a load spill anyway.
+        estimate say "fits" and a load spill anyway. What counts as a
+        measurement, and why most polls during a spill are not one, is
+        state.note_vram's problem.
         """
+        rows = snap.get("gpus") or []
+        # The counters are read every few seconds and this runs five times
+        # a second, so without this the same reading would be folded in ten
+        # times over - which is how "seen" came to say 1064.
+        if rows is self._vram_learned:
+            return
+        self._vram_learned = rows
         changed = False
-        for row in snap.get("gpus") or []:
+        for row in rows:
             if row.get("used") is None or not row.get("model_bytes"):
                 continue
             if state.note_vram(self._vram_limits, row.get("luid"),
                                row.get("vram"), row["used"],
-                               bool(row.get("spilled"))):
+                               row.get("spilled") or 0, self._vram_watch):
                 changed = True
         if changed:
             state.save_vram_limits(self._vram_limits)

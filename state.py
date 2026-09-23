@@ -49,10 +49,66 @@ HISTORY_PATH = os.path.join(ROOT, "history.json")
 # How much of each card can actually be handed out, learned by watching.
 # A card's sticker VRAM is not its budget: Windows keeps a reserve for the
 # desktop and gives a process less than the raw total, so a load can spill
-# with gigabytes apparently free. The moment a model spills, the card's
-# usage is that budget - if more could have been placed there, it would
-# have been - which makes this measurable rather than a guess.
+# with gigabytes apparently free. A model that spilled measures that budget
+# - if more could have been placed on the card, it would have been - which
+# makes this measurable rather than a guess.
 VRAM_LIMITS_PATH = os.path.join(ROOT, "vram_limits.json")
+
+# The measurement is the *peak* of a spill, never a sample taken part-way
+# through one. A load fills a card over tens of seconds and starts spilling
+# well before it has finished filling, so most of the readings taken during
+# a spill are of a card still being filled rather than of a card that is
+# full. Two things keep those readings out:
+#
+#   - every number learned here is a maximum, so a small reading loses to
+#     the peak of the same load rather than replacing it;
+#   - a reading only counts once the card's whole footprint has been flat
+#     for VRAM_SETTLE_SECONDS. Dedicated usage alone will not do: a card
+#     that has run out goes flat while the model keeps loading into system
+#     RAM, so what is watched is what is on the card plus what it pushed
+#     off it.
+VRAM_SETTLE_SECONDS = 8.0
+VRAM_SETTLE_SLACK = 64 * 1024 ** 2
+
+# The lowest ceiling worth believing, as a reserve the card could plausibly
+# be holding back and as a share of its sticker VRAM. A ceiling under that
+# was not measured on a full card: a 16 GB card that appears to stop handing
+# out at 7 GB was read while a load was still filling it. Entries like that
+# are in the file this code inherited, so the rule applies on the way in as
+# well as on the way out.
+#
+# Both forms are needed because they fail at opposite ends. The reserve is
+# what actually happens - this machine idles at up to 2.4 GB of dedicated
+# VRAM before anything is loaded, and Windows holds back more on top of
+# that, so 5 GB is already generous - but subtracting a fixed 5 GB from a
+# 4 GB card believes anything. The share covers the small cards; the
+# reserve stops a 16 GB card being written off at 9 GB, which the share
+# alone would wave through.
+VRAM_MAX_RESERVE = 5 * 1024 ** 3
+VRAM_MIN_CEILING = 0.6
+
+
+def least_credible_ceiling(vram_bytes):
+    """The lowest ceiling that could be a real reserve on a card this size."""
+    return max(int(vram_bytes) - VRAM_MAX_RESERVE,
+               int(int(vram_bytes) * VRAM_MIN_CEILING))
+
+# How long a ceiling is believed without being confirmed again. A ceiling
+# has to be re-earned rather than bind forever, because it suppresses the
+# evidence that would move it: the estimate, "Use largest context" and the
+# suggested -ts all plan within the ceiling, so nothing ever asks the card
+# for more and no clean run can ever prove it wrong. Letting it lapse means
+# the app probes upwards again every so often, and either learns the same
+# number back or learns a better one.
+VRAM_CEILING_DAYS = 30
+
+# How often a spill already on record is worth writing down again. A model
+# can sit there spilling for half an hour, which at one counter sample
+# every couple of seconds is a thousand readings of the same fact: that is
+# how "seen" came to read 1064. Re-confirming at most this often keeps the
+# ceiling's age meaningful - it is what VRAM_CEILING_DAYS counts from -
+# without rewriting the file all afternoon.
+VRAM_CONFIRM_SECONDS = 3600.0
 
 KEEP_FILES = 20                  # how many generated scripts / logs to retain
 
@@ -205,42 +261,132 @@ def save_history(rows):
 
 
 def load_vram_limits():
-    """{luid: {"vram", "ceiling", "clean", "seen", "at"}}."""
+    """{luid: {"vram", "ceiling", "clean", "seen", "at", "ts"}}.
+
+    "seen" counts confirmations of the ceiling rather than readings, and
+    "at"/"ts" are when the last one landed.
+
+    Pruned on the way in, and the file rewritten when pruning changed
+    anything, so a limit that can no longer be believed stops being quoted
+    back at a user who opens the file to see what the app thinks.
+    """
     cards = read_json(VRAM_LIMITS_PATH, {}).get("cards")
-    return cards if isinstance(cards, dict) else {}
+    cards = cards if isinstance(cards, dict) else {}
+    if prune_vram_limits(cards):
+        save_vram_limits(cards)
+    return cards
 
 
 def save_vram_limits(cards):
     return write_json(VRAM_LIMITS_PATH, {"version": 1, "cards": cards})
 
 
-def note_vram(cards, luid, vram_bytes, used, spilling):
+def _confirmed_age(card, now):
+    """Seconds since this card's ceiling was last confirmed, or None when
+    the entry does not say."""
+    stamp = card.get("ts")
+    if not isinstance(stamp, (int, float)) or stamp <= 0:
+        try:
+            stamp = time.mktime(time.strptime(str(card.get("at") or ""),
+                                              "%Y-%m-%d %H:%M"))
+        except (ValueError, OverflowError):
+            return None
+    return max(0.0, now - float(stamp))
+
+
+def prune_vram_limits(cards, now=None):
+    """Forget ceilings that cannot be believed. True if anything changed.
+
+    A ceiling goes for one of two reasons: it is too far below the card's
+    sticker VRAM to be a real reserve (least_credible_ceiling), or nothing has
+    confirmed it for VRAM_CEILING_DAYS - see that constant for why a
+    ceiling has to expire. The floor a clean run proved is never dropped,
+    because it is a fact about the card rather than an inference, and the
+    card's row stays either way so the history is still readable.
+    """
+    now = time.time() if now is None else now
+    changed = False
+    for luid, card in list(cards.items()):
+        if not isinstance(card, dict):
+            del cards[luid]
+            changed = True
+            continue
+        ceiling = int(card.get("ceiling") or 0)
+        if not ceiling:
+            continue
+        vram_bytes = int(card.get("vram") or 0)
+        age = _confirmed_age(card, now)
+        if (vram_bytes and ceiling < least_credible_ceiling(vram_bytes)) or \
+                (age is not None and age > VRAM_CEILING_DAYS * 86400):
+            for key in ("ceiling", "seen", "at", "ts"):
+                card.pop(key, None)
+            changed = True
+    return changed
+
+
+def _settled(watch, luid, footprint):
+    """True once this card's footprint has stopped growing.
+
+    `watch` is scratch the caller keeps between polls, keyed by LUID; None
+    means take every sample, which is what a test or a one-shot caller
+    wants. The comparison is against the reading at the start of the flat
+    stretch rather than against the previous poll, so a load creeping up a
+    few MB at a time is still seen to be growing.
+    """
+    if watch is None:
+        return True
+    now = time.time()
+    flat = watch.get(luid)
+    if flat is None or footprint > flat["base"] + VRAM_SETTLE_SLACK:
+        watch[luid] = {"base": footprint, "since": now}
+        return False
+    return now - flat["since"] >= VRAM_SETTLE_SECONDS
+
+
+def note_vram(cards, luid, vram_bytes, used, spilled=0, watch=None):
     """Fold one observation of a card into what is known about its budget.
 
-    Spilling puts a ceiling on the card: that is as much as it would hand
-    out. Not spilling puts a floor under it: that much was handed out and
-    was fine. The lowest ceiling is kept because it is the one that has to
-    hold, and a later floor above it wins - a ceiling measured while
-    something else was busy should not bind forever.
+    `used` is everything on the card; `spilled` is what it pushed into
+    system RAM, and zero means a clean sample.
+
+    Both numbers learned here are the *most* the card was ever seen to hand
+    out, never the least. Taking the least looks careful and is wrong: a
+    load climbs to its limit through every value below it, so the smallest
+    reading during a spill is the start of the fill rather than the limit.
+    The peak of a spill is the answer, because at the peak the card was as
+    full as it was going to get and still would not take the rest.
+
+    Spilling makes that peak a ceiling as well as a floor; a clean run only
+    makes it a floor. A spill never lowers the floor - a load that fitted
+    yesterday still fitted - which is the other half of the old rule that
+    had to go.
 
     Returns True when anything changed and the file is worth writing.
     """
     if not luid or not used or not vram_bytes:
         return False
+    used, spilled, vram_bytes = int(used), int(spilled or 0), int(vram_bytes)
+    if not _settled(watch, luid, used + spilled):
+        return False
     card = dict(cards.get(luid) or {})
     before = dict(card)
-    card["vram"] = int(vram_bytes)
-    if spilling:
-        ceiling = int(used)
-        card["ceiling"] = min(int(card.get("ceiling") or ceiling), ceiling)
-        # A floor recorded earlier, with less on the card, is not evidence
-        # against a spill happening now. The newer measurement wins; a later
-        # clean run can raise it again on its own.
-        card["clean"] = min(int(card.get("clean") or ceiling), ceiling)
-        card["seen"] = int(card.get("seen") or 0) + 1
-        card["at"] = time.strftime("%Y-%m-%d %H:%M")
+    card["vram"] = vram_bytes
+    if spilled:
+        ceiling = max(int(card.get("ceiling") or 0), used)
+        age = _confirmed_age(card, time.time())
+        # A reading from part-way up a load can still get this far - the
+        # watch only sees the samples it is handed, and a slow disk can
+        # hold one still for a long time - so refuse outright a ceiling too
+        # low to be a desktop reserve.
+        if ceiling >= least_credible_ceiling(vram_bytes) and (
+                ceiling > int(card.get("ceiling") or 0) or age is None
+                or age >= VRAM_CONFIRM_SECONDS):
+            card["ceiling"] = ceiling
+            card["seen"] = int(card.get("seen") or 0) + 1
+            card["at"] = time.strftime("%Y-%m-%d %H:%M")
+            card["ts"] = int(time.time())
     else:
-        card["clean"] = max(int(card.get("clean") or 0), int(used))
+        card["clean"] = max(int(card.get("clean") or 0), used)
     if card == before:
         return False
     cards[luid] = card
@@ -250,11 +396,17 @@ def note_vram(cards, luid, vram_bytes, used, spilling):
 def vram_budget(cards, luid, vram_bytes):
     """What one card can really hand out, or its sticker VRAM if unknown."""
     card = cards.get(luid) or {}
+    vram_bytes = int(vram_bytes)
     ceiling = int(card.get("ceiling") or 0)
+    if ceiling < least_credible_ceiling(vram_bytes):
+        ceiling = 0        # never credible; see prune_vram_limits
     if not ceiling:
-        return int(vram_bytes)
-    # A clean run above an old ceiling proves the ceiling has moved.
-    return min(int(vram_bytes), max(ceiling, int(card.get("clean") or 0)))
+        return vram_bytes
+    # Both are amounts the card was seen to hand out, so the larger is the
+    # one that has actually been proved: a clean run above the ceiling says
+    # the ceiling has moved, and nothing here may read below what already
+    # worked.
+    return min(vram_bytes, max(ceiling, int(card.get("clean") or 0)))
 
 
 def preset_key(text):
