@@ -2193,14 +2193,22 @@ class Zoomies:
         this covers every way a model can come up, including a server
         started outside Zoomies, and costs a set comparison when nothing has
         changed.
+
+        The servers are half of what can go out of step: the config itself
+        is edited by hand, by the full sync, and by us, so its stamp is in
+        the comparison too. Without it a number that went wrong while the
+        same server stayed up - or a write that could not happen because the
+        file was mid-edit - would stand until something was loaded or
+        unloaded.
         """
-        signature = tuple(sorted(
+        servers = tuple(sorted(
             (model.endpoint, model.id, model.context) for model in loaded
             if model.backend == "llamacpp" and model.context))
+        signature = (servers, opencode.config_stamp())
         if signature == self._opencode_seen:
             return
         self._opencode_seen = signature
-        if not signature:
+        if not servers:
             return
         try:
             plan = opencode.plan_limits(loaded=loaded)
@@ -2208,6 +2216,9 @@ class Zoomies:
                 opencode.write(plan, backup=False)
                 for line in plan.changed:
                     self.out_queue.put(("line", "[zoomies] opencode " + line))
+                # Our own write moved the stamp; record where we left it so
+                # the next poll does not read the file back to find itself.
+                self._opencode_seen = (servers, opencode.config_stamp())
             self._opencode_moan = ""
         except (OSError, ValueError) as exc:
             # A config that is missing, half-edited or not ours to parse is

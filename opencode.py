@@ -33,6 +33,7 @@ Levels are listed least reasoning first on purpose: opencode runs titles and
 summaries with a model's first variant.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -63,6 +64,26 @@ def config_path():
         if os.path.exists(path):
             return path
     return os.path.join(folder, "opencode.jsonc")
+
+
+def config_stamp(path=None):
+    """A digest of the config file, or None if it is not there.
+
+    The sync on the poll compares this alongside the running servers, so a
+    config changed by anything else - a hand edit, the full sync, a
+    half-saved file that would not parse - is looked at again instead of
+    waiting for a server to come or go.
+
+    The contents rather than the modified time, because the edits that
+    matter most here keep both: 65536 and 90112 are the same eight bytes,
+    and Windows moves a file's timestamp in steps of about 16 ms, so a write
+    in the same step as the last reading would leave no mark at all.
+    """
+    try:
+        with open(path or config_path(), "rb") as f:
+            return hashlib.blake2b(f.read(), digest_size=16).digest()
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -345,21 +366,6 @@ def _preset_max_tokens(candidates):
     return values.pop() if len(values) == 1 else ""
 
 
-def _preset_context(candidates):
-    """What the presets say the context is, or 0 if they cannot agree."""
-    values = set()
-    for preset in state.presets_for([c for c in candidates if c], "llamacpp"):
-        value = (preset.get("settings") or {}).get("context_length")
-        if value not in (None, ""):
-            values.add(str(value).strip())
-    if len(values) != 1:
-        return 0
-    try:
-        return int(values.pop())
-    except ValueError:
-        return 0
-
-
 def _spec_for_config(model):
     """The Spec across every llama.cpp preset for this model. Presets can
     name different --chat-template-file files; if those disagree, opencode
@@ -459,16 +465,19 @@ def plan_sync(path=None, models=None, loaded=None):
                     "opencode is left sending none and the server's own "
                     "values stand. Save them into its preset to pin them."
                     % name)
-            # What a server is serving beats what a preset asked for: the
-            # context can be typed into the form without saving, and llama.cpp
-            # can hand out less than was asked for. Only a model that is down
-            # is described by its preset.
+            # Only a running server can say how much room there is. A preset
+            # holds what was last saved, not what was launched - the context
+            # is typed into the form without saving it back, and llama.cpp
+            # can hand out less than was asked for - so writing a preset's
+            # number here would talk a live server's window down to a figure
+            # nobody chose. A model that is down keeps whatever opencode
+            # already believes.
             running = live.get((port, mid))
-            context = (running.context if running else
-                       _preset_context([model.id, model.gguf_path, model.label]))
-            limits = (context, backends.max_tokens_for(
-                context, _preset_max_tokens(
-                    [model.id, model.gguf_path, model.label])))
+            limits = (0, 0)
+            if running:
+                limits = (running.context, backends.max_tokens_for(
+                    running.context, _preset_max_tokens(
+                        [model.id, model.gguf_path, model.label])))
             _plan_model(plan, name, mid, mnode, spec, new_variants, sampling,
                         limits)
 
