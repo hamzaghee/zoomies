@@ -15,14 +15,14 @@ import backends
 import metrics
 import processes
 import vram
-from ui_common import (ACCENT, BAD, BG_PANEL, BORDER, FG, FG_DIM, FONT_MONO,
-                       WARN, fill_combo, human_bytes, until)
+from ui_common import (ACCENT, BAD, BG, BG_PANEL, BORDER, FG, FG_DIM,
+                       FONT_MONO, WARN, fill_combo, human_bytes, until)
 
 
 class ClassicLayout:
     name = "classic"
     size = (980, 800)             # at 100% display scale
-    min_size = (780, 560)
+    min_size = (780, 420)         # shorter than the form: it scrolls
     remember_geometry = False     # opens centred, as it always has
     dock = None
 
@@ -35,6 +35,8 @@ class ClassicLayout:
         self.procs = []
         self._hist_key = None             # what the History table shows now
         self._vram_labels = {}            # luid -> value label beside its slider
+        self._scroll = None               # (canvas, scrollbar) once built
+        self._form_height = 1             # what the scrollbar is measured on
         self._build()
 
     # ------------------------------------------------------------------
@@ -44,9 +46,10 @@ class ClassicLayout:
     def _build(self):
         app = self.app
         pad = {"padx": 8, "pady": 3}
+        body = self._scrollable()
 
         # ---- top bar -------------------------------------------------
-        top = ttk.Frame(self.root)
+        top = ttk.Frame(body)
         top.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(top, text="Zoomies", style="Head.TLabel",
                   font=("Segoe UI", 12, "bold")).pack(side="left")
@@ -62,7 +65,7 @@ class ClassicLayout:
                 side="right", padx=(0, 12))
 
         # ---- backend + model ----------------------------------------
-        pick = ttk.Frame(self.root)
+        pick = ttk.Frame(body)
         pick.pack(fill="x", **pad)
         pick.columnconfigure(1, weight=1)
 
@@ -107,7 +110,7 @@ class ClassicLayout:
                             lambda e: app.model_picked(self.model_box.current()))
 
         # ---- settings ------------------------------------------------
-        box = ttk.LabelFrame(self.root, text=" Settings ")
+        box = ttk.LabelFrame(body, text=" Settings ")
         box.pack(fill="x", padx=8, pady=(8, 3))
 
         bar = ttk.Frame(box)
@@ -179,7 +182,7 @@ class ClassicLayout:
         self.status_lbl.pack(side="left", padx=(16, 0))
 
         # ---- loaded --------------------------------------------------
-        lbox = ttk.LabelFrame(self.root, text=" Loaded ")
+        lbox = ttk.LabelFrame(body, text=" Loaded ")
         lbox.pack(fill="x", padx=8, pady=3)
         cols = ("model", "backend", "vram", "context", "endpoint", "pid", "until")
         widths = (300, 90, 80, 80, 150, 60, 80)
@@ -204,7 +207,120 @@ class ClassicLayout:
         self.vram_lbl = ttk.Label(lbar, text="", style="Dim.TLabel")
         self.vram_lbl.pack(side="right")
 
-        self._build_live(self.root)
+        self._build_live(body)
+
+    # ------------------------------------------------------------------
+    # scrolling
+    # ------------------------------------------------------------------
+
+    def _scrollable(self):
+        """The frame the whole window is built into, which scrolls when the
+        window is shorter than the form.
+
+        The frame is stretched to the canvas whenever there is room to
+        spare, so the Live pane still grows with the window exactly as it
+        did before the canvas went in; only once the form needs more height
+        than the window has does the scrollbar appear.
+        """
+        canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0)
+        bar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        item = canvas.create_window(0, 0, window=inner, anchor="nw")
+        self._scroll = (canvas, bar)
+        shown = [None]                    # last size handed to the frame
+
+        def fit(_event=None):
+            view, need = canvas.winfo_height(), inner.winfo_reqheight()
+            width, height = canvas.winfo_width(), max(need, view)
+            self._form_height = height
+            # Stretched to the window only while the form is shorter than
+            # it, so the Live pane still takes the leftover room. Left at
+            # its own height otherwise - a frame stretched to a fixed height
+            # stops reporting that the form inside it has grown.
+            size = (width, view if need < view else 0)
+            if shown[0] != (size, height):
+                shown[0] = (size, height)
+                canvas.itemconfigure(item, width=size[0], height=size[1])
+                canvas.configure(scrollregion=(0, 0, width, height))
+            over = need > view
+            if over and not bar.winfo_manager():
+                bar.pack(side="right", fill="y", before=canvas)
+            elif not over and bar.winfo_manager():
+                bar.pack_forget()
+                canvas.yview_moveto(0)
+
+        def watch():
+            """A row added to a table, a card's bars appearing, a longer
+            note: the form grows without the frame around it changing size,
+            and nothing tells us. So look, cheaply, a few times a second."""
+            try:
+                fit()
+                canvas.after(250, watch)
+            except tk.TclError:
+                pass                      # the window has gone
+
+        inner.bind("<Configure>", fit)
+        canvas.bind("<Configure>", fit)
+        canvas.after(250, watch)
+        # On the window rather than each widget: a wheel event goes to
+        # whatever is under the pointer, and labels and frames pass nothing
+        # on to their parents.
+        self.root.bind("<MouseWheel>", self._wheel)
+        # A wheel turn over a closed dropdown scrolls the form too. Tk's own
+        # binding quietly changes the setting instead, which is not what
+        # anybody means by scrolling a window.
+        self.root.bind_class("TCombobox", "<MouseWheel>", self._wheel)
+        self.root.bind("<FocusIn>", self._show_focused)
+        return inner
+
+    def _wheel(self, event):
+        """Scroll the form, unless the pointer is over something with its
+        own scrollbar - a table, the output pane, an open dropdown list -
+        which would otherwise scroll twice on one turn of the wheel."""
+        canvas, bar = self._scroll
+        if not bar.winfo_manager():
+            return
+        widget = event.widget
+        while widget is not None and widget is not canvas:
+            yview = getattr(widget, "yview", None)
+            if yview is not None:
+                try:
+                    if tuple(yview()) != (0.0, 1.0):
+                        return          # it has somewhere of its own to go
+                except (TypeError, ValueError, tk.TclError):
+                    return
+            widget = getattr(widget, "master", None)
+        if widget is not canvas:
+            return                      # another window, such as a dialog
+        canvas.yview_scroll(int(-event.delta / 120) or
+                            (-1 if event.delta > 0 else 1), "units")
+
+    def _show_focused(self, event):
+        """Bring a field tabbed into below the fold into view, so typing
+        never lands somewhere off screen."""
+        canvas, bar = self._scroll
+        widget = event.widget
+        # Only the things that are typed into: the window itself and the
+        # panes also report focus, and following those would scroll the
+        # form about on its own.
+        if not bar.winfo_manager() or not isinstance(widget,
+                                                     (tk.Entry, tk.Text)):
+            return
+        try:
+            if widget.winfo_toplevel() is not self.root:
+                return                  # a dialog's own field
+            top = widget.winfo_rooty() - canvas.winfo_rooty()
+            high = widget.winfo_height()
+        except tk.TclError:
+            return
+        view, edge = canvas.winfo_height(), self.px(12)
+        if top >= 0 and top + high <= view:
+            return
+        move = top - edge if top < 0 else top + high - view + edge
+        canvas.yview_moveto(max(0.0, (canvas.canvasy(0) + move)
+                                / float(self._form_height)))
 
     def _field_group(self, parent, title, blurb, keys):
         """One labelled block of fields, four to a row."""

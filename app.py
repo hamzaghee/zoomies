@@ -306,6 +306,16 @@ class Zoomies:
             height = min(want_h, bottom - top - self.px(40))   # title bar
             self.root.geometry("%dx%d+%d+%d" % (width, height,
                                                 right - width - self.px(16), top))
+        elif area:
+            # Fit the desktop rather than the whole screen: a window taller
+            # than the work area hangs below the taskbar, and its scrollbar
+            # goes down there with it.
+            left, top, right, bottom = area
+            height = min(height, bottom - top - self.px(40))   # title bar
+            self.root.geometry("%dx%d+%d+%d" % (
+                width, height,
+                left + max(0, (right - left - width) // 2),
+                top + max(0, (bottom - top - height) // 3)))
         else:
             self.root.geometry("%dx%d+%d+%d" % (
                 width, height,
