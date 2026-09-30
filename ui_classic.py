@@ -168,12 +168,22 @@ class ClassicLayout:
         self.entries["extra_flags"].bind(
             "<FocusOut>", lambda e: app._refresh_reasoning())
 
-        self.source_lbl = ttk.Label(form, text="", style="Dim.TLabel",
+        # Where the numbers came from, and what this backend quietly
+        # ignores. Worth being able to read, not worth the paragraphs it
+        # took up under the fields, so it folds away - and the head wears
+        # the warning colour while there is a warning behind it, which is
+        # the one thing that must not go quiet.
+        self.notes_head = tk.Label(form, bg=BG, fg=FG_DIM, cursor="hand2",
+                                   font=("Segoe UI", 9))
+        self.notes_head.bind("<Button-1>", lambda e: self._toggle_notes())
+        self.notes_box = ttk.Frame(form)
+        self.source_lbl = ttk.Label(self.notes_box, text="", style="Dim.TLabel",
                                     wraplength=self.px(940), justify="left")
-        self.source_lbl.pack(fill="x", padx=8, pady=(2, 0))
-        self.notes_lbl = ttk.Label(form, text="", style="Warn.TLabel",
+        self.source_lbl.pack(fill="x", pady=(2, 0))
+        self.notes_lbl = ttk.Label(self.notes_box, text="", style="Warn.TLabel",
                                    wraplength=self.px(940), justify="left")
-        self.notes_lbl.pack(fill="x", padx=8, pady=(2, 6))
+        self.notes_lbl.pack(fill="x", pady=(2, 0))
+        self._notes_open = False
         self._build_vram(form)
 
         # Into the box, not the scrolling part: Load model is what the
@@ -683,7 +693,7 @@ class ClassicLayout:
         card; they follow Windows' own counters until you move one.
         """
         app = self.app
-        frame = ttk.Frame(box)
+        frame = self.vram_frame = ttk.Frame(box)
         frame.pack(fill="x", padx=8, pady=(0, 6))
         head = ttk.Frame(frame)
         head.pack(fill="x")
@@ -776,9 +786,36 @@ class ClassicLayout:
 
     def set_source(self, text):
         self.source_lbl.configure(text=text)
+        self._sync_notes()
 
     def set_notes(self, text):
         self.notes_lbl.configure(text=text)
+        self._sync_notes()
+
+    def _toggle_notes(self):
+        self._notes_open = not self._notes_open
+        self._sync_notes()
+
+    def _sync_notes(self):
+        """No head at all when there is nothing behind it: an empty line
+        that says "Notes" is the noise this was meant to take away."""
+        warn = bool(self.notes_lbl.cget("text"))
+        if not warn and not self.source_lbl.cget("text"):
+            self.notes_head.pack_forget()
+            self.notes_box.pack_forget()
+            return
+        # Before the VRAM block, which was already built by the time
+        # anything has notes to show.
+        self.notes_head.pack(anchor="w", padx=8, pady=(2, 0),
+                             before=self.vram_frame)
+        self.notes_head.configure(
+            text=("▾ Notes" if self._notes_open else "▸ Notes"),
+            fg=WARN if warn else FG_DIM)
+        if self._notes_open:
+            self.notes_box.pack(fill="x", padx=8, pady=(0, 4),
+                                before=self.vram_frame)
+        else:
+            self.notes_box.pack_forget()
 
     def log(self, text, tag=None):
         self.out.configure(state="normal")
@@ -796,9 +833,8 @@ class ClassicLayout:
         self._vram_labels = {}
         for row, card in enumerate(cards):
             gb = card.total / float(vram.GB)
-            ttk.Label(self.vram_cards, text="%s - in use by other apps"
-                      % card.name, style="Dim.TLabel").grid(
-                row=row, column=0, sticky="w")
+            ttk.Label(self.vram_cards, text=card.name,
+                      style="Dim.TLabel").grid(row=row, column=0, sticky="w")
             ttk.Scale(self.vram_cards, from_=0, to=gb,
                       variable=variables[card.luid], length=self.px(220),
                       command=lambda v, l=card.luid: on_slide(l)).grid(

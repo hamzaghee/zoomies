@@ -1344,18 +1344,17 @@ class Zoomies:
         else:
             verdict = "fits - %s GB spare" % vram.gb(worst.spare)
             style = "Ok.TLabel"
-        notes = ["Other apps + this model = total. Accurate to about 0.25 GB "
-                 "per card; keeps %s GB free per card for \"largest context\"."
-                 % vram.gb(est.margin)]
+        # The line above already reads "other + model = used / limit", so
+        # the note only has to cover what it cannot show: how close the
+        # number is, and where a limit that is not the sticker came from.
+        notes = ["Good to about 0.25 GB; \"largest context\" leaves %s GB "
+                 "spare per card." % vram.gb(est.margin)]
         measured = [c for c in est.cards if c.budget and c.budget < c.total]
         if measured:
-            notes.append(
-                "Card limits are measured rather than the number on the box "
-                "(%s): Windows holds the rest back for the desktop, and a "
-                "model that spilled there is what showed where the line is."
-                % ", ".join("%s %s of %.0f GB" % (
-                    c.name, vram.gb(c.budget), c.total / float(vram.GB))
-                    for c in measured))
+            notes.append("Limits measured, not off the box: %s." % ", ".join(
+                "%s %s of %.0f GB" % (c.name, vram.gb(c.budget),
+                                      c.total / float(vram.GB))
+                for c in measured))
         notes += est.notes
         self.view.show_vram_estimate(
             est, "%s   ->   %s" % ("   |   ".join(parts), verdict), style,
