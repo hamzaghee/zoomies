@@ -37,6 +37,8 @@ class ClassicLayout:
         self._vram_labels = {}            # luid -> value label beside its slider
         self._scroll = None               # (canvas, scrollbar) once built
         self._form_height = 1             # what the scrollbar is measured on
+        self._sections = {}               # key -> the box a grip resizes
+        self._panes = {}                  # clipping canvas -> what is in it
         self._build()
 
     # ------------------------------------------------------------------
@@ -110,10 +112,15 @@ class ClassicLayout:
                             lambda e: app.model_picked(self.model_box.current()))
 
         # ---- settings ------------------------------------------------
-        box = ttk.LabelFrame(body, text=" Settings ")
-        box.pack(fill="x", padx=8, pady=(8, 3))
+        # Everything but the Load row scrolls inside the box, so dragging
+        # it shorter hides fields instead of the button they are for.
+        box, holder = self._section(body, "Settings", "settings",
+                                    self.px(120), cap="content")
+        holder.pack(side="top", fill="x")
+        pane, form = self._clip(holder)
+        self._sections["settings"]["content"] = form
 
-        bar = ttk.Frame(box)
+        bar = ttk.Frame(form)
         bar.pack(fill="x", padx=8, pady=(6, 2))
         self.apply_btn = ttk.Button(bar, text="Fill from docs",
                                     command=app._apply_optimal)
@@ -144,7 +151,7 @@ class ClassicLayout:
         # difference is the one that catches people out: the loading ones
         # cost VRAM and need the model started again, the writing ones are
         # only the server's defaults and take effect on the next reply.
-        writes = self._field_group(box, backends.WRITE_TITLE,
+        writes = self._field_group(form, backends.WRITE_TITLE,
                                    backends.WRITE_BLURB, backends.WRITE_KEYS)
         # The docs' own recipe for these numbers. Picking what a preset is
         # for normally answers this, so it sits here rather than in the bar.
@@ -154,23 +161,25 @@ class ClassicLayout:
                                      state="readonly", width=22)
         self.mode_box.pack(side="left")
         self.mode_box.bind("<<ComboboxSelected>>", lambda e: app._mode_changed())
-        self._field_group(box, backends.LOAD_TITLE, backends.LOAD_BLURB,
+        self._field_group(form, backends.LOAD_TITLE, backends.LOAD_BLURB,
                           backends.LOAD_KEYS + backends.SETTING_WIDE)
         # --chat-template-file changes which template sets the levels. The
         # controller also watches this field as it is typed in.
         self.entries["extra_flags"].bind(
             "<FocusOut>", lambda e: app._refresh_reasoning())
 
-        self.source_lbl = ttk.Label(box, text="", style="Dim.TLabel",
+        self.source_lbl = ttk.Label(form, text="", style="Dim.TLabel",
                                     wraplength=self.px(940), justify="left")
         self.source_lbl.pack(fill="x", padx=8, pady=(2, 0))
-        self.notes_lbl = ttk.Label(box, text="", style="Warn.TLabel",
+        self.notes_lbl = ttk.Label(form, text="", style="Warn.TLabel",
                                    wraplength=self.px(940), justify="left")
         self.notes_lbl.pack(fill="x", padx=8, pady=(2, 6))
-        self._build_vram(box)
+        self._build_vram(form)
 
+        # Into the box, not the scrolling part: Load model is what the
+        # whole section is for and must never be the thing scrolled away.
         act = ttk.Frame(box)
-        act.pack(fill="x", padx=8, pady=(0, 8))
+        act.pack(side="top", fill="x", padx=8, pady=(0, 8))
         self.load_btn = ttk.Button(act, text="Load model", style="Go.TButton",
                                    command=app._load)
         self.load_btn.pack(side="left")
@@ -182,22 +191,24 @@ class ClassicLayout:
         self.status_lbl.pack(side="left", padx=(16, 0))
 
         # ---- loaded --------------------------------------------------
-        lbox = ttk.LabelFrame(body, text=" Loaded ")
-        lbox.pack(fill="x", padx=8, pady=3)
+        lbox, holder = self._section(body, "Loaded", "loaded", self.px(54))
+        holder.pack(side="top", fill="x")
         cols = ("model", "backend", "vram", "context", "endpoint", "pid", "until")
         widths = (300, 90, 80, 80, 150, 60, 80)
-        self.tree = ttk.Treeview(lbox, columns=cols, show="headings", height=3)
+        # height=3 is only what it asks for: dragged taller, the rows it
+        # shows follow the room it is given.
+        self.tree = ttk.Treeview(holder, columns=cols, show="headings", height=3)
         for col, w in zip(cols, widths):
             self.tree.heading(col, text=col.title())
             self.tree.column(col, width=self.px(w), minwidth=self.px(40),
                              anchor="w" if col in ("model", "endpoint") else "center")
-        self.tree.pack(fill="x", padx=8, pady=(6, 2))
+        self.tree.pack(fill="both", expand=True, padx=8, pady=(6, 2))
         self.tree.tag_configure("foreign", foreground=FG_DIM)
         self.tree.tag_configure("ours", foreground=FG)
         self.tree.bind("<Double-1>", lambda e: app._unload_selected())
 
         lbar = ttk.Frame(lbox)
-        lbar.pack(fill="x", padx=8, pady=(0, 8))
+        lbar.pack(side="top", fill="x", padx=8, pady=(0, 8))
         ttk.Button(lbar, text="Unload selected",
                    command=app._unload_selected).pack(side="left")
         ttk.Button(lbar, text="Unload all",
@@ -210,6 +221,7 @@ class ClassicLayout:
         self.vram_lbl.pack(side="right")
 
         self._build_live(body)
+        self._restore_sections()
 
     # ------------------------------------------------------------------
     # scrolling
@@ -277,42 +289,82 @@ class ClassicLayout:
         self.root.bind("<FocusIn>", self._show_focused)
         return inner
 
+    @staticmethod
+    def _has_room(widget):
+        """Whether it can scroll: False when it has no view of its own,
+        None when it has one but will not say."""
+        yview = getattr(widget, "yview", None)
+        if yview is None:
+            return False
+        try:
+            return tuple(yview()) != (0.0, 1.0)
+        except (TypeError, ValueError, tk.TclError):
+            return None
+
     def _wheel(self, event):
         """Scroll the form, unless the pointer is over something with its
-        own scrollbar - a table, the output pane, an open dropdown list -
-        which would otherwise scroll twice on one turn of the wheel."""
+        own scrollbar - a table, the output pane, a section dragged shorter
+        than its contents, an open dropdown list - which would otherwise
+        scroll twice on one turn of the wheel."""
         canvas, bar = self._scroll
-        if not bar.winfo_manager():
-            return
+        ticks = int(-event.delta / 120) or (-1 if event.delta > 0 else 1)
         widget = event.widget
         while widget is not None and widget is not canvas:
-            yview = getattr(widget, "yview", None)
-            if yview is not None:
-                try:
-                    if tuple(yview()) != (0.0, 1.0):
-                        return          # it has somewhere of its own to go
-                except (TypeError, ValueError, tk.TclError):
-                    return
+            room = self._has_room(widget)
+            if room is None:
+                return
+            if room:
+                # A canvas has no wheel binding of its own, so a clipped
+                # section is scrolled here or not at all. Everything else
+                # has already been told about the turn.
+                if widget in self._panes:
+                    widget.yview_scroll(ticks, "units")
+                return
             widget = getattr(widget, "master", None)
-        if widget is not canvas:
-            return                      # another window, such as a dialog
-        canvas.yview_scroll(int(-event.delta / 120) or
-                            (-1 if event.delta > 0 else 1), "units")
+        if widget is not canvas or not bar.winfo_manager():
+            return              # another window, or the form already fits
+        canvas.yview_scroll(ticks, "units")
 
     def _show_focused(self, event):
         """Bring a field tabbed into below the fold into view, so typing
-        never lands somewhere off screen."""
+        never lands somewhere off screen - inside a section dragged
+        shorter than its fields as well as inside the window."""
         canvas, bar = self._scroll
         widget = event.widget
         # Only the things that are typed into: the window itself and the
         # panes also report focus, and following those would scroll the
         # form about on its own.
-        if not bar.winfo_manager() or not isinstance(widget,
-                                                     (tk.Entry, tk.Text)):
+        if not isinstance(widget, (tk.Entry, tk.Text)):
             return
         try:
             if widget.winfo_toplevel() is not self.root:
                 return                  # a dialog's own field
+        except tk.TclError:
+            return
+        # The section first: moving it changes where the field is, which
+        # is what the window then has to be told about.
+        moved = False
+        for pane, inner in self._panes.items():
+            if self._has_room(pane) and self._within(pane, widget):
+                self._reveal(pane, widget, inner.winfo_reqheight())
+                moved = True
+        if bar.winfo_manager():
+            if moved:
+                # A canvas moves what is in it when it next goes idle, and
+                # where the field ends up is what the window is measuring.
+                self.root.update_idletasks()
+            self._reveal(canvas, widget, self._form_height)
+
+    @staticmethod
+    def _within(parent, widget):
+        while widget is not None:
+            if widget is parent:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _reveal(self, canvas, widget, total):
+        try:
             top = widget.winfo_rooty() - canvas.winfo_rooty()
             high = widget.winfo_height()
         except tk.TclError:
@@ -322,7 +374,139 @@ class ClassicLayout:
             return
         move = top - edge if top < 0 else top + high - view + edge
         canvas.yview_moveto(max(0.0, (canvas.canvasy(0) + move)
-                                / float(self._form_height)))
+                                / float(total or 1)))
+
+    # ------------------------------------------------------------------
+    # sections you can drag taller or shorter
+    # ------------------------------------------------------------------
+
+    def _section(self, parent, title, key, minimum, cap=None, expand=False):
+        """A labelled box with a grab bar along its bottom edge.
+
+        The box is packed here, the holder - the part that gives and takes
+        the height - is not, because it usually belongs between things that
+        must stay put: drag Live shorter and it is the tabs that shrink,
+        not the numbers above them, and drag Settings shorter and Load
+        model stays where it is. So the caller packs the holder where the
+        growing part goes and puts the rest straight into the box.
+
+        Until it is dragged a section sizes itself exactly as it did
+        before: to its contents, or, with expand, to the room left over.
+        """
+        box = ttk.LabelFrame(parent, text=" %s " % title)
+        box.pack(fill="both" if expand else "x", expand=expand, padx=8, pady=3)
+        grip = tk.Frame(box, bg=BG, cursor="sb_v_double_arrow",
+                        height=self.px(9))
+        grip.pack(side="bottom", fill="x")
+        grip.pack_propagate(False)
+        # Placed rather than packed: a short bar in the middle reads as
+        # something to take hold of, where a full-width line would read as
+        # the bottom of the box.
+        line = tk.Frame(grip, bg=BORDER, height=self.px(3), width=self.px(46))
+        line.place(relx=0.5, rely=0.5, anchor="center")
+        sec = self._sections[key] = {
+            "title": title, "box": box, "holder": ttk.Frame(box), "line": line,
+            "min": minimum, "cap": cap, "expand": expand,
+            "height": None,               # None while it sizes itself
+            "content": None,              # what "as tall as it needs" means
+        }
+        for widget in (grip, line):
+            widget.bind("<Enter>", lambda e, s=sec: s["line"].configure(bg=ACCENT))
+            widget.bind("<Leave>", lambda e, s=sec: s["line"].configure(bg=BORDER))
+            widget.bind("<Button-1>", lambda e, k=key: self._grip_press(k, e))
+            widget.bind("<B1-Motion>", lambda e, k=key: self._grip_drag(k, e))
+            widget.bind("<Double-Button-1>", lambda e, k=key: self._grip_reset(k))
+        return box, sec["holder"]
+
+    def _apply_section(self, key):
+        sec = self._sections[key]
+        holder, auto = sec["holder"], sec["height"] is None
+        # A frame stops reporting what is inside it the moment it is given
+        # a height of its own, which is exactly what a dragged section
+        # wants and exactly what an undragged one must not have.
+        holder.pack_propagate(auto)
+        if not auto:
+            holder.configure(height=sec["height"])
+        grow = sec["expand"] and auto
+        for widget in (sec["box"], holder):
+            widget.pack_configure(expand=grow,
+                                  fill="both" if grow else "x")
+
+    def _grip_press(self, key, event):
+        sec = self._sections[key]
+        sec["from_y"] = event.y_root
+        sec["from_h"] = sec["holder"].winfo_height()
+
+    def _grip_drag(self, key, event):
+        sec = self._sections[key]
+        if "from_y" not in sec:
+            return
+        # Taller than its own contents is room for rows a table has not
+        # been given yet, so only a fixed grid of fields is capped.
+        most = self.root.winfo_screenheight()
+        if sec["cap"] == "content" and sec["content"] is not None:
+            most = sec["content"].winfo_reqheight()
+        sec["height"] = max(sec["min"],
+                            min(sec["from_h"] + event.y_root - sec["from_y"],
+                                max(sec["min"], most)))
+        self._apply_section(key)
+
+    def _grip_reset(self, key):
+        sec = self._sections[key]
+        sec["height"] = None
+        self._apply_section(key)
+        self.set_status("%s sizes itself again." % sec["title"])
+
+    def _restore_sections(self):
+        """Heights are kept even though the window's own is not: where the
+        window sits is a habit of the day, how the space inside it is
+        divided is a preference."""
+        saved = self.app.cfg.get("sections_classic") or {}
+        for key, sec in self._sections.items():
+            height = saved.get(key)
+            if isinstance(height, int) and height > 0:
+                # Clamped to this screen: the one it was dragged on may
+                # have been a taller one.
+                sec["height"] = max(sec["min"],
+                                    min(height, self.root.winfo_screenheight()))
+                self._apply_section(key)
+
+    def _clip(self, parent):
+        """A viewport for a section whose contents cannot shrink.
+
+        The fields in Settings are a fixed grid, so dragging that box
+        shorter can only hide some of them. What it hides gets a scrollbar
+        of its own rather than being lost.
+        """
+        pane = tk.Canvas(parent, bg=BG, highlightthickness=0, bd=0, height=1)
+        bar = ttk.Scrollbar(parent, orient="vertical", command=pane.yview)
+        pane.configure(yscrollcommand=bar.set)
+        pane.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(pane)
+        item = pane.create_window(0, 0, window=inner, anchor="nw")
+        shown = [None]
+
+        def fit(_event=None):
+            need, width = inner.winfo_reqheight(), pane.winfo_width()
+            if shown[0] != (need, width):
+                shown[0] = (need, width)
+                # Asking for the full height is what makes the section as
+                # tall as its fields while it still sizes itself; once it
+                # is dragged the holder is fixed and hands down whatever
+                # height it was given instead.
+                pane.configure(height=need, scrollregion=(0, 0, width, need))
+                pane.itemconfigure(item, width=width)
+            over = need > pane.winfo_height() + 1
+            if over and not bar.winfo_manager():
+                bar.pack(side="right", fill="y", before=pane)
+            elif not over and bar.winfo_manager():
+                bar.pack_forget()
+                pane.yview_moveto(0)
+
+        inner.bind("<Configure>", fit)
+        pane.bind("<Configure>", fit)
+        self._panes[pane] = inner
+        return pane, inner
 
     def _field_group(self, parent, title, blurb, keys):
         """One labelled block of fields, four to a row."""
@@ -372,8 +556,10 @@ class ClassicLayout:
         History and Output are rarely both wanted at once.
         """
         app = self.app
-        box = ttk.LabelFrame(parent, text=" Live ")
-        box.pack(fill="both", expand=True, padx=8, pady=3)
+        # The strips above go into the box and stay: dragging Live shorter
+        # is asking for fewer rows of history, never for the speeds to go.
+        box, holder = self._section(parent, "Live", "live", self.px(120),
+                                    expand=True)
 
         top = ttk.Frame(box)
         top.pack(fill="x", padx=8, pady=(6, 2))
@@ -415,7 +601,8 @@ class ClassicLayout:
         self.gpu_box.pack(fill="x", padx=8, pady=(0, 6))
         self._gpu_cells = []
 
-        tabs = ttk.Notebook(box)
+        holder.pack(side="top", fill="both", expand=True)
+        tabs = ttk.Notebook(holder)
         tabs.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         hist = ttk.Frame(tabs)
@@ -525,7 +712,9 @@ class ClassicLayout:
         pass
 
     def close(self):
-        pass
+        self.app.cfg["sections_classic"] = {
+            key: sec["height"] for key, sec in self._sections.items()
+            if sec["height"]}
 
     def launch_started(self):
         pass
