@@ -27,6 +27,7 @@ import webbrowser
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import backends
+import dsh
 import metrics
 import opencode
 import processes
@@ -348,6 +349,13 @@ class Zoomies:
         # poll only opens its config when something has actually changed.
         self._opencode_seen = None
         self._opencode_moan = ""
+
+        # The same, for the DeepSeek Harness. Kept apart from opencode's so
+        # that one client's unreadable config does not stop the other from
+        # being told, and so either can be written without the other's
+        # stamp going stale.
+        self._dsh_seen = None
+        self._dsh_moan = ""
 
         self.vars, self.dirty = {}, {}
         keys = [k for row in backends.SETTING_ROWS for k in row if k]
@@ -2205,6 +2213,7 @@ class Zoomies:
             self.shared["status"] = status
             self.shared["polled"] = True
         self._sync_opencode_limits(loaded)
+        self._sync_dsh_limits(loaded)
 
     def _sync_opencode_limits(self, loaded):
         """Keep opencode's idea of the context in step with the servers.
@@ -2250,6 +2259,55 @@ class Zoomies:
                 self._opencode_moan = str(exc)
                 self.out_queue.put(
                     ("line", "[zoomies] could not tell opencode the context: %s"
+                     % exc))
+
+    def _sync_dsh_limits(self, loaded):
+        """Keep the DeepSeek Harness's idea of the context in step.
+
+        Same reasoning as _sync_opencode_limits, and the same shape: dsh
+        reads the window out of its own settings.yaml and never asks the
+        server, so a number left over from an earlier load decides when it
+        compacts. Its own default is 1,000,000, which no local server comes
+        near, and it does not clamp the reply budget against the window
+        either - so the context and maxTokens both have to be written.
+
+        dsh serves one model at a time, so the model dsh has selected is
+        written too: a selection naming anything else cannot be served.
+
+        Deliberately a second pass rather than a branch inside opencode's.
+        The two configs fail independently - one can be mid-save or hand
+        broken while the other is fine - and a shared signature would let a
+        write to one mask a drift in the other.
+        """
+        servers = tuple(sorted(
+            (model.endpoint, model.id, model.context) for model in loaded
+            if model.backend == "llamacpp" and model.context))
+        signature = (servers, dsh.config_stamp())
+        if signature == self._dsh_seen:
+            return
+        self._dsh_seen = signature
+        if not servers:
+            return
+        try:
+            plan = dsh.plan_limits(loaded=loaded)
+            if plan.edits:
+                dsh.write(plan, backup=False)
+                for line in plan.changed:
+                    self.out_queue.put(("line", "[zoomies] dsh " + line))
+                # Our own write moved the stamp; record where we left it so
+                # the next poll does not read the file back to find itself.
+                self._dsh_seen = (servers, dsh.config_stamp())
+            for note in plan.notes:
+                self.out_queue.put(("line", "[zoomies] dsh: " + note))
+            self._dsh_moan = ""
+        except (OSError, ValueError) as exc:
+            # A settings file that is missing, half-edited or not ours to
+            # parse is not worth interrupting a load over. Said once, then
+            # left until something changes.
+            if str(exc) != self._dsh_moan:
+                self._dsh_moan = str(exc)
+                self.out_queue.put(
+                    ("line", "[zoomies] could not tell dsh the context: %s"
                      % exc))
 
     def _poll_loop(self):
