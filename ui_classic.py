@@ -202,6 +202,8 @@ class ClassicLayout:
                    command=app._unload_selected).pack(side="left")
         ttk.Button(lbar, text="Unload all",
                    command=app._unload_all).pack(side="left", padx=(8, 0))
+        ttk.Button(lbar, text="Copy endpoint",
+                   command=app._copy_endpoint).pack(side="left", padx=(8, 0))
         ttk.Button(lbar, text="Temporary tags...",
                    command=app._manage_tags).pack(side="left", padx=(8, 0))
         self.vram_lbl = ttk.Label(lbar, text="", style="Dim.TLabel")

@@ -2052,6 +2052,19 @@ class Zoomies:
         for item in chosen:
             self._unload_one(item)
 
+    def _copy_endpoint(self):
+        chosen = self.view.selected_loaded()
+        if not chosen:
+            self.set_status("Select a row in Loaded first.", "Warn.TLabel")
+            return
+        # A foreign server we only know by pid has no address to hand over.
+        if not chosen[0].endpoint:
+            self.set_status("That one has no endpoint to copy.", "Warn.TLabel")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(chosen[0].endpoint)
+        self.set_status("Copied %s" % chosen[0].endpoint, "Ok.TLabel")
+
     def _unload_all(self):
         with self.lock:
             loaded = list(self.shared["loaded"])

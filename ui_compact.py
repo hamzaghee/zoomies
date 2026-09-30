@@ -882,7 +882,7 @@ class CompactLayout:
             buttons.columnconfigure(col, weight=1, uniform="mb")
         for i, (text, command) in enumerate((
                 ("Unload", app._unload_selected), ("Unload all", app._unload_all),
-                ("Open log", app._open_log), ("Copy endpoint", self._copy_endpoint))):
+                ("Open log", app._open_log), ("Copy endpoint", app._copy_endpoint))):
             row, col = divmod(i, 2)
             ttk.Button(buttons, text=text, command=command).grid(
                 row=row, column=col, sticky="ew", pady=(0, self.px(6)),
@@ -1048,13 +1048,6 @@ class CompactLayout:
             other.pack_forget()
         panel.pack(fill="both", expand=True)
         self._mon_panel = panel
-
-    def _copy_endpoint(self):
-        chosen = self.selected_loaded()
-        if chosen and chosen[0].endpoint:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(chosen[0].endpoint)
-            self.app.set_status("Copied %s" % chosen[0].endpoint, "Ok.TLabel")
 
     # ------------------------------------------------------------------
     # setup: what the controller calls
