@@ -28,6 +28,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import backends
 import dsh
+import hermes
 import metrics
 import opencode
 import processes
@@ -356,6 +357,14 @@ class Zoomies:
         # stamp going stale.
         self._dsh_seen = None
         self._dsh_moan = ""
+
+        # And for Hermes. It is the odd one of the three: it has no model
+        # catalogue, only a single pin, because llama.cpp serves one model at
+        # a time - so there is nothing to add to, only a selection to keep
+        # current. Before this it was never synced and went stale on every
+        # swap.
+        self._hermes_seen = None
+        self._hermes_moan = ""
 
         self.vars, self.dirty = {}, {}
         keys = [k for row in backends.SETTING_ROWS for k in row if k]
@@ -2213,6 +2222,7 @@ class Zoomies:
             self.shared["polled"] = True
         self._sync_opencode_limits(loaded)
         self._sync_dsh_limits(loaded)
+        self._sync_hermes_limits(loaded)
 
     def _sync_opencode_limits(self, loaded):
         """Keep opencode's idea of the context in step with the servers.
@@ -2307,6 +2317,53 @@ class Zoomies:
                 self._dsh_moan = str(exc)
                 self.out_queue.put(
                     ("line", "[zoomies] could not tell dsh the context: %s"
+                     % exc))
+
+    def _sync_hermes_limits(self, loaded):
+        """Keep Hermes's single model pin in step with the server.
+
+        Same reasoning and the same shape as the two above, with one
+        difference that is worth stating: Hermes holds no catalogue. It pins
+        one model - `model.default` plus the `fallback_providers` entries
+        backing it - because llama.cpp serves one at a time, so there is no
+        entry to add and nothing to leave alone. That also means it has no
+        equivalent of dsh's "port is serving something the catalog does not
+        list" note: whatever is up is simply what gets pinned.
+
+        A third pass rather than a branch in either of the others, for the
+        reason dsh's docstring gives: the three configs fail independently,
+        and a shared signature would let a write to one mask a drift in
+        another.
+        """
+        servers = tuple(sorted(
+            (model.endpoint, model.id, model.context) for model in loaded
+            if model.backend == "llamacpp" and model.context))
+        signature = (servers, hermes.config_stamp())
+        if signature == self._hermes_seen:
+            return
+        self._hermes_seen = signature
+        if not servers:
+            return
+        try:
+            plan = hermes.plan_limits(loaded=loaded)
+            if plan.edits:
+                hermes.write(plan, backup=False)
+                for line in plan.changed:
+                    self.out_queue.put(("line", "[zoomies] hermes " + line))
+                # Our own write moved the stamp; record where we left it so
+                # the next poll does not read the file back to find itself.
+                self._hermes_seen = (servers, hermes.config_stamp())
+            for note in plan.notes:
+                self.out_queue.put(("line", "[zoomies] hermes: " + note))
+            self._hermes_moan = ""
+        except (OSError, ValueError) as exc:
+            # A config that is missing, half-edited or not ours to parse is
+            # not worth interrupting a load over - and Hermes may well not be
+            # installed at all. Said once, then left until something changes.
+            if str(exc) != self._hermes_moan:
+                self._hermes_moan = str(exc)
+                self.out_queue.put(
+                    ("line", "[zoomies] could not tell hermes the context: %s"
                      % exc))
 
     def _poll_loop(self):
