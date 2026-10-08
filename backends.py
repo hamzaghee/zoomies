@@ -1267,6 +1267,16 @@ class LlamaCppBackend(Backend):
             for record in source:
                 if os.path.normcase(record.gguf_path) not in seen:
                     models.append(record)
+        # A diffusion GGUF in the same folder is not something llama.cpp can
+        # load: it has no general.architecture to dispatch on, and no
+        # llama.cpp binary implements denoising. Offering it here would put a
+        # load in the dropdown that can only ever fail, so it is filtered out
+        # at the end rather than in each scan - the sdcpp backend lists it.
+        # Imported inside the method because sdcpp subclasses Backend from
+        # this module and is only registered at the bottom of it.
+        import sdcpp
+        models = [m for m in models
+                  if not sdcpp.is_diffusion_gguf(m.gguf_path or m.id)]
         models.sort(key=lambda m: m.label.lower())
         return models
 
@@ -1704,3 +1714,19 @@ class LlamaCppBackend(Backend):
 
 
 register(LlamaCppBackend())
+
+
+# --------------------------------------------------------------------------
+# stable-diffusion.cpp
+# --------------------------------------------------------------------------
+# Imported last, and from the bottom rather than the top, because sdcpp.py
+# subclasses Backend from this module: by the time we get here every name it
+# reaches for already exists.
+#
+# `import sdcpp`, never `from sdcpp import ...`, and sdcpp registers itself.
+# Either module can legitimately be imported first - app.py reaches this one,
+# test_sdcpp.py reaches the other - and a from-import needs the class to
+# already exist, which it does not when sdcpp is half way through its own
+# `import backends`. Binding the module alone touches no attribute, so the
+# cycle resolves whichever end it starts from.
+import sdcpp                            # noqa: E402,F401  (see above)
