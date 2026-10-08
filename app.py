@@ -1248,8 +1248,7 @@ class Zoomies:
             self._vram_req += 1
             self._sync_vram_rows([])
             self.view.show_vram_estimate(
-                None, "" if model is None else
-                "estimated for llama.cpp only - Ollama places layers itself",
+                None, "" if model is None else be.vram_note,
                 "Dim.TLabel", "")
             return
         settings = self.settings_dict()

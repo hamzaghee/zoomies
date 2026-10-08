@@ -375,6 +375,11 @@ class Backend:
     endpoint = ""
     host = "127.0.0.1"
     port = 0
+    # Why Zoomies cannot size this backend's load, shown beside a blank VRAM
+    # estimate. Only llama.cpp is estimated, because only there does Zoomies
+    # choose the layer count; every other backend decides for itself, and
+    # each decides differently, so each says so in its own words.
+    vram_note = ""
 
     def __init__(self):
         self.last_error = ""
@@ -597,6 +602,7 @@ def forget_tag(session, tag):
 
 class OllamaBackend(Backend):
     name = "ollama"
+    vram_note = "estimated for llama.cpp only - Ollama places layers itself"
     display_name = "Ollama"
     uses_model_folder = False
     endpoint = OLLAMA_BASE
