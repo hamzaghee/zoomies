@@ -15,9 +15,20 @@ cards and one card can overflow while the total fits:
               - sliding-window layers (Gemma 4, Muse Glimmer, Laguna) hold
                 their window, not the whole context.
   state     the fixed recurrent state of those other layers, per slot.
-  compute   llama.cpp's scratch space. The one rough part: it depends on
-            the batch size, flash attention and the vocabulary, and is
-            estimated here rather than read from anywhere.
+  compute   llama.cpp's scratch space, which is the largest single thing
+            here after the weights - 1.2 GB a card on a 35B at 131k - and
+            the only one no formula gets right for every architecture. It is
+            measured instead: llamafit asks llama.cpp itself, once per model
+            file. See llamafit and GPU_GRAPH below.
+  host      the part of that scratch llama.cpp keeps in pinned system
+            memory. Not on a card at all, but Windows reports it as *shared*
+            memory on the first card the process is using, which is what
+            makes a healthy load look like it is spilling a gigabyte.
+
+Everything except compute was checked against llama.cpp's own per-device
+figures (`-lv 4`, which prints them) and agreed to the megabyte on
+Qwen3.6-35B-A3B at 131k: weights 8635 / 12163 MiB, cache 1051 / 1571 MiB,
+and 515 MiB of embeddings left in system RAM.
 
 How llama.cpp places layers is mirrored from llama-model.cpp: split in
 proportion to each card's free memory unless --tensor-split says otherwise,
@@ -49,10 +60,31 @@ KV_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32,
 SWA_PERIOD = {"laguna": 4}
 
 # Fixed cost per card that no header mentions: the Vulkan context and
-# llama.cpp's own small buffers. Set from measured loads (flash attention
-# on): Qwen3.8 64k read 0.1 GB per card under this estimate, Devstral Q6 49k
-# and Laguna 64k 0.2 GB over it - so expect about +-0.25 GB per card.
+# llama.cpp's own small buffers. Confirmed against llama.cpp's own per-device
+# projection for Qwen3.6-35B-A3B at 131k, which came out 0.203 GB under what
+# the counters read on one card and 0.213 GB under the other - so this is the
+# one constant here that measurement has left alone.
 CARD_OVERHEAD = 250 * MB
+
+# Bytes of compute buffer per token of micro-batch per token of per-slot
+# context: llama.cpp's attention mask and the scratch beside it. Read off
+# llama.cpp's own projection for Qwen3.6-35B-A3B on Vulkan, which moved by
+# exactly 0.5 MB per token of micro-batch for every 65,536 of context.
+MASK_BYTES = 8
+
+# The same thing again in pinned system memory, which every card a model is
+# split over shares one copy of. 1.04 GB at 131k context and -ub 1024, and it
+# is why SPILL_BYTES in metrics.py cannot be a constant: no --tensor-split
+# moves it, and only a smaller context or a smaller -ub shrinks it.
+HOST_BYTES = 8
+
+# How much wider the graph is on a graphics card than on the CPU, which is
+# what llamafit's probe measures. Against llama.cpp's own per-device
+# projections - Qwen3.6-35B-A3B at 131k, Qwen3.8-27B at 64k, Devstral 2 at
+# 32k - the ratio ran from 1.17 to 1.61 per card. This sits at the top of
+# that range on purpose: a compute buffer guessed small is a model in system
+# RAM, guessed large is only a smaller context offered.
+GPU_GRAPH = 1.5
 
 # How much room a card should keep free. Windows spills to system RAM
 # silently rather than failing, so "just fits" is not good enough.
@@ -203,8 +235,9 @@ class Layers:
                            or h.lengths.get("tokenizer.ggml.tokens") or 0)
         ff = h.get("feed_forward_length")
         self.n_ff = max(ff) if isinstance(ff, list) else int(ff or 0)
+        self.n_expert_used = int(h.get("expert_used_count") or 0)
         self.n_expert_ff = int(h.get("expert_feed_forward_length") or 0) * \
-            int(h.get("expert_used_count") or 0)
+            self.n_expert_used
         self.window = int(h.get("attention.sliding_window") or 0)
         self.notes = []
 
