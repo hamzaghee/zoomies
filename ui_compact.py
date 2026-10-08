@@ -24,8 +24,8 @@ import metrics
 import processes
 import vram
 from ui_common import (ACCENT, BAD, BG, BG_FIELD, BG_PANEL, BORDER, FG, FG_DIM,
-                       FONT_MONO, OK_GREEN, WARN, fill_combo, human_bytes,
-                       until)
+                       FONT_MONO, OK_GREEN, WARN, backend_names, fill_combo,
+                       human_bytes, until)
 
 # Segoe Fluent Icons ships with Windows 11 and MDL2 Assets with Windows 10;
 # both put the same glyphs at the same code points.
@@ -505,12 +505,16 @@ class CompactLayout:
         row = ttk.Frame(box)
         row.pack(fill="x")
         self.backend_btns = {}
-        for col, name in enumerate(("llamacpp", "ollama")):
+        names = backend_names(("llamacpp", "ollama"))
+        for col, name in enumerate(names):
             row.columnconfigure(col, weight=1, uniform="be")
             be = backends.get(name)
             cell = ttk.Frame(row)
-            cell.grid(row=0, column=col, sticky="ew",
-                      padx=(0, self.px(4)) if col == 0 else (self.px(4), 0))
+            # Gaps between the cells, not outside them, so the row still fits
+            # edge to edge however many backends are registered.
+            left = 0 if col == 0 else self.px(4)
+            right = 0 if col == len(names) - 1 else self.px(4)
+            cell.grid(row=0, column=col, sticky="ew", padx=(left, right))
             btn = self._toggle(cell, be.display_name if be else name.title(),
                                lambda n=name: self._pick_backend(n))
             btn.pack(fill="x")

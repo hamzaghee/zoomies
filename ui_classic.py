@@ -16,7 +16,8 @@ import metrics
 import processes
 import vram
 from ui_common import (ACCENT, BAD, BG, BG_PANEL, BORDER, FG, FG_DIM,
-                       FONT_MONO, WARN, fill_combo, human_bytes, until)
+                       FONT_MONO, WARN, backend_names, fill_combo,
+                       human_bytes, until)
 
 
 class ClassicLayout:
@@ -75,7 +76,7 @@ class ClassicLayout:
         row = ttk.Frame(pick)
         row.grid(row=0, column=1, sticky="ew")
         self.backend_status = {}
-        for name in ("ollama", "llamacpp"):
+        for name in backend_names(("ollama", "llamacpp")):
             be = backends.get(name)
             rb = ttk.Radiobutton(
                 row, text=(be.display_name if be else name.title()),

@@ -202,3 +202,17 @@ def apply_style(root, px):
     root.option_add("*TCombobox*Listbox.background", BG_FIELD)
     root.option_add("*TCombobox*Listbox.foreground", FG)
     root.option_add("*TCombobox*Listbox.selectBackground", "#094771")
+
+
+def backend_names(preferred=()):
+    """Every registered backend, with these named ones first.
+
+    The two layouts used to hardcode their own pair, so a backend added to
+    the registry appeared nowhere and looked broken - there was simply no
+    button to select it. Each layout keeps the order it already had and any
+    newcomer lands at the end, so adding a backend needs no layout change.
+    """
+    import backends
+    names = [n for n in preferred if n in backends.REGISTRY]
+    names += [n for n in backends.REGISTRY if n not in names]
+    return names
