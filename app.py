@@ -1444,7 +1444,7 @@ class Zoomies:
         for row in rows:
             if row.get("used") is None or not row.get("model_bytes"):
                 continue
-            if state.note_vram(self._vram_limits, row.get("luid"),
+            if state.note_vram(self._vram_limits, row.get("key"),
                                row.get("vram"), row["used"],
                                row.get("spilled") or 0, self._vram_watch):
                 changed = True
