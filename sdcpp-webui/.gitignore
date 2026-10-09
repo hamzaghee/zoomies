@@ -1,0 +1,6 @@
+node_modules
+.DS_Store
+# The built page is tracked on purpose: sdcpp.py reads it at launch, so a
+# clone without it serves sd-server's own page instead. See VENDORED.txt.
+dist/*
+!dist/index.html

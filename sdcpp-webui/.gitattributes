@@ -1,0 +1,5 @@
+# The built page is a minified bundle, and git's end-of-line conversion is
+# not safe on one: a newline inside a JavaScript template literal is part of
+# the string, so turning LF into CRLF on checkout would change what the page
+# does, not just how it is stored. Kept byte for byte.
+dist/index.html -text -diff
