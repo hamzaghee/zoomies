@@ -1181,17 +1181,37 @@ QUANT_RE = re.compile(r"(?i)(UD-[A-Z0-9_]+|IQ\d[_A-Z0-9]*|"
                       r"Q\d[_A-Z0-9]*|MXFP4|BF16|F16|F32)")
 
 
+# Name fragments that mark a .gguf as a piece of a model rather than one you
+# can load on its own. Shared by every path that enumerates .gguf files, so a
+# file one of them hides cannot show up as a model in another.
+GGUF_SKIP = ("mmproj", "dspark", "ggml-vocab", "-draft")
+
+
+def is_loadable_gguf(fname):
+    """True if this file name is a model llama.cpp can be pointed at alone.
+
+    The one place that decides it, for folder scans and for the loose files
+    beside the Hugging Face cache alike.
+    """
+    low = os.path.basename(fname).lower()
+    if not low.endswith(".gguf"):
+        return False
+    if any(s in low for s in GGUF_SKIP):
+        return False
+    shard = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", low)
+    return not shard or shard.group(1) == "00001"
+
+
 def scan_gguf_folder(backend, folder):
     """Loose .gguf files under a folder.
 
     Skips the pieces that are not a model you can load on their own:
     projector files, speculative-decoding sidecars, llama.cpp's tiny vocab
     fixtures, and every shard of a split model except the first (llama.cpp
-    finds the rest itself).
+    finds the rest itself). is_loadable_gguf holds that rule.
     """
     if not folder or not os.path.isdir(folder):
         return []
-    skip = ("mmproj", "dspark", "ggml-vocab", "-draft")
     out, seen = [], set()
     for base, dirs, files in os.walk(folder):
         if base[len(folder):].count(os.sep) >= 4:
@@ -1199,11 +1219,7 @@ def scan_gguf_folder(backend, folder):
             continue
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for fname in files:
-            low = fname.lower()
-            if not low.endswith(".gguf") or any(s in low for s in skip):
-                continue
-            shard = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", low)
-            if shard and shard.group(1) != "00001":
+            if not is_loadable_gguf(fname):
                 continue
             path = os.path.join(base, fname)
             if path in seen:
@@ -1342,8 +1358,7 @@ class LlamaCppBackend(Backend):
         # Only the top level: everything below it is the cache's own layout,
         # handled above.
         for entry in entries:
-            low = entry.lower()
-            if not low.endswith(".gguf") or "mmproj" in low:
+            if not is_loadable_gguf(entry):
                 continue
             rec = gguf_record(self.name, os.path.join(hub, entry))
             if rec is not None:
