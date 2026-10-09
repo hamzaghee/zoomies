@@ -131,9 +131,31 @@ def adapters():
     """Cards in the order llama.cpp's Vulkan backend numbers them.
 
     Vulkan0, Vulkan1... follow DXGI's order of the non-software adapters,
-    integrated graphics included (this machine: RX 6800 XT, UHD 770, RX 6800
-    XT, so the two RX cards are Vulkan0 and Vulkan2). That order is an
-    assumption - llama.cpp is never asked, because asking starts Vulkan.
+    integrated graphics included. Which card gets which number is not
+    recorded here on purpose: Windows reshuffles the whole enumeration from
+    one boot to the next, and the adapter LUIDs change with it. Three
+    readings on 2026-10-06 put this machine's two RX 6800 XT and one UHD
+    770 in three different orders - iGPU first, iGPU in the middle, iGPU
+    last - each stable within its boot. Any index written down is true
+    until the next restart.
+
+    DXGI's order agreed with llama.cpp's in all three, so this mirror is
+    sound. What is not sound is a caller pinning the result. Nothing here
+    notices a stale index: the estimate simply costs the wrong cards, and
+    because an iGPU reports almost no *dedicated* VRAM, a pair holding one
+    by mistake shows up as a 0.1 GB card that nothing fits on - while the
+    launch sends half a model into shared system RAM instead of failing.
+
+    So do not hardcode a --device pair. Leaving it out is the fix, not a
+    better-chosen pair: build_launch then asks llama.cpp at launch (see
+    backends.INTEGRATED_GPU) and drops the shared-memory cards, and
+    cards_for does the equivalent here by VRAM size, so both follow the
+    renumbering for free. When a pinned pair has to be checked, the only
+    authority on llama.cpp's own numbering is
+
+        llama.exe cli --list-devices
+
+    read fresh, in the boot you are in.
     """
     out, seen = [], set()
     for a in state.enumerate_adapters():
@@ -163,9 +185,12 @@ def cards_for(tokens, found=None):
         # What build_launch does when no --device is given: dedicated only.
         chosen = [a for a in found if a["vram"] >= GB]
     limits = state.load_vram_limits()
+    # luid identifies the card to the performance counters; the budget is
+    # looked up on the stable adapter key instead, because a LUID does not
+    # survive a card being disabled and re-enabled (see load_vram_limits).
     return [Card(name=state.display_label(a, chosen), luid=a["luid"],
                  total=int(a["vram"]),
-                 budget=state.vram_budget(limits, a["luid"], a["vram"]))
+                 budget=state.vram_budget(limits, a["key"], a["vram"]))
             for a in chosen]
 
 

@@ -880,6 +880,9 @@ class Metrics:
                 rows.append({
                     "name": state.display_label(adapter, adapters),
                     "luid": adapter["luid"],
+                    # Carried alongside the LUID so a learned VRAM ceiling
+                    # can be filed under an identity that outlives it.
+                    "key": adapter["key"],
                     "vram": adapter["vram"],
                     "pct": usage.get(adapter["luid"]),
                     "used": (memory.get("used") or {}).get(adapter["luid"]),

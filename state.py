@@ -260,8 +260,24 @@ def save_history(rows):
     return write_json(HISTORY_PATH, {"version": 1, "rows": list(rows)})
 
 
+# Rows written before the limits were keyed on adapter_key: a DXGI LUID,
+# "00000000_00011A42". Windows reissues those whenever a card is disabled
+# and re-enabled (and on some reboots), so such a row can never match a
+# live card again - it is dead weight, and leaving it in only makes the
+# file look like it holds limits it cannot apply. See adapter_key.
+_LEGACY_LUID_KEY = re.compile(r"^[0-9A-Fa-f]{8}_[0-9A-Fa-f]{8}$")
+
+
 def load_vram_limits():
-    """{luid: {"vram", "ceiling", "clean", "seen", "at", "ts"}}.
+    """{adapter_key: {"vram", "ceiling", "clean", "seen", "at", "ts"}}.
+
+    Keyed on state.adapter_key - vendor:device:subsystem - because that is
+    the one identity for a card that survives a reboot or a trip through
+    Device Manager. It used to be keyed on the LUID, which does not: one
+    card toggled off and on again orphaned 25 rows at once here, among them
+    a ceiling confirmed 90 times, and the estimate quietly fell back to the
+    sticker VRAM - about 1.8 GB per card more than these cards really hand
+    out, which is the difference between "fits" and a silent spill.
 
     "seen" counts confirmations of the ceiling rather than readings, and
     "at"/"ts" are when the last one landed.
@@ -272,7 +288,11 @@ def load_vram_limits():
     """
     cards = read_json(VRAM_LIMITS_PATH, {}).get("cards")
     cards = cards if isinstance(cards, dict) else {}
-    if prune_vram_limits(cards):
+    changed = False
+    for card_id in [k for k in cards if _LEGACY_LUID_KEY.match(k)]:
+        del cards[card_id]
+        changed = True
+    if prune_vram_limits(cards) or changed:
         save_vram_limits(cards)
     return cards
 
@@ -306,9 +326,9 @@ def prune_vram_limits(cards, now=None):
     """
     now = time.time() if now is None else now
     changed = False
-    for luid, card in list(cards.items()):
+    for card_id, card in list(cards.items()):
         if not isinstance(card, dict):
-            del cards[luid]
+            del cards[card_id]
             changed = True
             continue
         ceiling = int(card.get("ceiling") or 0)
@@ -324,10 +344,11 @@ def prune_vram_limits(cards, now=None):
     return changed
 
 
-def _settled(watch, luid, footprint):
+def _settled(watch, card_id, footprint):
     """True once this card's footprint has stopped growing.
 
-    `watch` is scratch the caller keeps between polls, keyed by LUID; None
+    `watch` is scratch the caller keeps between polls, keyed the same way
+    as the limits themselves (state.adapter_key); None
     means take every sample, which is what a test or a one-shot caller
     wants. The comparison is against the reading at the start of the flat
     stretch rather than against the previous poll, so a load creeping up a
@@ -336,14 +357,14 @@ def _settled(watch, luid, footprint):
     if watch is None:
         return True
     now = time.time()
-    flat = watch.get(luid)
+    flat = watch.get(card_id)
     if flat is None or footprint > flat["base"] + VRAM_SETTLE_SLACK:
-        watch[luid] = {"base": footprint, "since": now}
+        watch[card_id] = {"base": footprint, "since": now}
         return False
     return now - flat["since"] >= VRAM_SETTLE_SECONDS
 
 
-def note_vram(cards, luid, vram_bytes, used, spilled=0, watch=None):
+def note_vram(cards, card_id, vram_bytes, used, spilled=0, watch=None):
     """Fold one observation of a card into what is known about its budget.
 
     `used` is everything on the card; `spilled` is what it pushed into
@@ -363,12 +384,12 @@ def note_vram(cards, luid, vram_bytes, used, spilled=0, watch=None):
 
     Returns True when anything changed and the file is worth writing.
     """
-    if not luid or not used or not vram_bytes:
+    if not card_id or not used or not vram_bytes:
         return False
     used, spilled, vram_bytes = int(used), int(spilled or 0), int(vram_bytes)
-    if not _settled(watch, luid, used + spilled):
+    if not _settled(watch, card_id, used + spilled):
         return False
-    card = dict(cards.get(luid) or {})
+    card = dict(cards.get(card_id) or {})
     before = dict(card)
     card["vram"] = vram_bytes
     if spilled:
@@ -389,13 +410,15 @@ def note_vram(cards, luid, vram_bytes, used, spilled=0, watch=None):
         card["clean"] = max(int(card.get("clean") or 0), used)
     if card == before:
         return False
-    cards[luid] = card
+    cards[card_id] = card
     return True
 
 
-def vram_budget(cards, luid, vram_bytes):
-    """What one card can really hand out, or its sticker VRAM if unknown."""
-    card = cards.get(luid) or {}
+def vram_budget(cards, card_id, vram_bytes):
+    """What one card can really hand out, or its sticker VRAM if unknown.
+
+    card_id is a state.adapter_key, not a LUID - see load_vram_limits."""
+    card = cards.get(card_id) or {}
     vram_bytes = int(vram_bytes)
     ceiling = int(card.get("ceiling") or 0)
     if ceiling < least_credible_ceiling(vram_bytes):

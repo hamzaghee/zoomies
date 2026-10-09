@@ -28,7 +28,8 @@ import state
 
 GB = 1024 ** 3
 STICKER = 17130815488            # RX 6800 XT, as DXGI reports it: 15.95 GiB
-LUID = "00000000_0001231F"
+CARD = "1002:73BF:439E1DA2"      # state.adapter_key: vendor:device:subsystem
+CARD_2 = "1002:73BF:39511462"    # the second RX 6800 XT in the same machine
 
 # What the old rule wrote for the two cards in this machine, and what a
 # believable reading off the same hardware looks like.
@@ -81,7 +82,7 @@ def replay(samples, cards=None, watch=None, clock=None, poll=0.2, every=2.0):
     learned = []
     for i, (used, spilled) in enumerate(samples):
         for _ in range(int(round(every / poll))):
-            if state.note_vram(cards, LUID, STICKER, int(used * GB),
+            if state.note_vram(cards, CARD, STICKER, int(used * GB),
                                int(spilled * GB), watch):
                 learned.append(i)
             if clock is not None:
@@ -94,37 +95,37 @@ class TheMeasurement(FrozenTime):
 
     def test_the_peak_of_a_spill_is_learned_not_the_start_of_it(self):
         cards, _ = replay(RAMP, clock=self.clock)
-        self.assertEqual(cards[LUID]["ceiling"], PEAK)
+        self.assertEqual(cards[CARD]["ceiling"], PEAK)
 
     def test_the_first_spilling_reading_is_not_the_answer(self):
         # The regression proper: the old rule kept this one.
         cards, _ = replay(RAMP, clock=self.clock)
-        self.assertGreater(cards[LUID]["ceiling"], int(RAMP[0][0] * GB))
+        self.assertGreater(cards[CARD]["ceiling"], int(RAMP[0][0] * GB))
 
     def test_a_smaller_later_spill_does_not_lower_the_ceiling(self):
         cards, _ = replay(RAMP, clock=self.clock)
         replay([(9.0, 1.0)] * 4, cards=cards, clock=self.clock)
-        self.assertEqual(cards[LUID]["ceiling"], PEAK)
+        self.assertEqual(cards[CARD]["ceiling"], PEAK)
 
     def test_a_spill_never_lowers_a_floor_a_clean_run_proved(self):
-        cards = {LUID: {"vram": STICKER, "clean": int(12.4 * GB)}}
+        cards = {CARD: {"vram": STICKER, "clean": int(12.4 * GB)}}
         replay([(11.0, 1.0)], cards=cards, clock=self.clock)
-        self.assertEqual(cards[LUID]["clean"], int(12.4 * GB))
+        self.assertEqual(cards[CARD]["clean"], int(12.4 * GB))
 
     def test_a_clean_run_keeps_the_highest_it_reached(self):
         cards, _ = replay([(8.0, 0), (13.9, 0), (4.0, 0)], clock=self.clock)
-        self.assertEqual(cards[LUID]["clean"], int(13.9 * GB))
+        self.assertEqual(cards[CARD]["clean"], int(13.9 * GB))
 
     def test_a_clean_run_alone_never_invents_a_ceiling(self):
         cards, _ = replay([(13.9, 0)], clock=self.clock)
-        self.assertIsNone(cards[LUID].get("ceiling"))
-        self.assertEqual(state.vram_budget(cards, LUID, STICKER), STICKER)
+        self.assertIsNone(cards[CARD].get("ceiling"))
+        self.assertEqual(state.vram_budget(cards, CARD, STICKER), STICKER)
 
     def test_nothing_is_learned_from_a_card_with_no_reading(self):
         cards = {}
-        self.assertFalse(state.note_vram(cards, LUID, STICKER, 0, 0))
+        self.assertFalse(state.note_vram(cards, CARD, STICKER, 0, 0))
         self.assertFalse(state.note_vram(cards, "", STICKER, 1 * GB, 0))
-        self.assertFalse(state.note_vram(cards, LUID, 0, 1 * GB, 0))
+        self.assertFalse(state.note_vram(cards, CARD, 0, 1 * GB, 0))
         self.assertEqual(cards, {})
 
 
@@ -139,7 +140,7 @@ class Settling(FrozenTime):
 
     def test_the_settled_load_is_learned_at_the_same_peak(self):
         cards, _ = replay(RAMP + PLATEAU, watch={}, clock=self.clock)
-        self.assertEqual(cards[LUID]["ceiling"], PEAK)
+        self.assertEqual(cards[CARD]["ceiling"], PEAK)
 
     def test_dedicated_usage_going_flat_is_not_enough(self):
         # A card that has run out stops taking dedicated VRAM while the
@@ -168,15 +169,15 @@ class WritingItDown(FrozenTime):
 
     def test_seen_counts_confirmations_rather_than_readings(self):
         cards, _ = replay(RAMP + PLATEAU, watch={}, clock=self.clock)
-        self.assertEqual(cards[LUID]["seen"], 1)
+        self.assertEqual(cards[CARD]["seen"], 1)
         self.clock.tick(state.VRAM_CONFIRM_SECONDS + 1)
         replay(PLATEAU, cards=cards, watch={}, clock=self.clock)
-        self.assertEqual(cards[LUID]["seen"], 2)
+        self.assertEqual(cards[CARD]["seen"], 2)
 
     def test_a_higher_peak_is_written_down_at_once(self):
         cards, _ = replay(RAMP + PLATEAU, watch={}, clock=self.clock)
         replay([(14.8, 3.4)] * 12, cards=cards, watch={}, clock=self.clock)
-        self.assertEqual(cards[LUID]["ceiling"], int(14.8 * GB))
+        self.assertEqual(cards[CARD]["ceiling"], int(14.8 * GB))
 
 
 class Credible(unittest.TestCase):
@@ -185,25 +186,25 @@ class Credible(unittest.TestCase):
     def test_the_readings_that_pinned_this_machines_cards_are_refused(self):
         for low in (PINNED_LOW, PINNED_LOW_2):
             cards = {}
-            state.note_vram(cards, LUID, STICKER, low, 1 * GB)
-            self.assertIsNone(cards[LUID].get("ceiling"),
+            state.note_vram(cards, CARD, STICKER, low, 1 * GB)
+            self.assertIsNone(cards[CARD].get("ceiling"),
                               "%d was believed" % low)
 
     def test_a_believable_reading_off_the_same_card_is_kept(self):
         cards = {}
-        state.note_vram(cards, LUID, STICKER, BELIEVABLE, 1 * GB)
-        self.assertEqual(cards[LUID]["ceiling"], BELIEVABLE)
+        state.note_vram(cards, CARD, STICKER, BELIEVABLE, 1 * GB)
+        self.assertEqual(cards[CARD]["ceiling"], BELIEVABLE)
 
     def test_an_idle_desktop_plus_windows_own_reserve_still_fits(self):
         # This machine idles at up to 2.4 GB of dedicated VRAM and Windows
         # holds back more on top. A ceiling that low down must survive.
         cards = {}
-        state.note_vram(cards, LUID, STICKER, int(12.5 * GB), 1 * GB)
-        self.assertEqual(cards[LUID]["ceiling"], int(12.5 * GB))
+        state.note_vram(cards, CARD, STICKER, int(12.5 * GB), 1 * GB)
+        self.assertEqual(cards[CARD]["ceiling"], int(12.5 * GB))
 
     def test_a_low_ceiling_in_the_file_is_ignored_even_unpruned(self):
-        cards = {LUID: {"vram": STICKER, "ceiling": PINNED_LOW}}
-        self.assertEqual(state.vram_budget(cards, LUID, STICKER), STICKER)
+        cards = {CARD: {"vram": STICKER, "ceiling": PINNED_LOW}}
+        self.assertEqual(state.vram_budget(cards, CARD, STICKER), STICKER)
 
     def test_the_reserve_is_capped_on_a_big_card(self):
         for size in (16, 24, 48):
@@ -221,59 +222,59 @@ class Budget(unittest.TestCase):
     """What the estimate is handed."""
 
     def test_an_unmeasured_card_is_worth_its_sticker_vram(self):
-        self.assertEqual(state.vram_budget({}, LUID, STICKER), STICKER)
+        self.assertEqual(state.vram_budget({}, CARD, STICKER), STICKER)
 
     def test_a_ceiling_holds_the_card_below_its_sticker_vram(self):
-        cards = {LUID: {"vram": STICKER, "ceiling": int(13.6 * GB)}}
-        self.assertEqual(state.vram_budget(cards, LUID, STICKER),
+        cards = {CARD: {"vram": STICKER, "ceiling": int(13.6 * GB)}}
+        self.assertEqual(state.vram_budget(cards, CARD, STICKER),
                          int(13.6 * GB))
 
     def test_a_clean_run_above_the_ceiling_says_the_ceiling_has_moved(self):
-        cards = {LUID: {"vram": STICKER, "ceiling": int(13.6 * GB),
+        cards = {CARD: {"vram": STICKER, "ceiling": int(13.6 * GB),
                         "clean": int(14.2 * GB)}}
-        self.assertEqual(state.vram_budget(cards, LUID, STICKER),
+        self.assertEqual(state.vram_budget(cards, CARD, STICKER),
                          int(14.2 * GB))
 
     def test_the_budget_never_exceeds_the_card(self):
-        cards = {LUID: {"vram": STICKER, "ceiling": STICKER,
+        cards = {CARD: {"vram": STICKER, "ceiling": STICKER,
                         "clean": STICKER * 2}}
-        self.assertEqual(state.vram_budget(cards, LUID, STICKER), STICKER)
+        self.assertEqual(state.vram_budget(cards, CARD, STICKER), STICKER)
 
 
 class Expiry(FrozenTime):
     """A ceiling is re-earned rather than binding forever."""
 
     def aged(self, days):
-        return {LUID: {"vram": STICKER, "ceiling": BELIEVABLE,
+        return {CARD: {"vram": STICKER, "ceiling": BELIEVABLE,
                        "clean": int(13.0 * GB), "seen": 40,
                        "ts": int(self.clock() - days * 86400)}}
 
     def test_a_ceiling_nothing_has_confirmed_for_a_month_lapses(self):
         cards = self.aged(state.VRAM_CEILING_DAYS + 10)
         self.assertTrue(state.prune_vram_limits(cards))
-        self.assertIsNone(cards[LUID].get("ceiling"))
+        self.assertIsNone(cards[CARD].get("ceiling"))
 
     def test_the_floor_it_was_measured_beside_survives(self):
         cards = self.aged(state.VRAM_CEILING_DAYS + 10)
         state.prune_vram_limits(cards)
-        self.assertEqual(cards[LUID]["clean"], int(13.0 * GB))
+        self.assertEqual(cards[CARD]["clean"], int(13.0 * GB))
 
     def test_a_ceiling_confirmed_this_week_is_kept(self):
         cards = self.aged(3)
         self.assertFalse(state.prune_vram_limits(cards))
-        self.assertEqual(cards[LUID]["ceiling"], BELIEVABLE)
+        self.assertEqual(cards[CARD]["ceiling"], BELIEVABLE)
 
     def test_an_old_entry_is_dated_by_the_stamp_it_does_have(self):
         # Entries written before "ts" existed carry only "at".
         stale = time.strftime("%Y-%m-%d %H:%M",
                               time.localtime(self._real_time()
                                              - 400 * 86400))
-        cards = {LUID: {"vram": STICKER, "ceiling": BELIEVABLE, "at": stale}}
+        cards = {CARD: {"vram": STICKER, "ceiling": BELIEVABLE, "at": stale}}
         self.restore()          # strptime/mktime want the real calendar
         self.assertTrue(state.prune_vram_limits(cards))
 
     def test_an_entry_with_no_date_at_all_is_left_alone(self):
-        cards = {LUID: {"vram": STICKER, "ceiling": BELIEVABLE}}
+        cards = {CARD: {"vram": STICKER, "ceiling": BELIEVABLE}}
         self.assertFalse(state.prune_vram_limits(cards))
 
 
@@ -288,10 +289,10 @@ class Pruning(unittest.TestCase):
         state.VRAM_LIMITS_PATH = self.path
         self.addCleanup(setattr, state, "VRAM_LIMITS_PATH", self._real_path)
         self.write({
-            "00000000_0001231F": {"vram": STICKER, "clean": 12402786304,
+            CARD: {"vram": STICKER, "clean": 12402786304,
                                   "ceiling": PINNED_LOW, "seen": 1064,
                                   "at": "2026-09-23 15:11"},
-            "00000000_00011FF2": {"vram": STICKER, "clean": 15391420416,
+            CARD_2: {"vram": STICKER, "clean": 15391420416,
                                   "ceiling": BELIEVABLE, "seen": 90,
                                   "ts": int(time.time())},
         })
@@ -306,36 +307,60 @@ class Pruning(unittest.TestCase):
 
     def test_the_file_is_repaired_on_the_way_in(self):
         cards = state.load_vram_limits()
-        self.assertIsNone(cards["00000000_0001231F"].get("ceiling"))
-        self.assertEqual(cards["00000000_00011FF2"]["ceiling"], BELIEVABLE)
+        self.assertIsNone(cards[CARD].get("ceiling"))
+        self.assertEqual(cards[CARD_2]["ceiling"], BELIEVABLE)
 
     def test_the_repair_is_written_back(self):
         state.load_vram_limits()
-        self.assertIsNone(self.read()["00000000_0001231F"].get("ceiling"))
+        self.assertIsNone(self.read()[CARD].get("ceiling"))
 
     def test_what_is_returned_is_what_was_written(self):
         self.assertEqual(state.load_vram_limits(), self.read())
 
     def test_the_seen_count_goes_with_the_ceiling_it_counted(self):
         cards = state.load_vram_limits()
-        self.assertIsNone(cards["00000000_0001231F"].get("seen"))
+        self.assertIsNone(cards[CARD].get("seen"))
 
     def test_the_floor_is_never_dropped(self):
         cards = state.load_vram_limits()
-        self.assertEqual(cards["00000000_0001231F"]["clean"], 12402786304)
+        self.assertEqual(cards[CARD]["clean"], 12402786304)
 
     def test_pruning_again_changes_nothing(self):
         self.assertFalse(state.prune_vram_limits(state.load_vram_limits()))
+
+    def test_rows_left_over_from_luid_keying_are_dropped(self):
+        """A LUID-keyed row can never match a live card again.
+
+        Windows reissues the LUID when a card is disabled and re-enabled,
+        which is how 25 rows for three cards came to be on file at once -
+        none of them matchable, while the estimate fell back to sticker
+        VRAM and called a spill a fit.
+        """
+        self.write({
+            "00000000_0001231F": {"vram": STICKER, "ceiling": BELIEVABLE,
+                                  "seen": 90, "ts": int(time.time())},
+            CARD: {"vram": STICKER, "ceiling": BELIEVABLE, "seen": 90,
+                   "ts": int(time.time())},
+        })
+        cards = state.load_vram_limits()
+        self.assertEqual(list(cards), [CARD])
+        self.assertEqual(cards[CARD]["ceiling"], BELIEVABLE)
+
+    def test_dropping_them_is_written_back(self):
+        self.write({"00000000_0001231F": {"vram": STICKER,
+                                          "clean": 12402786304}})
+        state.load_vram_limits()
+        self.assertEqual(self.read(), {})
 
     def test_a_pinned_card_goes_back_to_its_sticker_vram(self):
         # 11.55 GiB under the old rule, because the bad ceiling dragged the
         # clean floor down with it. 15.95 GiB now, until a spill says less.
         cards = state.load_vram_limits()
         self.assertEqual(
-            state.vram_budget(cards, "00000000_0001231F", STICKER), STICKER)
+            state.vram_budget(cards, CARD, STICKER), STICKER)
 
     def test_rubbish_in_the_file_costs_the_entry_not_the_app(self):
-        self.write({LUID: "not a card"})
+        self.write({CARD: "not a card"})
         self.assertEqual(state.load_vram_limits(), {})
 
     def test_a_missing_file_is_not_an_error(self):
