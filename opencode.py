@@ -40,6 +40,7 @@ import re
 import time
 
 import backends
+import optimizer
 import reasoning
 import state
 
@@ -263,8 +264,15 @@ def _sampling_for_config(model):
     subsets = []
     for preset in presets:
         settings = preset.get("settings") or {}
-        subsets.append({k: settings[k] for k in SAMPLING_OPTIONS
-                        if settings.get(k) not in (None, "")})
+        # As numbers, because that is what opencode sends and what the
+        # preset means - a quoted "40" reached llama.cpp as a string and was
+        # ignored. to_number returns None for anything that is not a number,
+        # and those are dropped rather than written: a null in the options
+        # block is not a setting, it is a setting that cannot be read.
+        numbers = {k: optimizer.to_number(settings[k], k)
+                   for k in SAMPLING_OPTIONS
+                   if settings.get(k) not in (None, "")}
+        subsets.append({k: v for k, v in numbers.items() if v is not None})
     for other in subsets[1:]:
         if other != subsets[0]:
             return None, ("its presets disagree about the sampling numbers "
