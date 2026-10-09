@@ -14,6 +14,7 @@ of gigabytes, and what is being tested is the rule, not the parser.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -42,7 +43,20 @@ DIFFUSION_TENSORS = (
 LLM_TENSORS = ("token_embd.weight", "blk.0.attn_q.weight", "output_norm.weight")
 
 
-class _PatchGguf(unittest.TestCase):
+class _Tmp(unittest.TestCase):
+    """A throwaway directory that goes away again.
+
+    tempfile.mkdtemp() on its own leaks one directory per test, which over a
+    few hundred runs is a visible pile under %TEMP%.
+    """
+
+    def tmpdir(self):
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
+
+
+class _PatchGguf(_Tmp):
     """Swaps gguf.read for a lookup over fake headers."""
 
     def setUp(self):
@@ -96,10 +110,176 @@ class Identifying(_PatchGguf):
         self.assertFalse(sdcpp.is_diffusion_gguf("/m/nothing-here.gguf"))
 
 
-class Companions(unittest.TestCase):
+class FindingTheProgram(_Tmp):
+    """sd-server has to be found without depending on one env var.
+
+    A GUI started from a shortcut does not always inherit LOCALAPPDATA. When
+    it did not, the lookup returned "" and the app reported sd-server missing
+    while it was installed, and every Load wrote a refusal to the log.
+    """
 
     def setUp(self):
-        self.dir = tempfile.mkdtemp()
+        self.env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.env)
+
+    def _install(self):
+        """A fake install under a fake home."""
+        home = self.tmpdir()
+        folder = os.path.join(home, "AppData", "Local", "stable-diffusion.cpp")
+        os.makedirs(folder)
+        exe = os.path.join(folder, "sd-server.exe")
+        with open(exe, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        return home, exe
+
+    def test_found_through_localappdata(self):
+        home, exe = self._install()
+        os.environ["PATH"] = ""
+        os.environ["LOCALAPPDATA"] = os.path.join(home, "AppData", "Local")
+        self.assertEqual(sdcpp.find_sd_exe(), exe)
+
+    def test_found_with_no_localappdata_at_all(self):
+        home, exe = self._install()
+        os.environ["PATH"] = ""
+        os.environ.pop("LOCALAPPDATA", None)
+        os.environ["USERPROFILE"] = home          # what expanduser reads
+        self.assertEqual(sdcpp.find_sd_exe(), exe)
+
+    def test_nothing_found_when_it_is_not_installed(self):
+        os.environ["PATH"] = ""
+        os.environ["LOCALAPPDATA"] = self.tmpdir()
+        os.environ["USERPROFILE"] = self.tmpdir()
+        self.assertEqual(sdcpp.find_sd_exe(), "")
+
+
+class ItsOwnDeviceListing(unittest.TestCase):
+    """sd-server names its devices differently from llama.cpp.
+
+    llama.cpp writes "Vulkan0: AMD Radeon RX 6800 XT (16368 MiB, ...)";
+    sd-server writes "Vulkan0<TAB>AMD Radeon RX 6800 XT". Its help says the
+    names it prints are the ones --backend accepts, so these are the ones to
+    report - reading llama.cpp's instead assumed two ggml builds enumerate
+    the same adapters in the same order.
+    """
+
+    LISTING = (
+        "ggml_vulkan: Found 3 Vulkan devices:\n"
+        "ggml_vulkan: 0 = AMD Radeon RX 6800 XT (AMD proprietary driver)\n"
+        "load_backend: loaded Vulkan backend from ggml-vulkan.dll\n"
+        "Vulkan0\tAMD Radeon RX 6800 XT\n"
+        "Vulkan1\tIntel(R) UHD Graphics 770\n"
+        "Vulkan2\tAMD Radeon RX 6800 XT\n"
+        "CPU\tIntel(R) Core(TM) i9-14900K\n")
+
+    def setUp(self):
+        self.real = sdcpp.subprocess.run
+        sdcpp._DEVICES.clear()
+
+        class Result:
+            stdout = ItsOwnDeviceListing.LISTING
+            stderr = ""
+
+        sdcpp.subprocess.run = lambda *a, **k: Result()
+
+    def tearDown(self):
+        sdcpp.subprocess.run = self.real
+        sdcpp._DEVICES.clear()
+
+    def test_the_loaders_own_chatter_is_not_read_as_a_device(self):
+        """Only the tab separated lines are the listing."""
+        self.assertEqual(sdcpp.list_devices("sd-server.exe"), [
+            ("Vulkan0", "AMD Radeon RX 6800 XT"),
+            ("Vulkan1", "Intel(R) UHD Graphics 770"),
+            ("Vulkan2", "AMD Radeon RX 6800 XT"),
+            ("CPU", "Intel(R) Core(TM) i9-14900K"),
+        ])
+
+    def test_the_integrated_gpu_is_the_one_to_leave_out(self):
+        """It sits between the two cards, so the obvious pair is wrong.
+
+        Vulkan0&Vulkan1 would put half the weights on a chip sharing system
+        memory. The pair worth using is Vulkan0&Vulkan2.
+        """
+        be = sdcpp.SdCppBackend()
+        be.exe = "sd-server.exe"
+        notes = " ".join(be._device_notes())
+        self.assertIn("Leave Vulkan1 out", notes)
+        self.assertIn("diffusion=Vulkan0&Vulkan2", notes)
+        self.assertNotIn("Vulkan0&Vulkan1", notes)
+
+    def test_the_cpu_is_a_backend_but_not_a_card(self):
+        """It must not be offered as somewhere to spread the weights."""
+        be = sdcpp.SdCppBackend()
+        be.exe = "sd-server.exe"
+        notes = " ".join(be._device_notes())
+        self.assertNotIn("CPU", notes.replace("CPU)", ""))
+
+    def _notes_for(self, model_bytes, card_bytes=16 * (1 << 30)):
+        be = sdcpp.SdCppBackend()
+        be.exe = "sd-server.exe"
+
+        class Record:
+            gguf_path = "C:\\models\\denoiser.gguf"
+            id = gguf_path
+
+        real_size, real_card = os.path.getsize, sdcpp._smallest_card
+        os.path.getsize = lambda p: model_bytes
+        sdcpp._smallest_card = lambda: card_bytes
+        try:
+            return " ".join(be._device_notes(Record()))
+        finally:
+            os.path.getsize = real_size
+            sdcpp._smallest_card = real_card
+
+    def test_a_model_that_fits_one_card_is_not_sent_to_two(self):
+        """Splitting costs speed, so it is only worth suggesting when needed.
+
+        Dividing a 4 GB denoiser over two 16 GB cards would have suggested
+        --max-vram 2, which is both pointless and worse than leaving it off.
+        """
+        notes = self._notes_for(4 * (1 << 30))
+        self.assertIn("fits on one card", notes)
+        self.assertNotIn("--max-vram", notes)
+
+    def test_a_model_too_big_for_one_card_gets_half_of_itself(self):
+        """Half the denoiser per card is what forces an even split."""
+        notes = self._notes_for(int(13.5 * (1 << 30)))
+        self.assertIn("--max-vram 7", notes)   # 13.5 GB over two cards
+        self.assertNotIn("fits on one card", notes)
+
+    def test_the_graph_counts_against_the_card_too(self):
+        """A denoiser that only just fits does not fit.
+
+        The file size is the weights alone; the denoising graph wants GBs
+        more on the same card, and sd-server fails at the first request
+        rather than at load if that was not left spare.
+        """
+        card = 16 * (1 << 30)
+        self.assertIn("--max-vram", self._notes_for(card - (1 << 30), card))
+
+    def test_the_split_advice_says_what_max_vram_is_for(self):
+        """--max-vram is what decides the partition, not a safety limit.
+
+        The splitter fills the first card up to the budget and reserves
+        nothing for the graph, so leaving it out or setting it high puts
+        nearly everything on one card and the request then fails. Saying
+        "--split-mode layer" without saying this sends people to a setting
+        that looks unsupported.
+        """
+        be = sdcpp.SdCppBackend()
+        be.exe = "sd-server.exe"
+        notes = " ".join(be._device_notes())
+        self.assertIn("--max-vram", notes)
+        self.assertIn("divided by the number of cards", notes)
+
+
+class Companions(_Tmp):
+
+    def setUp(self):
+        self.dir = self.tmpdir()
 
     def _touch(self, name):
         path = os.path.join(self.dir, name)
@@ -185,13 +365,27 @@ class TheBackend(_PatchGguf):
     def setUp(self):
         _PatchGguf.setUp(self)
         self.be = sdcpp.SdCppBackend()
-        self.dir = tempfile.mkdtemp()
+        self.dir = self.tmpdir()
 
     def _model(self, name="qwen-image-2.1-F16.gguf"):
         path = os.path.join(self.dir, name)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("x")
         self.headers[name.lower()] = FakeHeader("", DIFFUSION_TENSORS)
+        return path
+
+    def _complete(self):
+        """A denoiser with its VAE and text encoder, so a launch really runs.
+
+        Without them build_launch refuses and writes an exit 2 script, and a
+        test that looks for a flag in the script passes because the script
+        has no flags in it at all.
+        """
+        path = self._model()
+        for name in ("qwen_image_2.1_vae_bf16.safetensors",
+                     "Qwen3-VL-8B-Instruct.gguf"):
+            with open(os.path.join(self.dir, name), "w", encoding="utf-8") as fh:
+                fh.write("x")
         return path
 
     def test_only_denoisers_are_listed(self):
@@ -242,7 +436,7 @@ class TheBackend(_PatchGguf):
         A --port or --vae through the free-text field would leave the
         dropdown and the running server disagreeing about what is loaded.
         """
-        self._model()
+        self._complete()
         record = self.be.list_models(self.dir)[0]
         plan = self.be.build_launch(
             record,
@@ -250,6 +444,85 @@ class TheBackend(_PatchGguf):
             {})
         self.assertTrue(any("Ignoring" in n for n in plan.notes))
         self.assertNotIn("9999", plan.script_text)
+
+    def test_a_quoted_flag_is_still_caught_by_the_denied_list(self):
+        """Quoting must not be a way round the flags Zoomies owns.
+
+        Extra flags are split with posix=False, which leaves the quotes on
+        the token so that a value like "diffusion=a&b" survives intact. That
+        made '"--listen-port"' a different string from '--listen-port', and
+        the guard let it through.
+        """
+        self._complete()
+        record = self.be.list_models(self.dir)[0]
+        plan = self.be.build_launch(
+            record, {"extra_flags": '"--listen-port" 9999'}, {})
+        self.assertTrue(any("Ignoring" in n for n in plan.notes))
+        self.assertNotIn("9999", plan.script_text)
+
+    def test_a_quoted_value_reaches_sd_server_as_written(self):
+        """The other half: quoting a value is how --backend is written."""
+        self._complete()
+        record = self.be.list_models(self.dir)[0]
+        plan = self.be.build_launch(
+            record,
+            {"extra_flags": '--backend "diffusion=Vulkan0&Vulkan2"'}, {})
+        self.assertFalse(any("Ignoring" in n for n in plan.notes))
+        self.assertIn("diffusion=Vulkan0&Vulkan2", plan.script_text)
+
+    def test_zoomies_own_page_is_handed_to_sd_server(self):
+        """The dark theme is only reachable through --serve-html-path.
+
+        sd-server has its own page built into the binary and serves that at /
+        unless it is pointed at a file. Building a nicer page and not passing
+        the flag means nobody ever sees it.
+        """
+        self._complete()
+        record = self.be.list_models(self.dir)[0]
+        page = os.path.join(self.dir, "index.html")
+        with open(page, "w", encoding="utf-8") as fh:
+            fh.write("<html></html>")
+        real, sdcpp.find_web_ui = sdcpp.find_web_ui, lambda: page
+        try:
+            plan = self.be.build_launch(record, {}, {})
+        finally:
+            sdcpp.find_web_ui = real
+        self.assertIn("--serve-html-path", plan.script_text)
+        self.assertIn(page, plan.script_text)
+
+    def test_a_page_of_your_own_is_not_overridden(self):
+        """Extra flags win: this one is not a setting Zoomies owns."""
+        self._complete()
+        record = self.be.list_models(self.dir)[0]
+        real, sdcpp.find_web_ui = sdcpp.find_web_ui, lambda: "C:\\ours.html"
+        try:
+            plan = self.be.build_launch(
+                record, {"extra_flags": "--serve-html-path C:\\mine.html"}, {})
+        finally:
+            sdcpp.find_web_ui = real
+        self.assertIn("mine.html", plan.script_text)
+        self.assertNotIn("ours.html", plan.script_text)
+        self.assertEqual(plan.script_text.count("--serve-html-path"), 1)
+
+    def test_nothing_is_passed_when_the_page_has_not_been_built(self):
+        """sdcpp-webui/dist is a build output, so it may simply not be there.
+
+        Passing a path that does not exist would be worse than passing
+        nothing: sd-server would serve an empty page instead of its own.
+        """
+        self._complete()
+        record = self.be.list_models(self.dir)[0]
+        real, sdcpp.find_web_ui = sdcpp.find_web_ui, lambda: ""
+        try:
+            plan = self.be.build_launch(record, {}, {})
+        finally:
+            sdcpp.find_web_ui = real
+        self.assertNotIn("--serve-html-path", plan.script_text)
+
+    def test_the_page_has_to_be_a_file_that_is_there(self):
+        """find_web_ui checks, rather than trusting the layout."""
+        self.assertEqual(
+            os.path.basename(sdcpp.find_web_ui() or "index.html"), "index.html")
 
     def test_the_address_flags_are_the_ones_sd_server_actually_takes(self):
         """sd-server uses --listen-ip/--listen-port, not --host/--port.

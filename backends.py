@@ -1139,15 +1139,24 @@ def split_extra_flags(settings, denied):
         parts = shlex.split(raw, posix=False)
     except ValueError:
         parts = raw.split()
+    # posix=False keeps the quotes in the token, which is what we want for a
+    # value like --backend "diffusion=a&b" - the quoting is part of how the
+    # flag is written down, and the child's own parser strips it. It is not
+    # what we want when deciding whether a flag is denied, though: '"--port"'
+    # is not "--port", so a quoted flag used to walk straight past the list
+    # it was supposed to be caught by. Compare unquoted, pass on what was
+    # typed.
+    parts = [p for p in parts if p]
     kept, dropped, skip_next = [], [], False
     for i, token in enumerate(parts):
+        bare = token.strip("\"'")
         if skip_next:
             skip_next = False
             continue
-        if token.split("=", 1)[0] in denied:
+        if bare.split("=", 1)[0] in denied:
             dropped.append(token)
-            if "=" not in token and i + 1 < len(parts) \
-                    and not parts[i + 1].startswith("-"):
+            if "=" not in bare and i + 1 < len(parts) \
+                    and not parts[i + 1].strip("\"'").startswith("-"):
                 skip_next = True
             continue
         kept.append(token)

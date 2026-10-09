@@ -57,12 +57,14 @@ supports(). The server's own page is the quickest way to drive it.
 
 import os
 import re
+import subprocess
 import time
 
 import backends
 import gguf
 import runner
 import state
+import vram
 
 SDCPP_HOST = "127.0.0.1"
 SDCPP_PORT = 1234              # sd-server's own default, and the first we try
@@ -100,23 +102,120 @@ def find_sd_exe():
     stay up. Mirrors find_llama_exe, including the WindowsApps directory,
     since a packaged build would land there.
     """
-    dirs = (os.environ.get("PATH") or "").split(os.pathsep)
-    local = os.environ.get("LOCALAPPDATA", "")
-    if local:
+    dirs = [d.strip('"') for d in (os.environ.get("PATH") or "").split(os.pathsep)]
+
+    # Both ways of naming Local AppData, because neither is guaranteed. A GUI
+    # started from a shortcut or a service does not always inherit
+    # LOCALAPPDATA, and when it did not, this returned "" and the app went on
+    # insisting sd-server was not installed while it sat in plain sight.
+    # expanduser() is the fallback rather than a second env var because it
+    # reads USERPROFILE, which a process that lost LOCALAPPDATA still has.
+    roots = []
+    for root in (os.environ.get("LOCALAPPDATA", ""),
+                 os.path.join(os.path.expanduser("~"), "AppData", "Local")):
+        if root and root not in roots:
+            roots.append(root)
+    for root in roots:
         dirs += [
-            os.path.join(local, "Microsoft", "WindowsApps"),
-            os.path.join(local, "stable-diffusion.cpp"),
-            os.path.join(local, "sd.cpp"),
+            os.path.join(root, "Microsoft", "WindowsApps"),
+            os.path.join(root, "stable-diffusion.cpp"),
+            os.path.join(root, "sd.cpp"),
         ]
+
     for name in ("sd-server.exe", "sd-server"):
         for directory in dirs:
-            directory = directory.strip('"')
             if not directory:
                 continue
             candidate = os.path.join(directory, name)
             if os.path.exists(candidate):
                 return candidate
     return ""
+
+
+# What a denoiser needs on a card beyond the bytes in its file: the denoising
+# graph, plus whatever the desktop is already holding. Measured on this
+# machine with the 13.25 GB Qwen-Image 2.1 F16 - sd-server asked for 16.07 GB
+# at 512x512, and more at 1024x1024, against a card that hands out 15.2 GB of
+# its 15.95 GB. 3 GB is the round number above that, and it is only ever used
+# to answer "does this need two cards at all", never written into a launch.
+GRAPH_HEADROOM = 3 * (1 << 30)
+
+
+def _smallest_card():
+    """What the smallest discrete card can hand out, or 0 if unknown.
+
+    Deliberately not matched up with the Vulkan indices: the enumeration is
+    reshuffled from one boot to the next, so the smallest card is the honest
+    thing to size against rather than "the card Vulkan0 happens to be".
+
+    Goes through state.vram_budget so that a ceiling Zoomies has actually
+    measured wins over the sticker figure. That ceiling is keyed on a card
+    identity Windows reissues, so it is often simply absent, and then the
+    sticker figure is what there is - which is why GRAPH_HEADROOM is
+    generous rather than tight.
+    """
+    try:
+        limits = state.load_vram_limits()
+        sizes = [state.vram_budget(limits, a["key"], a["vram"])
+                 for a in vram.adapters()
+                 if not a.get("is_software")
+                 and not backends.INTEGRATED_GPU.search(a.get("name") or "")]
+    except Exception:                                 # noqa: BLE001
+        return 0
+    sizes = [s for s in sizes if s]
+    return min(sizes) if sizes else 0
+
+
+_DEVICES = {}
+
+
+def list_devices(exe):
+    """[(name, description)] from sd-server's own --list-devices.
+
+    sd-server prints one `name<TAB>description` per line, which is a
+    different shape from llama.cpp's `Vulkan0: name (16368 MiB, ...)`, so
+    backends.list_devices cannot read it. Worth asking anyway rather than
+    borrowing llama.cpp's numbering: the help says these are exactly the
+    names --backend accepts, which removes the assumption that two different
+    ggml builds enumerate the same adapters in the same order.
+
+    Cached per run like the llama.cpp one, because it starts a process.
+    """
+    if exe in _DEVICES:
+        return _DEVICES[exe]
+    try:
+        res = subprocess.run([exe, "--list-devices"],
+                             capture_output=True, text=True, timeout=60,
+                             creationflags=state.CREATE_NO_WINDOW)
+        text = (res.stdout or "") + (res.stderr or "")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in text.splitlines():
+        # The loader writes its own progress to the same streams; only the
+        # listing itself is tab separated.
+        name, tab, desc = line.partition("\t")
+        if tab and name.strip() and desc.strip():
+            found.append((name.strip(), desc.strip()))
+    if found:
+        _DEVICES[exe] = found
+    return found
+
+
+def find_web_ui():
+    """Zoomies' own build of the sd-server page, or "" to use the built-in one.
+
+    sd-server embeds a web UI and serves it at /, and `--serve-html-path`
+    replaces that page with a file on disk. The build in sdcpp-webui/dist is
+    the upstream page plus a dark theme, so it is handed over whenever it has
+    been built - there is nothing to install and nothing to configure.
+
+    Found relative to this file rather than from an absolute path: the page
+    ships inside the checkout, so wherever Zoomies is, the page is beside it.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    page = os.path.join(here, "sdcpp-webui", "dist", "index.html")
+    return page if os.path.isfile(page) else ""
 
 
 def is_diffusion_gguf(path):
@@ -467,6 +566,17 @@ class SdCppBackend(backends.Backend):
         if kit.vision:
             a += ["'--llm_vision'", runner.ps_single(kit.vision)]
         a += [runner.ps_single(t) for t in extra]
+
+        # Zoomies' page, unless Extra flags already name one. Not in
+        # SDCPP_DENIED, because pointing sd-server at a different page breaks
+        # nothing Zoomies relies on - it talks to the API, not the page.
+        page = find_web_ui()
+        if page and not any(t.split("=", 1)[0] == "--serve-html-path"
+                            for t in extra):
+            a += ["'--serve-html-path'", runner.ps_single(page)]
+            notes.append("Serving Zoomies' build of the sd-server page, "
+                         "which follows the system light/dark setting.")
+
         a += ["'--listen-ip'", runner.ps_single(SDCPP_HOST),
               "'--listen-port'", runner.ps_single(port)]
 
@@ -474,7 +584,7 @@ class SdCppBackend(backends.Backend):
         # launch: a missing binary and missing weights are both worth knowing
         # about on the first try, rather than one per attempt.
         if not any(t.split("=", 1)[0] == "--backend" for t in extra):
-            notes.extend(self._device_notes())
+            notes.extend(self._device_notes(model))
 
         if kit.complete:
             notes.append("VAE: %s. Text encoder: %s."
@@ -529,30 +639,29 @@ class SdCppBackend(backends.Backend):
             model_id=path, model_label=model.label,
             ready_check=lambda: self._ready(port))
 
-    @staticmethod
-    def _device_notes():
-        """Say which Vulkan devices are worth using, without pinning any.
+    def _device_notes(self, model=None):
+        """Say which devices are worth using, without pinning any.
 
-        sd-server has no device listing of its own, so the numbering is read
-        from llama.cpp's - both sit on ggml-vulkan, so they enumerate the
-        same adapters in the same order. It is only ever reported, never
+        Asked of sd-server itself, because its help says the names it prints
+        are the ones --backend accepts. They are only ever reported, never
         written into the launch: these indices are reshuffled on reboot, so a
         number baked into a preset eventually names a different adapter.
 
         The point of saying it at all is that an integrated GPU can sit in
-        the middle of the list, which makes the obvious `vulkan0&vulkan1`
+        the middle of the list, which makes the obvious `Vulkan0&Vulkan1`
         put half the weights on a chip sharing system memory.
         """
         try:
-            lc = backends.get("llamacpp")
-            devices = backends.list_devices(lc.exe, lc.prefix) if lc else []
+            devices = list_devices(self.exe) if self.exe else []
         except Exception:                             # noqa: BLE001
             return []
-        if not devices:
+        # The listing ends with the CPU, which is a backend but not a card.
+        gpus = [(tag, desc) for tag, desc in devices if tag.upper() != "CPU"]
+        if not gpus:
             return []
-        discrete = [(tag, desc) for tag, desc in devices
+        discrete = [(tag, desc) for tag, desc in gpus
                     if not backends.INTEGRATED_GPU.search(desc)]
-        shared = [(tag, desc) for tag, desc in devices
+        shared = [(tag, desc) for tag, desc in gpus
                   if backends.INTEGRATED_GPU.search(desc)]
         notes = []
         if shared:
@@ -563,11 +672,58 @@ class SdCppBackend(backends.Backend):
                    ", ".join(d for _, d in shared),
                    ", ".join("%s (%s)" % (t, d) for t, d in discrete)))
         if len(discrete) > 1:
-            notes.append(
-                "To spread one model over both cards: --backend "
-                "\"diffusion=%s\" --split-mode layer. Check these numbers "
-                "after a reboot - Vulkan reorders them."
-                % "&".join(t.lower() for t, _ in discrete))
+            notes.extend(self._split_notes(discrete, model))
+        return notes
+
+    @staticmethod
+    def _split_notes(discrete, model=None):
+        """How to spread one denoiser over several cards, and the catch.
+
+        --max-vram is not a safety limit here, it is the thing that decides
+        the partition: the splitter fills the first card up to that budget
+        and gives the rest whatever is left, and it sets nothing aside for
+        the graph. Leave it out or set it high and the first card takes
+        almost everything, then asks for more than it has and the request
+        fails - which looks exactly like "splitting is not supported".
+
+        Half the denoiser is the number that works, because that is what
+        forces an even split. Measured on 2x16 GB: a 13.5 GB denoiser at
+        --max-vram 7 lands 6.9/6.7 GB and runs; at 13 it lands 13.1/0.4 and
+        dies. The headroom left under the budget is one transformer block,
+        so this only stretches so far - big images need more room for the
+        graph than the budget can leave, whatever it is set to.
+        """
+        try:
+            size = os.path.getsize(model.gguf_path or model.id) if model else 0
+        except (OSError, AttributeError):
+            size = 0
+
+        # Splitting costs speed and is fiddly to get right, so it is only
+        # worth suggesting for a denoiser that cannot sit on one card with
+        # room left for the graph. The smallest card is the one to measure
+        # against, and the sticker figure is close enough for a yes or no.
+        smallest = _smallest_card()
+        if size and smallest and size + GRAPH_HEADROOM <= smallest:
+            return ["%s fits on one card with room for the graph, so there "
+                    "is nothing to gain by splitting it."
+                    % os.path.basename(model.gguf_path or model.id)]
+
+        tags = "&".join(t for t, _ in discrete)
+        notes = ["To spread one model over %d cards: --backend "
+                 "\"diffusion=%s\" --split-mode layer, plus --max-vram. "
+                 "Check these names after a reboot - Vulkan reorders them."
+                 % (len(discrete), tags)]
+        half = ""
+        if size:
+            half = " For %s that is about --max-vram %d." % (
+                os.path.basename(model.gguf_path or model.id),
+                max(1, round(size / float(1 << 30) / len(discrete))))
+        notes.append(
+            "Set --max-vram to roughly the denoiser's size divided by the "
+            "number of cards, per card (\"%s\"). It is what decides the "
+            "split, not a safety limit: too high and the first card takes "
+            "nearly all the weights and then cannot fit the graph.%s"
+            % (",".join("%s=N" % t for t, _ in discrete), half))
         return notes
 
     def _ready(self, port):
