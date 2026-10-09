@@ -13,6 +13,8 @@ template and reports the levels it understands:
                                        off / low-effort / on
     Muse Glimmer                       reasoning_strength, no off switch
                                        low / medium / high / xhigh
+    gpt-oss                            reasoning_effort, no off switch
+                                       low / medium / high
     Ministral 3, Devstral Small 2      nothing to switch
 
 Each level is the exact chat_template_kwargs that produce it, and it is the
@@ -22,9 +24,10 @@ on: llama.cpp merges a request's kwargs into the server's key by key, so a
 level that left enable_thinking out would inherit "off" from the launch.
 
 Where the template reads a value but does not list the allowed ones (Muse
-Glimmer takes any string), the values come from DOCUMENTED below, which cites
-where each list was read. Anything else it cannot account for is reported as
-a problem or a note - never filled in with a plausible-looking default.
+Glimmer and gpt-oss both take any string), the values come from DOCUMENTED
+below, which cites where each list was read. Anything else it cannot account
+for is reported as a problem or a note - never filled in with a
+plausible-looking default.
 """
 
 import json
@@ -57,6 +60,9 @@ DOCUMENTED = (
      "source": "Unsloth's Muse Glimmer guide, Thinking Settings"},
     {"match": "granite4", "flag": "low_effort", "level": "low-effort",
      "source": "IBM's Granite 4.2 model card, Thinking Modes"},
+    {"match": "gptoss", "var": "reasoning_effort",
+     "values": ("low", "medium", "high"),
+     "source": "OpenAI's gpt-oss model card, Reasoning levels"},
 )
 
 # Template variables about thinking that are not a level: whether old
@@ -167,7 +173,13 @@ def _default_value(text, var):
     v = re.escape(var)
     for pattern in (r"%s\s*\|\s*default\(\s*['\"](\w+)['\"]" % v,
                     r"%s\s+if\s+%s\s+is\s+defined[^%%}]*?else\s*['\"](\w+)['\"]"
-                    % (v, v)):
+                    % (v, v),
+                    # A statement rather than an expression - the
+                    # harmony template (gpt-oss) writes its default as
+                    # `{%- if x is not defined %}` guarding a
+                    # `{%- set x = "y" %}`.
+                    r"%s\s+is\s+not\s+defined\s*-?%%\}\s*\{%%-?\s*"
+                    r"set\s+%s\s*=\s*['\"](\w+)['\"]" % (v, v)):
         m = re.search(pattern, text)
         if m:
             return m.group(1)
