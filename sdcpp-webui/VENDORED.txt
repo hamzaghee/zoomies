@@ -1,0 +1,41 @@
+This folder is a copy of someone else's project, kept inside Zoomies.
+
+Where it came from
+------------------
+    https://github.com/leejet/sdcpp-webui
+    upstream commit 8e7c11505925c0dbf9aaea56a3a5058b8690d66b (2026-10-06)
+        "fix: validate video reference inputs and clarify model support"
+
+It is the web page stable-diffusion.cpp's sd-server serves, and sd-server
+is pointed at the build in dist/ by sdcpp.py's find_web_ui(). Without it
+sd-server falls back to the page built into the binary, which works but
+has no dark theme.
+
+It used to be a git clone of its own sitting inside this one, which meant
+Zoomies' history did not contain the page it depends on: a fresh clone got
+the Python and no page at all, and quietly served the old one. It is
+ordinary files here instead, so one clone is the whole thing.
+
+What was changed from upstream
+------------------------------
+One commit's worth, in src/App.vue, src/lib/settings.ts and
+src/styles.css: a dark theme, chosen by a button in the header or left to
+follow the system setting. Nothing else is modified.
+
+Taking a newer upstream
+-----------------------
+There is no `git pull` for this any more - that is the trade for having
+one history. Clone the repo above somewhere else, diff it against this
+folder to see what moved, copy the new files in, and re-apply the theme.
+`git log` on this folder shows exactly what the theme touched.
+
+Why dist/index.html is committed
+--------------------------------
+It is a build output, and normally those are left out. It is kept because
+Zoomies reads it at launch and most people running Zoomies have no reason
+to have Node installed. Rebuilding it after a source change is:
+
+    pnpm install
+    pnpm build
+
+Everything else dist/ produces stays ignored - see .gitignore.
